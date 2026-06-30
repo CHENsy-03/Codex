@@ -5,7 +5,7 @@
 三组为一轮勘测，自动编号（如 HW-1），精度比较 -> 去重 -> 存入分部 -> 上传总部。
 分部服务器：Home-HW（杭州）、Home-SX（绍兴）
 总部服务器：Home-ALL
-数据库引擎：DuckDB（应用层分片）
+数据库引擎：DuckDB (数据库引擎)（应用层分片）
 """
 
 import json
@@ -95,7 +95,7 @@ def print_record(record: Dict):
 # ============================================================
 def main():
     print("=" * 55)
-    print("  勘测系统服务器 v0.1.1 — V4-Local 工业级测试引擎 (5.docx)")
+    print("  勘测系统服务器 v0.1.1")
     print("=" * 55)
 
     while True:
@@ -105,14 +105,14 @@ def main():
         print("  3. 查看分部服务器数据")
         print("  4. 查看总部服务器数据")
 
-        print("  5. 图表/Excel 数据导入（JSON/Excel 接口）")
-        print("  6. 网络健康检查区 (Check Zone)")
+        print("  5. 图表/数据文件导入")
+        print("  6. 网络健康检查区")
         print("  7. 数据管理 (删除/清除缓存)")
-        print("  8. 系统升级功能 (重复检测/熔断/统计API)")
-        print("  A. V4-Local EventBus 状态与回放")
-        print("  B. V4-Local CLI 测试引擎")
-        print("  C. V4-Local GPS 回放系统")
-        print("  D. V4-Local 插件管理")
+        print("  8. 系统升级与统计管理")
+        print("  A. 事件总线状态与回放")
+        print("  B. 命令行测试引擎")
+        print("  C. GPS 回放系统")
+        print("  D. 插件管理")
         print("  0. 退出")
 
         choice = input("\n请输入选择: ").strip()
@@ -289,9 +289,29 @@ def _view_shard():
             i2 = int(c2)
             if i2 == len(_city)+1: break
             if not(1<=i2<=len(_city)): continue
-            _,cn = _city[i2-1]
+            cc, cn = _city[i2-1]
             rc = _CRM.get(cn,"")
-            if not rc: print("未找到"+cn+"数据库"); continue
+            if not rc: print("未找到 "+cn+" 数据库"); continue
+            from utils.admin_regions import DISTRICTS as _DISTRICTS, find_admin
+            _districts = [(dc, dn) for dc, dn, _, _ in _DISTRICTS if dc[:4] == cc[:4]]
+            _skip = False; _sel_dn = None
+            if len(_districts) > 0:
+                while True:
+                    print()
+                    print(f"三级 - {cn} 区县级分部：")
+                    for i, (_, dn) in enumerate(_districts, 1):
+                        print(f"  {i}. {dn}")
+                    print(f"  {len(_districts)+1}. 查看全部")
+                    print(f"  {len(_districts)+2}. 返回")
+                    c3 = input("请选择区县或查看全部: ").strip()
+                    if not c3.isdigit(): continue
+                    i3 = int(c3)
+                    if i3 == len(_districts)+2:
+                        _skip = True; break
+                    if 1 <= i3 <= len(_districts):
+                        _, _sel_dn = _districts[i3-1]
+                    break
+                if _skip: continue
             from shard_db import ShardDatabase
             from db_config import REGION_CONFIG
             cfg = REGION_CONFIG.get(rc, {})
@@ -299,11 +319,15 @@ def _view_shard():
                 _c = db.count_all()
                 print(f"\n{cn} ({cfg.get(chr(99)+chr(111)+chr(100)+chr(101),chr(63))}) - GPS: {_c.get(chr(103)+chr(112)+chr(115)+chr(95)+chr(114)+chr(101)+chr(99)+chr(111)+chr(114)+chr(100)+chr(115),0)} 结果: {_c.get(chr(114)+chr(101)+chr(115)+chr(117)+chr(108)+chr(116)+chr(115),0)}")
                 if _c.get("gps_records",0) > 0:
-                    if input("\n查看详细? (y/n): ").strip().lower()=="y":
+                    if input("\n查看详细数据? (输y查看/n跳过): ").strip().lower()=="y":
                         from collections import defaultdict
                         _gl = db.get_all_gps(200)
                         _bt = defaultdict(dict)
-                        for r in _gl: _bt[r.get("batch_id","?")][r.get("group_label","?")] = r
+                        for r in _gl:
+                            if _sel_dn:
+                                _ad = find_admin(r.get("lat",0), r.get("lng",0))
+                                if _ad["l2"] != _sel_dn: continue
+                            _bt[r.get("batch_id","?")][r.get("group_label","?")] = r
                         for bd in sorted(_bt, key=lambda x: str(x)):
                             gp = _bt[bd]
                             for lb in ["A","B","C"]:
@@ -665,13 +689,13 @@ def _chart_import():
     - CSV / TXT (.csv / .txt) - comma or tab separated
     """
     print("\n数据导入")
-    print("支持格式:")
-    print("  1) JSON 文件 (.json)")
-    print("  2) Excel 文件 (.xlsx / .xls)")
+    print("支持格式：")
+    print("  1. JSON 文件 (.json)")
+    print("  2. Excel 文件 (.xlsx/.xls)")
     print("  3) CSV / TXT 文件 (.csv / .txt)")
-    print("  4) JSON 手动粘贴")
+    print("  4. JSON 手动粘贴")
 
-    path = input("\n输入文件路径: ").strip().strip('"').strip("'")
+    path = input("\n输入文件路径： ").strip().strip('"').strip("'")
 
     try:
         if path.lower() == "json":
@@ -744,28 +768,28 @@ def _startup_check():
     """Startup check: verify DB, config, and dependencies"""
     import os
     print("\n" + "=" * 55)
-    print("  System Startup Check")
+    print("  系统启动检查")
     print("=" * 55)
     checks = []
 
-    # DB directory
+    # 数据库目录
     from db_config import DB_DIR
-    checks.append(("DB directory", os.path.exists(DB_DIR)))
+    checks.append(("数据库目录", os.path.exists(DB_DIR)))
 
-    # Region config
+    # 区域配置
     from db_config import REGION_CONFIG
-    checks.append(("Region config", len(REGION_CONFIG) > 0))
+    checks.append(("区域配置", len(REGION_CONFIG) > 0))
 
-    # Main DB path
+    # 总数据库路径
     from db_config import MAIN_DB_PATH
-    checks.append(("Main DB path", isinstance(MAIN_DB_PATH, str)))
+    checks.append(("总库路径", isinstance(MAIN_DB_PATH, str)))
 
     # Import check
     try:
         import duckdb
-        checks.append(("DuckDB", True))
+        checks.append(("DuckDB引擎", True))
     except ImportError:
-        checks.append(("DuckDB", False))
+        checks.append(("DuckDB引擎", False))
 
     try:
         import openpyxl
@@ -778,9 +802,9 @@ def _startup_check():
         print(f"  [{status}] {name}")
 
     if all(ok for _, ok in checks):
-        print("\n  All checks passed.")
+        print("\n  全部检查通过")
     else:
-        print("\n  Some checks failed. Check dependencies.")
+        print("\n  部分检查失败，请检查依赖。")
 
     return all(ok for _, ok in checks)
 
@@ -809,7 +833,7 @@ def _data_management():
     print("\n" + "=" * 55)
     print("  数据管理")
     print("=" * 55)
-    print("  1. 删除指定数据 (按 batch_id)")
+    print("  1. 删除指定数据（按批次号）")
     print("  2. 清空全部数据 (分库和总库)")
     print("  3. 清除上传缓冲区和锁文件")
     print("  4. 合并分库到总库（三级链路）")
@@ -827,6 +851,79 @@ def _data_management():
             print(f"  {k}: {v}")
         input("\n按 Enter 继续...")
         return
+    if choice == "2":
+        print("\n  请选择清除方式：\n  1. 按区域分级清除\n  2. 清除全部数据\n  0. 返回")
+        c0 = input("选择: ").strip()
+        if c0 == "2":
+            if input('输入 "yes" 确认清除全部数据: ').lower() == "yes":
+                for rc in ["hangzhou","shaoxing","zhaotong","zhejiang","yunnan"]:
+                    try: __import__("shard_db").ShardDatabase(rc).__enter__().clear_all()
+                    except: pass
+                print("已清空")
+            input("按 Enter 继续...")
+        elif c0 == "1":
+            from utils.admin_regions import PROVINCES, CITIES as _CITIES, DISTRICTS as _DISTRICTS
+            _CRM = {"杭州":"hangzhou","绍兴":"shaoxing","昭通市":"zhaotong"}
+            _pv = sorted(PROVINCES.items())
+            while True:
+                print()
+                print("一级 - 省份：")
+                for i,(_,pn) in enumerate(_pv,1): print(f"  {i}. {pn}")
+                print(f"  {len(_pv)+1}. 返回")
+                c = input("选择: ").strip()
+                if not c.isdigit(): continue
+                ic = int(c)
+                if ic == len(_pv)+1: break
+                if not(1<=ic<=len(_pv)): continue
+                pc, pn = _pv[ic-1]
+                _city = [(cc,cn) for cc,cn in _CITIES.items() if cc[:2]==pc]
+                while True:
+                    print()
+                    print(f"二级 - {pn} 市级：")
+                    for i,(_,cn) in enumerate(_city,1): print(f"  {i}. {cn}")
+                    print(f"  {len(_city)+1}. 回上级")
+                    c2 = input("选择: ").strip()
+                    if not c2.isdigit(): continue
+                    i2 = int(c2)
+                    if i2 == len(_city)+1: break
+                    if not(1<=i2<=len(_city)): continue
+                    cc2, cn2 = _city[i2-1]
+                    rc2 = _CRM.get(cn2,"")
+                    if not rc2: continue
+                    _dlist = [(dc,dn) for dc,dn,_,_ in _DISTRICTS if dc[:4]==cc2[:4]]
+                    while True:
+                        print()
+                        print(f"三级 - {cn2} 区县：")
+                        for i,(_,dn) in enumerate(_dlist,1): print(f"  {i}. {dn}")
+                        print(f"  {len(_dlist)+1}. 清除全市({cn2})")
+                        print(f"  {len(_dlist)+2}. 回上级")
+                        c3 = input("选择: ").strip()
+                        if not c3.isdigit(): continue
+                        i3 = int(c3)
+                        if i3 == len(_dlist)+2: break
+                        if i3 == len(_dlist)+1:
+                            if input(f"确认清除{c2}数据? (yes): ").lower() == "yes":
+                                with __import__("shard_db").ShardDatabase(rc2) as s: s.clear_all()
+                                print("已清空")
+                            continue
+                        if not(1<=i3<=len(_dlist)): continue
+                        _, dn = _dlist[i3-1]
+                        if input(f"确认清除{cn2}的{dn}数据? (yes): ").lower() == "yes":
+                            from utils.admin_regions import find_admin
+                            with __import__("shard_db").ShardDatabase(rc2) as s2:
+                                allg = s2.get_all_gps(99999) or []
+                                td = set()
+                                for rd in allg:
+                                    ad = find_admin(rd.get("lat",0), rd.get("lng",0))
+                                    if ad["l2"] == dn: td.add(str(rd.get("batch_id","")))
+                                for bd in td:
+                                    if bd:
+                                        try: s2.delete_by_batch(bd)
+                                        except: pass
+                                print(f"{dn}的{len(td)}批次已清空")
+                        continue
+        input("\n按 Enter 继续...")
+        return
     region_code = _select_region()
     with ShardDatabase(region_code) as db:
         if choice == "1":
@@ -834,13 +931,6 @@ def _data_management():
             if bid:
                 db.delete_by_batch(bid); ok, msg = True, "已删除 "+bid
                 print("\n  " + msg)
-        elif choice == "2":
-            print("\n  警告: 这将删除全部数据!")
-            if input('输入 "yes" 确认: ').strip().lower() == "yes":
-                db.clear_all(); ok, msg = True, "已清空"
-                print("\n  " + msg)
-            else:
-                print("  已取消.")
         elif choice == "3":
             msg = "缓冲区已清除"
             try:
@@ -878,8 +968,8 @@ def _upgrade_menu():
         print("  2. 查看序列完整性检测统计")
         print("  3. 查看熔断机制状态")
         print("  4. 手动恢复熔断设备")
-        print("  5. 启动/重启 统计API (端口 8080)")
-        print("  6. 停止统计API")
+        print("  5. 启动统计接口 (端口 8080)")
+        print("  6. 停止统计接口")
         print("  0. 返回主菜单")
 
         choice = input("\n请选择: ").strip()
@@ -919,26 +1009,26 @@ def _upgrade_menu():
                 register("sequence_checker", sc)
                 register("circuit_breaker", cb)
                 _api_server = run_server(port=8080, blocking=False); _API_SERVERS['stats'] = _api_server
-                print("  统计API已启动: http://localhost:8080/api/survey/stats")
+                print("  统计接口已启动: http://localhost:8080/api/survey/stats")
             except Exception as e:
                 print(f"  启动失败: {e}")
         elif choice == "6":
             if _api_server:
                 _api_server.shutdown()
                 _api_server = _API_SERVERS.get('stats')
-                print("  统计API已停止")
+                print("  统计接口已停止")
             else:
-                print("  统计API未运行")
+                print("  统计接口未运行")
         else:
             print("无效选择")
         input("\n按 Enter 继续...")
 
 
 def _eventbus_menu():
-    """V4-Local EventBus 状态与回放"""
+    """事件总线状态与回放"""
     from upgrade.eventbus import bus, Topics
     print("\n" + "=" * 55)
-    print("  V4-Local EventBus 状态与回放")
+    print("  事件总线 状态与回放")
     print("=" * 55)
     while True:
         s = bus.stats()
@@ -964,9 +1054,9 @@ def _eventbus_menu():
         else: print("  无效选择")
 
 def _cli_test_menu():
-    """V4-Local CLI 测试引擎"""
+    """命令行测试引擎"""
     print("\n" + "=" * 55)
-    print("  V4-Local CLI 测试引擎")
+    print("  命令行 测试引擎")
     print("=" * 55)
     print("\n  CLI 命令 (在终端中使用):")
     print("  python -m cli.run_test --device gps --count 5")
@@ -990,9 +1080,9 @@ def _cli_test_menu():
             print(f"  错误: {e}")
 
 def _gps_replay_menu():
-    """V4-Local GPS 回放系统"""
+    """GPS 回放系统"""
     print("\n" + "=" * 55)
-    print("  V4-Local GPS 回放系统")
+    print("  GPS 回放系统")
     print("=" * 55)
     print("\n  功能: 通过 EventBus 回放 GPS 数据")
     print("\n  命令 (在终端中使用):")
@@ -1031,10 +1121,10 @@ def _gps_replay_menu():
                 print(f"  文件不存在: {fp}")
 
 def _plugin_menu():
-    """V4-Local 插件管理"""
+    """插件管理"""
     from upgrade.plugin_sdk import manager
     print("\n" + "=" * 55)
-    print("  V4-Local 插件管理")
+    print("  插件管理")
     print("=" * 55)
     while True:
         plugins = manager.list()
@@ -1059,9 +1149,9 @@ def _plugin_menu():
 
 
 def _result_service_menu():
-    """V4-Local 结果服务 — 工业测试裁决"""
+    """结果服务 — 工业测试裁决"""
     print("\n" + "=" * 55)
-    print("  V4-Local 结果服务 (Result Service)")
+    print("  结果服务 ")
     print("=" * 55)
     print("\n  功能: 计算设备勘察结果 (1=正确 / 0=错误 / -1=未知)")
     print("  依据: 4.docx 结果输出接口增强版")
@@ -1077,8 +1167,8 @@ def _result_service_menu():
         print("  1. 查询设备结果")
         print("  2. 测试计算设备结果")
         print("  3. 查看全部结果")
-        print("  4. 启动 Result API (端口 8081)")
-        print("  5. 停止 Result API")
+        print("  4. 启动结果查询接口 (端口 8081)")
+        print("  5. 停止结果查询接口")
         print("  6. 清空结果")
         print("  0. 返回")
         ch = input("\n选择: ").strip()
@@ -1108,10 +1198,10 @@ def _result_service_menu():
             import threading
             t = threading.Thread(target=api_server.start, daemon=True)
             t.start()
-            print("  Result API 已启动: http://localhost:8081/result/")
+            print("  结果查询接口已启动: http://localhost:8081/result/")
         elif ch == "5":
             api_server.stop()
-            print("  Result API 已停止")
+            print("  结果查询接口已停止")
         elif ch == "6":
             store.clear()
             print("  结果已清空")
