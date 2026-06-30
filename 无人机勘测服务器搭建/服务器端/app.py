@@ -266,11 +266,18 @@ def _view_shard():
         if c['gps_records'] > 0:
             show = input("\n是否查看详细数据（y/n）: ").strip().lower()
             if show == "y":
-                gps_list = db.get_all_gps(50)
+                from collections import defaultdict
+                gps_list = db.get_all_gps(200)
+                batches = defaultdict(dict)
                 for r in gps_list:
-                    print(f"  batch={r.get('batch_id','?'):<10} group={r.get('group_label','?'):<2} "
-                          f"纬度={r.get('lat',0):.4f} 经度={r.get('lng',0):.4f} "
-                          f"东向={r.get('e',0):.3f} 北向={r.get('n',0):.3f} 高度={r.get('u',0):.3f}")
+                    batches[r.get('batch_id','?')][r.get('group_label','?')] = r
+                for bid in sorted(batches, key=lambda x: str(x)):
+                    grp = batches[bid]
+                    a = grp.get('A', {}); b = grp.get('B', {}); c = grp.get('C', {})
+                    print(f"  batch={bid}")
+                    print(f"    A: 纬度={a.get('lat',0):.4f} 经度={a.get('lng',0):.4f}  东向={a.get('e',0):.3f}  北向={a.get('n',0):.3f}  高度={a.get('u',0):.3f}")
+                    print(f"    B: 纬度={b.get('lat',0):.4f} 经度={b.get('lng',0):.4f}  东向={b.get('e',0):.3f}  北向={b.get('n',0):.3f}  高度={b.get('u',0):.3f}")
+                    print(f"    C: 纬度={c.get('lat',0):.4f} 经度={c.get('lng',0):.4f}  东向={c.get('e',0):.3f}  北向={c.get('n',0):.3f}  高度={c.get('u',0):.3f}")
 
 
 def _view_main_old():
@@ -1175,12 +1182,19 @@ def _view_main():
         for k, v in summary.items():
             print(f"    {k}: {v}")
         print("\n  最近GPS记录:")
-        gps = db.get_all_gps(20)
+        from collections import defaultdict
+        gps = db.get_all_gps(200)
+        batches = defaultdict(dict)
         for r in gps:
-            print(f"    {r.get('batch_id','?'):<20} {r.get('region_code','?'):<4} "
-                  f"分组={r.get('group_label','?'):<2} "
-                  f"纬度={r.get('lat',0):.4f} 经度={r.get('lng',0):.4f} "
-                  f"东向={r.get('e',0):.3f} 北向={r.get('n',0):.3f} 高度={r.get('u',0):.3f}")
+            batches[r.get('batch_id','?')][r.get('group_label','?')] = r
+        for bid in sorted(batches, key=lambda x: str(x)):
+            grp = batches[bid]
+            a = grp.get('A', {}); b = grp.get('B', {}); c = grp.get('C', {})
+            rc = a.get('region_code', '?')
+            print(f"    batch={bid:<10} {rc:<4}")
+            print(f"      A: 纬度={a.get('lat',0):.4f} 经度={a.get('lng',0):.4f}  东向={a.get('e',0):.3f}  北向={a.get('n',0):.3f}  高度={a.get('u',0):.3f}")
+            print(f"      B: 纬度={b.get('lat',0):.4f} 经度={b.get('lng',0):.4f}  东向={b.get('e',0):.3f}  北向={b.get('n',0):.3f}  高度={b.get('u',0):.3f}")
+            print(f"      C: 纬度={c.get('lat',0):.4f} 经度={c.get('lng',0):.4f}  东向={c.get('e',0):.3f}  北向={c.get('n',0):.3f}  高度={c.get('u',0):.3f}")
         results = db.get_all_results(10)
         if results:
             print("\n  最近结果:")
