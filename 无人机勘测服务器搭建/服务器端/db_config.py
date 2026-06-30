@@ -25,6 +25,24 @@ REGION_CONFIG = {
         "rural_alt_min": 0.0, "rural_alt_max": 250.0,
         "boundary": {"points": [(29.4,119.8),(30.15,119.8),(30.15,121.3),(29.4,121.3)]},
     },
+    "zhejiang": {
+        "code": "ZJ", "name": "浙江",
+        "db_path": os.path.join(DB_DIR, "Home-ZJ.duckdb"),
+        "rural_alt_min": 0.0, "rural_alt_max": 250.0,
+        "boundary": {"points": [(28.0,118.0),(31.0,118.0),(31.0,123.0),(28.0,123.0)]},
+    },
+    "yunnan": {
+        "code": "YN", "name": "云南",
+        "db_path": os.path.join(DB_DIR, "Home-YN.duckdb"),
+        "rural_alt_min": 0.0, "rural_alt_max": 3500.0,
+        "boundary": {"points": [(21.0,97.0),(29.0,97.0),(29.0,106.0),(21.0,106.0)]},
+    },
+    "zhaotong": {
+        "code": "ZT", "name": "昭通",
+        "db_path": os.path.join(DB_DIR, "Home-ZT.duckdb"),
+        "rural_alt_min": 0.0, "rural_alt_max": 4000.0,
+        "boundary": {"points": [(26.5,102.5),(29.0,102.5),(29.0,105.5),(26.5,105.5)]},
+    },
 }
 
 MAIN_DB_PATH = os.path.join(DB_DIR, "Home-ALL.duckdb")

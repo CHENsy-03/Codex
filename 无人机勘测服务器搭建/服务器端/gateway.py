@@ -53,7 +53,7 @@ class SurveyGateway:
         gps_region = None
         if lat is not None and lng is not None:
             _ad = find_admin(lat, lng)
-            _cm = {'\u676d\u5dde': 'hangzhou', '\u7ecd\u5174': 'shaoxing'}
+            _cm = {'\u676d\u5dde': 'hangzhou', '\u7ecd\u5174': 'shaoxing', '\u662d\u901a\u5e02': 'zhaotong'}
             gps_region = _cm.get(_ad.get('l1', '')) or which_polygon(lat, lng, REGION_CONFIG)
 
         # Layer 3: reconcile

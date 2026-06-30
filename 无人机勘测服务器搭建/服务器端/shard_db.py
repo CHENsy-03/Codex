@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 5.docx §9 数据库改造 - 分片数据库管理器
 4表结构: device_data / gps_data / result_data / event_log
@@ -18,6 +18,7 @@ from db_config import (
 from db_base import DatabaseBase
 
 logger = logging.getLogger(__name__)
+CITY_TO_PROVINCE_MAP = {"hangzhou": "zhejiang", "shaoxing": "zhejiang", "zhaotong": "yunnan"}
 
 def _enu(pt: dict) -> tuple:
     """从 dict 提取 e/n/u，兼容旧版 h/v/d 格式"""
@@ -363,6 +364,10 @@ class BatchShardMerger:
             except:
                 pass
         self._shards = {}
+        try: self.main_conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_gps ON gps_data(batch_id, group_label, region_code)")
+        except: pass
+        try: self.main_conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_result ON result_data(batch_id, region_code)")
+        except: pass
 
     def get_shard(self, region_code):
         if region_code not in self._shards:
@@ -373,40 +378,60 @@ class BatchShardMerger:
 
     def merge_all_regions(self) -> dict:
         results = {}
-        for rc in __import__("db_config").REGION_CONFIG:
+        _dc = __import__("db_config")
+        _c2p = __import__("shard_db").CITY_TO_PROVINCE_MAP
+        # Phase 1: City -> Province
+        for city_rc, prov_rc in _c2p.items():
             try:
-                shard = self.get_shard(rc)
-                gps_rows = shard.get_all_gps(99999)
-                result_rows = shard.get_results(99999)
-                ig = 0
+                city_shard = self.get_shard(city_rc)
+                prov_shard = self.get_shard(prov_rc)
+                try: prov_shard.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_gps ON gps_data(batch_id, group_label, region_code)")
+                except: pass
+                try: prov_shard.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_result ON result_data(batch_id, region_code)")
+                except: pass
+                gps_rows = city_shard.get_all_gps(99999) or []
+                result_rows = city_shard.get_results(99999) or []
+                ig = ir = 0
                 for r in gps_rows:
                     try:
-                        self.main_conn.execute(f"INSERT INTO {__import__('db_config').TABLE_GPS_DATA} (batch_id,region_code,group_label,lat,lng,alt,e,n,u,h,v,d,is_correct,device_id,survey_time,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
-                                              (r["batch_id"],r["region_code"],r["group_label"],
-                                               r["lat"],r["lng"],r["alt"],r["e"],r["n"],r["u"],
-                                               r["h"],r["v"],r["d"],r["is_correct"],
-                                               r["device_id"],r["survey_time"],r["created_at"]))
+                        prov_shard.conn.execute(f"INSERT INTO {_dc.TABLE_GPS_DATA} (batch_id,region_code,group_label,lat,lng,alt,e,n,u,h,v,d,is_correct,device_id,survey_time,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
+                            (r["batch_id"],r["region_code"],r["group_label"],r["lat"],r["lng"],r["alt"],r["e"],r["n"],r["u"],r["h"],r["v"],r["d"],r["is_correct"],r["device_id"],r["survey_time"],r["created_at"]))
                         ig += 1
-                    except:
-                        pass
-                ir = 0
+                    except: pass
                 for r in result_rows:
                     try:
-                        self.main_conn.execute(f"INSERT INTO {__import__('db_config').TABLE_RESULT_DATA} (batch_id,device_id,region_code,result,reason,score,ab_e,ab_n,ab_u,ac_e,ac_n,ac_u,bc_e,bc_n,bc_u,is_correct,survey_time,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
-                                              (r["batch_id"],r["device_id"],r["region_code"],
-                                               r["result"],r["reason"],r["score"],
-                                               r["ab_e"],r["ab_n"],r["ab_u"],
-                                               r["ac_e"],r["ac_n"],r["ac_u"],
-                                               r["bc_e"],r["bc_n"],r["bc_u"],
-                                               r["is_correct"],r["survey_time"],r["created_at"]))
+                        prov_shard.conn.execute(f"INSERT INTO {_dc.TABLE_RESULT_DATA} (batch_id,device_id,region_code,result,reason,score,ab_e,ab_n,ab_u,ac_e,ac_n,ac_u,bc_e,bc_n,bc_u,is_correct,survey_time,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
+                            (r["batch_id"],r["device_id"],r["region_code"],r["result"],r["reason"],r["score"],r["ab_e"],r["ab_n"],r["ab_u"],r["ac_e"],r["ac_n"],r["ac_u"],r["bc_e"],r["bc_n"],r["bc_u"],r["is_correct"],r["survey_time"],r["created_at"]))
                         ir += 1
-                    except:
-                        pass
+                    except: pass
+                results[f"{city_rc}->{prov_rc}"] = f"gps={ig} results={ir}"
+            except Exception as e:
+                results[f"{city_rc}->{prov_rc}"] = f"error: {e}"
+        # Phase 2: Province -> Main (skip cities)
+        for rc in _dc.REGION_CONFIG:
+            if rc in _c2p:
+                continue
+            try:
+                shard = self.get_shard(rc)
+                gps_rows = shard.get_all_gps(99999) or []
+                result_rows = shard.get_results(99999) or []
+                ig = ir = 0
+                for r in gps_rows:
+                    try:
+                        self.main_conn.execute(f"INSERT INTO {_dc.TABLE_GPS_DATA} (batch_id,region_code,group_label,lat,lng,alt,e,n,u,h,v,d,is_correct,device_id,survey_time,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
+                            (r["batch_id"],r["region_code"],r["group_label"],r["lat"],r["lng"],r["alt"],r["e"],r["n"],r["u"],r["h"],r["v"],r["d"],r["is_correct"],r["device_id"],r["survey_time"],r["created_at"]))
+                        ig += 1
+                    except: pass
+                for r in result_rows:
+                    try:
+                        self.main_conn.execute(f"INSERT INTO {_dc.TABLE_RESULT_DATA} (batch_id,device_id,region_code,result,reason,score,ab_e,ab_n,ab_u,ac_e,ac_n,ac_u,bc_e,bc_n,bc_u,is_correct,survey_time,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
+                            (r["batch_id"],r["device_id"],r["region_code"],r["result"],r["reason"],r["score"],r["ab_e"],r["ab_n"],r["ab_u"],r["ac_e"],r["ac_n"],r["ac_u"],r["bc_e"],r["bc_n"],r["bc_u"],r["is_correct"],r["survey_time"],r["created_at"]))
+                        ir += 1
+                    except: pass
                 results[rc] = f"gps={ig} results={ir}"
             except Exception as e:
                 results[rc] = f"error: {e}"
         return results
-
     def close(self):
         for s in list(self._shards.values()):
             try:

@@ -1,4 +1,4 @@
-"""
+﻿"""
 位置勘测数据管理系统
 ====================
 定位器读取经纬度+高度，获取 H/V/D 位置差分精度，A/B/C 三组不重复数据。
@@ -104,11 +104,11 @@ def main():
         print("  2. 模拟定位器自动录入")
         print("  3. 查看分部服务器数据")
         print("  4. 查看总部服务器数据")
-        print("  5. 查看总部汇总统计")
-        print("  6. 图表/Excel 数据导入（JSON/Excel 接口）")
-        print("  7. 网络健康检查区 (Check Zone)")
-        print("  8. 数据管理 (删除/清除缓存)")
-        print("  9. 系统升级功能 (重复检测/熔断/统计API)")
+
+        print("  5. 图表/Excel 数据导入（JSON/Excel 接口）")
+        print("  6. 网络健康检查区 (Check Zone)")
+        print("  7. 数据管理 (删除/清除缓存)")
+        print("  8. 系统升级功能 (重复检测/熔断/统计API)")
         print("  A. V4-Local EventBus 状态与回放")
         print("  B. V4-Local CLI 测试引擎")
         print("  C. V4-Local GPS 回放系统")
@@ -133,19 +133,16 @@ def main():
         elif choice == "4":
             _view_main()
 
+
         elif choice == "5":
-            _view_summary()
-
-        elif choice == "6":
             _chart_import()
-        elif choice == "7":
+        elif choice == "6":
             _show_check_zone()
-        elif choice == "8":
+        elif choice == "7":
             _data_management()
 
+
         elif choice == "8":
-            _data_management()
-        elif choice == "9":
             _upgrade_menu()
         elif choice == "A" or choice == "a":
             _eventbus_menu()
@@ -164,6 +161,16 @@ def main():
 # ============================================================
 # 操作实现
 # ============================================================
+    if choice == "4":
+        from shard_db import BatchShardMerger
+        m = BatchShardMerger()
+        r = m.merge_all_regions()
+        m.close()
+        print()
+        for k, v in r.items():
+            print(f"  {k}: {v}")
+        input("\n按 Enter 继续...")
+        return
 def _select_region() -> str:
     """选择地区"""
     print("\n可用地区：")
@@ -254,52 +261,59 @@ def _auto_simulate():
 
 
 def _view_shard():
-    """查看分部数据"""
-    region_code = _select_region()
-    cfg = REGION_CONFIG[region_code]
+    """查看分部服务器数据 - 三级分层：省→市→数据"""
+    from utils.admin_regions import PROVINCES, CITIES as _CITIES
+    _CRM = {"杭州": "hangzhou", "绍兴": "shaoxing", "昭通市": "zhaotong"}
+    _prov = sorted(PROVINCES.items())
+    while True:
+        print()
+        print("一级 - 省级分部：")
+        for i,(_,pn) in enumerate(_prov,1):
+            print(f"  {i}. {pn}")
+        print(f"  {len(_prov)+1}. 返回")
+        c = input("请选择省份: ").strip()
+        if not c.isdigit(): continue
+        ic = int(c)
+        if ic == len(_prov)+1: return
+        if not(1<=ic<=len(_prov)): continue
+        pc,pn = _prov[ic-1]
+        _city = [(cc,cn) for cc,cn in _CITIES.items() if cc[:2]==pc]
+        while True:
+            print()
+            print(f"二级 - {pn} 市级分部：")
+            for i,(_,cn) in enumerate(_city,1):
+                print(f"  {i}. {cn}")
+            print(f"  {len(_city)+1}. 返回")
+            c2 = input("请选择城市: ").strip()
+            if not c2.isdigit(): continue
+            i2 = int(c2)
+            if i2 == len(_city)+1: break
+            if not(1<=i2<=len(_city)): continue
+            _,cn = _city[i2-1]
+            rc = _CRM.get(cn,"")
+            if not rc: print("未找到"+cn+"数据库"); continue
+            from shard_db import ShardDatabase
+            from db_config import REGION_CONFIG
+            cfg = REGION_CONFIG.get(rc, {})
+            with ShardDatabase(rc) as db:
+                _c = db.count_all()
+                print(f"\n{cn} ({cfg.get(chr(99)+chr(111)+chr(100)+chr(101),chr(63))}) - GPS: {_c.get(chr(103)+chr(112)+chr(115)+chr(95)+chr(114)+chr(101)+chr(99)+chr(111)+chr(114)+chr(100)+chr(115),0)} 结果: {_c.get(chr(114)+chr(101)+chr(115)+chr(117)+chr(108)+chr(116)+chr(115),0)}")
+                if _c.get("gps_records",0) > 0:
+                    if input("\n查看详细? (y/n): ").strip().lower()=="y":
+                        from collections import defaultdict
+                        _gl = db.get_all_gps(200)
+                        _bt = defaultdict(dict)
+                        for r in _gl: _bt[r.get("batch_id","?")][r.get("group_label","?")] = r
+                        for bd in sorted(_bt, key=lambda x: str(x)):
+                            gp = _bt[bd]
+                            for lb in ["A","B","C"]:
+                                d = gp.get(lb,{})
+                                print(f"  batch={bd}")
+                                print(f"    {lb}: 纬度={d.get(chr(108)+chr(97)+chr(116),0):.4f} 经度={d.get(chr(108)+chr(110)+chr(103),0):.4f}  东向={d.get(chr(101),0):.3f}  北向={d.get(chr(110),0):.3f}  高度={d.get(chr(117),0):.3f}")
+            input("\n按 Enter 继续...")
 
-    with ShardDatabase(region_code) as db:
-        c = db.count_all()
-        print(f"\n{cfg['name']}分部 ({cfg['code']}) 汇总：")
-        print(f"  设备: {c['devices']}  GPS记录: {c['gps_records']}  结果: {c['results']}  日志: {c['logs']}")
-
-        if c['gps_records'] > 0:
-            show = input("\n是否查看详细数据（y/n）: ").strip().lower()
-            if show == "y":
-                from collections import defaultdict
-                gps_list = db.get_all_gps(200)
-                batches = defaultdict(dict)
-                for r in gps_list:
-                    batches[r.get('batch_id','?')][r.get('group_label','?')] = r
-                for bid in sorted(batches, key=lambda x: str(x)):
-                    grp = batches[bid]
-                    a = grp.get('A', {}); b = grp.get('B', {}); c = grp.get('C', {})
-                    print(f"  batch={bid}")
-                    print(f"    A: 纬度={a.get('lat',0):.4f} 经度={a.get('lng',0):.4f}  东向={a.get('e',0):.3f}  北向={a.get('n',0):.3f}  高度={a.get('u',0):.3f}")
-                    print(f"    B: 纬度={b.get('lat',0):.4f} 经度={b.get('lng',0):.4f}  东向={b.get('e',0):.3f}  北向={b.get('n',0):.3f}  高度={b.get('u',0):.3f}")
-                    print(f"    C: 纬度={c.get('lat',0):.4f} 经度={c.get('lng',0):.4f}  东向={c.get('e',0):.3f}  北向={c.get('n',0):.3f}  高度={c.get('u',0):.3f}")
 
 
-def _view_main_old():
-    """查看总部数据（旧版兼容）"""
-    _view_main()
-
-
-def _view_summary():
-    """查看总部汇总"""
-    with MainDatabase() as db:
-        s = db.get_summary()
-
-        print("\n" + "=" * 40)
-        print("  总部 (Home-ALL) 数据汇总")
-        print("=" * 40)
-        print(f"  GPS记录: {s.get('total_gps',0)}")
-        print(f"  结果: {s.get('total_results',0)}")
-        print(f"  正确: {s.get('correct',0)}  错误: {s.get('failed',0)}")
-        if s.get("regions"):
-            print("\n  按地区分布：")
-            for r, cnt in s["regions"].items():
-                print(f"    {r}: {cnt} 条")
 
 
 def detect_file_format(path):
@@ -687,12 +701,14 @@ def _chart_import():
         from utils.admin_regions import find_admin
         from utils.geo import which_polygon
         CITY_REGION_MAP = {"杭州": "hangzhou", "绍兴": "shaoxing"}
+        CITY_REGION_MAP["昭通市"] = "zhaotong"
+        PROVINCE_REGION_MAP = {"浙江": "zhejiang", "云南": "yunnan"}
         region_groups = {}
         for rec in data:
             avg_lat = (float(rec.get("a_lat",0))+float(rec.get("b_lat",0))+float(rec.get("c_lat",0)))/3
             avg_lng = (float(rec.get("a_lng",0))+float(rec.get("b_lng",0))+float(rec.get("c_lng",0)))/3
             _ad = find_admin(avg_lat, avg_lng)
-            rc = CITY_REGION_MAP.get(_ad.get("l1", "")) or which_polygon(avg_lat, avg_lng, REGION_CONFIG) or "hangzhou"
+            rc = CITY_REGION_MAP.get(_ad.get("l1", "")) or PROVINCE_REGION_MAP.get(_ad.get("p", "")) or which_polygon(avg_lat, avg_lng, REGION_CONFIG) or "hangzhou"
             region_groups.setdefault(rc, []).append(rec)
         total_ok = 0
         all_msgs = []
@@ -796,9 +812,20 @@ def _data_management():
     print("  1. 删除指定数据 (按 batch_id)")
     print("  2. 清空全部数据 (分库和总库)")
     print("  3. 清除上传缓冲区和锁文件")
+    print("  4. 合并分库到总库（三级链路）")
     print("  0. 返回")
     choice = input("\n请选择: ").strip()
     if choice == "0":
+        return
+    if choice == "4":
+        from shard_db import BatchShardMerger
+        m = BatchShardMerger()
+        r = m.merge_all_regions()
+        m.close()
+        print()
+        for k, v in r.items():
+            print(f"  {k}: {v}")
+        input("\n按 Enter 继续...")
         return
     region_code = _select_region()
     with ShardDatabase(region_code) as db:
@@ -1173,35 +1200,92 @@ def _run_cli_export(fmt, region):
 
 
 def _view_main():
-    """查看总部服务器数据 (新4表)"""
+    """查看总部服务器数据 (合并汇总)"""
     from main_db import MainDatabase
+    from utils.admin_regions import PROVINCES, CITIES as _CITIES
+    _CRM = {"杭州":"hangzhou","绍兴":"shaoxing","昭通市":"zhaotong"}
     with MainDatabase() as db:
-        summary = db.get_summary()
-        print("\n  总部数据库统计:")
-        lbl = {"total_gps":"GPS数","total_results":"结果数","correct":"正确","failed":"错误","regions":"地区"}
-        for k, v in summary.items():
-            print(f"    {k}: {v}")
-        print("\n  最近GPS记录:")
-        from collections import defaultdict
-        gps = db.get_all_gps(200)
-        batches = defaultdict(dict)
-        for r in gps:
-            batches[r.get('batch_id','?')][r.get('group_label','?')] = r
-        for bid in sorted(batches, key=lambda x: str(x)):
-            grp = batches[bid]
-            a = grp.get('A', {}); b = grp.get('B', {}); c = grp.get('C', {})
-            rc = a.get('region_code', '?')
-            print(f"    batch={bid:<10} {rc:<4}")
-            print(f"      A: 纬度={a.get('lat',0):.4f} 经度={a.get('lng',0):.4f}  东向={a.get('e',0):.3f}  北向={a.get('n',0):.3f}  高度={a.get('u',0):.3f}")
-            print(f"      B: 纬度={b.get('lat',0):.4f} 经度={b.get('lng',0):.4f}  东向={b.get('e',0):.3f}  北向={b.get('n',0):.3f}  高度={b.get('u',0):.3f}")
-            print(f"      C: 纬度={c.get('lat',0):.4f} 经度={c.get('lng',0):.4f}  东向={c.get('e',0):.3f}  北向={c.get('n',0):.3f}  高度={c.get('u',0):.3f}")
-        results = db.get_all_results(10)
-        if results:
-            print("\n  最近结果:")
-            for r in results:
-                em = {1:"OK",0:"FAIL",-1:"?" }
-                print(f"    {r.get('batch_id','?'):<20} 结果={em.get(r.get('result'),'?')} "
-                      f"原因={r.get('reason','')}")
+        s = db.get_summary()
+        tot_gps = s.get("total_gps",0); tot_res = s.get("total_results",0)
+        print("\n" + "="*50)
+        print("  总部服务器数据统计")
+        print("="*50)
+        print(f"  总GPS记录: {tot_gps}")
+        print(f"  总结果数: {tot_res}")
+        print(f"  总勘测点: {tot_gps//3 if tot_gps else 0} 个")
+        print()
+        # 省统计从主库regions字段获取
+        _REGION_PROV = {"HW":"浙江","SX":"浙江","ZT":"云南"}
+        _prov_cnt = {}
+        for _rc, _c in s.get("regions",{}).items():
+            _p = _REGION_PROV.get(_rc.upper(), "")
+            if _p: _prov_cnt[_p] = _prov_cnt.get(_p, 0) + _c
+        _pv = sorted(PROVINCES.items())
+        for _, pn in _pv:
+            print(f"  {pn} - {_prov_cnt.get(pn, 0)}条GPS记录")
+        print("  \u8bf7选择省份查看详情：")
+        for i,(_,pn) in enumerate(_pv,1):
+            print(f"  {i}. {pn}")
+        print(f"  {len(_pv)+1}. 返回")
+        c = input("\n输入选择: ").strip()
+        if c.isdigit() and 1 <= int(c) <= len(_pv):
+            pc,pn = _pv[int(c)-1]
+            _show_province_detail(pn, pc, _CRM)
+
+
+
+def _show_province_detail(pname, pcode, _CRM):
+
+    """显示省级详情：最近30条记录"""
+
+    _cities = [(cn, _CRM.get(cn,"")) for cc,cn in [("330100","杭州"),("330600","绍兴"),("530600","昭通市")] if cc.startswith(pcode)]
+
+    all_rec = []; from shard_db import ShardDatabase
+
+    for cn, rc in _cities:
+
+        if not rc: continue
+
+        try:
+
+            with ShardDatabase(rc) as sd:
+
+                for r in sd.get_all_gps(100):
+
+                    all_rec.append(r)
+
+        except: pass
+
+    all_rec.sort(key=lambda x: str(x.get("batch_id","")), reverse=True)
+
+    recent = all_rec[:30]
+
+    total = len(set(r.get("batch_id","") for r in all_rec))
+
+    print(f"\n  {pname}总的无人机勘测点: {total}")
+
+    print(f"  最近存储的{len(recent)}个定位点：")
+
+    _rc_map = {"杭州":"HW","绍兴":"SX","昭通市":"ZT"}
+
+    for r in recent:
+
+        bid = r.get("batch_id","?")
+
+        cn = r.get("region_code","")
+
+        for k,v in _rc_map.items():
+
+            rrc = _CRM.get(k,"")
+
+            if rrc and rrc.upper() == cn.upper():
+
+                cn = v; break
+
+        print(f"    Home-{cn}-batch={bid:<12}  纬度={r.get("lat",0):.4f} 经度={r.get("lng",0):.4f} 东向={r.get("e",0):.3f} 北向={r.get("n",0):.3f} 高度={r.get("u",0):.3f}")
+
+    input("\n按 Enter 继续...")
+
 
 if __name__ == "__main__":
     cli_main()
