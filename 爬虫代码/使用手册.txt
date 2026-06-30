@@ -1,0 +1,96 @@
+============================================================
+  政府网站政策爬虫 - 小白运行手册
+============================================================
+
+【一、这是干什么的】
+这个工具可以自动去政府网站搜索关键词（比如低空经济、低空政策），
+找到相关的政策文件并保存下来。
+
+【二、下载和安装】
+1. 把 爬虫代码.zip 解压到电脑的一个文件夹
+2. 确保电脑已经安装了 Python（版本 3.9 以上）
+   没安装的话去 https://www.python.org/downloads/ 下载安装
+3. 打开 命令提示符(cmd) 或 PowerShell
+4. 进入解压后的文件夹：
+   cd 爬虫代码的完整路径
+5. 安装依赖库（只需要运行一次）：
+   pip install requests lxml
+   pip install selenium   （浏览器模式需要）
+
+【三、最简单的搜索】
+搜索北京财政局的 低空经济：
+
+   python main.py --site czj_beijing --keywords 低空经济
+
+等待几秒，看到 [OK] 采集完成 就说明成功了。
+结果保存在 output/ 文件夹里，有 JSON 和 CSV 两种格式。
+CSV 文件可以用 Excel 直接打开。
+
+【四、搜索其他关键词】
+把 --keywords 后面的词换成你想要的：
+
+   python main.py --site czj_beijing --keywords 低空政策
+   python main.py --site czj_beijing --keywords 低空经济 低空政策
+
+多个关键词用空格隔开。
+
+【五、搜索其他站点】
+目前内置了以下站点（--site 后面跟的名字）：
+
+   czj_beijing    北京市财政局（推荐，最快）
+   bj_gov         北京市人民政府
+   czj_hangzhou   杭州市财政局
+   sxcs_shaoxing  绍兴市财政局
+
+示例：
+
+   python main.py --site bj_gov --keywords 低空经济
+   python main.py --site sxcs_shaoxing --keywords 低空经济
+
+【六、查找并添加新网站】
+尝试自动发现新网站的搜索配置：
+
+   python main.py --discover https://xxx.gov.cn
+
+如果自动发现没用，可以手动配置。
+打开 config/sites_config.json 文件，
+按照里面已有的站点格式添加新站点信息即可。
+
+【七、从文章链接抓取内容】
+如果你已经知道某篇文章的网址：
+
+1. 新建一个文本文件 urls.txt
+2. 每行写一个网址：
+   https://xxx.gov.cn/art/2025/3/6/art_123.html
+   https://xxx.gov.cn/art/2024/9/10/art_456.html
+3. 运行：
+   python main.py --urls urls.txt
+
+【八、结果文件说明】
+搜索结果保存在 output/ 目录下：
+
+   *.json  完整数据，可以用任何文本编辑器打开
+   *.csv   表格格式，直接用 Excel 打开
+
+每篇文章包含：标题、网址、发布日期、来源、匹配关键词分数。
+
+【九、常用命令速查】
+
+   自检：             python main.py --self-test
+   搜索：             python main.py --site czj_beijing --keywords 低空经济
+   多关键词：         python main.py --site czj_beijing --keywords 低空经济 低空政策
+   指定输出目录：     python main.py --site czj_beijing --keywords 低空经济 --output my_results
+   获取正文：         python main.py --site czj_beijing --keywords 低空经济 --with-detail
+   网址列表抓取：     python main.py --urls urls.txt
+   探查新站点：       python main.py --discover https://xxx.gov.cn
+   查看帮助：         python main.py --help
+
+【十、注意事项】
+1. 首次运行请先执行 python main.py --self-test 确认环境正常
+2. 搜索速度受网站服务器限制，如果出错等待几秒重试即可
+3. CSV 文件用 Excel 打开时如果中文乱码，用导入功能选择 UTF-8 编码
+4. 结果中的 score 表示文章与关键词的相关度分数（越高越相关）
+
+============================================================
+  如有问题请提供运行时的完整日志截图
+============================================================
