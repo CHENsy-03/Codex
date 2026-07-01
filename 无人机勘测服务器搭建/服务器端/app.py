@@ -26,25 +26,25 @@ from position_compare import compare_position
 
 
 # ============================================================
-def input_group(label: str) -> Dict:
-    """手动输入一组位置数据"""
+def input_group(label: str):
+    """手动输入一组位置数据，输入 q 取消"""
     print(f"\n--- {label}组数据 ---")
-    print("输入格式：纬度 经度 高度(m) H水平精度(cm) V垂直精度(cm) D三维精度(cm)")
+    print("输入格式：纬度 经度 高度 H水平精度 V垂直精度 D三维精度")
     print("示例：30.25 120.16 50.0 3.2 2.8 4.1")
+    print("  (输入 q 取消)")
     while True:
         try:
-            parts = input(f"{label}组> ").strip().split()
+            raw = input(f"{label}组> ").strip()
+            if raw.lower() in ("q","quit","exit"):
+                return None
+            parts = raw.split()
             if len(parts) != 6:
-                print("错误：必须输入 6 个值（lat lng alt H V D）")
+                print("错误：必须输入 6 个值，输入 q 取消")
                 continue
             vals = [float(x) for x in parts]
-            return {
-                "lat": vals[0], "lng": vals[1], "alt": vals[2],
-                "h": vals[3], "v": vals[4], "d": vals[5],
-            }
+            return {"lat": vals[0], "lng": vals[1], "alt": vals[2], "h": vals[3], "v": vals[4], "d": vals[5]}
         except ValueError:
-            print("错误：请输入有效数字")
-
+            print("错误：请输入有效数字，输入 q 取消")
 
 # ============================================================
 # 数据显示
@@ -104,8 +104,8 @@ def main():
             break
 
         elif choice == "1":
-            _manual_input()
-
+            try: _manual_input()
+            except (KeyboardInterrupt, EOFError): print("\n  \xe5\xb7\xb2\xe5\x8f\x96\xe6\xb6\x88\xe5\xbd\x95\xe5\x85\xa5")
         elif choice == "2":
             _view_shard()
 
@@ -163,7 +163,7 @@ def _select_region() -> str:
             idx = int(input("请选择地区: ").strip()) - 1
             if 0 <= idx < len(keys):
                 return keys[idx]
-        except ValueError:
+        except (ValueError, EOFError):
             pass
         print("无效选择")
 
@@ -211,15 +211,18 @@ def _do_survey(region_code: str, A: Dict, B: Dict, C: Dict) -> Tuple[bool, str]:
 
 
 def _manual_input():
-    """手动录入三组数据"""
+    """手动录入三组数据，支持 q 取消"""
     region_code = _select_region()
     print("\n输入三组不重复的勘测数据：")
     A = input_group("A")
+    if not A: print("\n  已取消"); return
     B = input_group("B")
+    if not B: print("\n  已取消"); return
     C = input_group("C")
+    if not C: print("\n  已取消"); return
     _do_survey(region_code, A, B, C)
 def _view_shard():
-    """查看分部服务器数据 - 三级分层：省→市→数据"""
+    """\u67e5\u770b\u5206\u90e8\u670d\u52a1\u5668\u6570\u636e - \u4e09\u7ea7\u5206\u5c42\uff1a\u7701\u2192\u5e02\u2192\u6570\u636e"""
     from utils.admin_regions import PROVINCES, CITIES as _CITIES
     _CRM = {"杭州": "hangzhou", "绍兴": "shaoxing", "昭通市": "zhaotong"}
     _prov = sorted(PROVINCES.items())
@@ -678,7 +681,7 @@ def _chart_import():
     print("支持格式：")
     print("  1. JSON 文件 (.json)")
     print("  2. Excel 文件 (.xlsx/.xls)")
-    print("  3) CSV / TXT 文件 (.csv / .txt)")
+    print("  3. CSV / TXT 文件 (.csv / .txt)")
     print("  4. JSON 手动粘贴")
 
     path = input("\n输入文件路径： ").strip().strip('"').strip("'")
@@ -1291,7 +1294,7 @@ def _view_main():
         print(f"  总勘测点: {tot_gps//3 if tot_gps else 0} 个")
         print()
         # 省统计从主库regions字段获取
-        _REGION_PROV = {"HW":"浙江","SX":"浙江","ZT":"云南"}
+        _REGION_PROV = {"hangzhou":"浙江","shaoxing":"浙江","zhejiang":"浙江","zhaotong":"云南","yunnan":"云南"}
         _prov_cnt = {}
         for _rc, _c in s.get("regions",{}).items():
             _p = _REGION_PROV.get(_rc.upper(), "")
@@ -1315,12 +1318,12 @@ def _show_province_detail(pname, pcode, _CRM):
     from main_db import MainDatabase
     from db_config import REGION_CONFIG
     _city_rc = [(cn, _CRM.get(cn,"")) for cc,cn in [("330100","杭州"),("330600","绍兴"),("530600","昭通市")] if cc.startswith(pcode)]
-    _region_upper = [REGION_CONFIG.get(rc,{}).get("code","").upper() for _,rc in _city_rc if rc]
+    _region_keys = [rc for _,rc in _city_rc if rc]
     all_rec = []
     with MainDatabase() as db:
-        try: all_rec = db.get_all_gps(500) or []
+        try: all_rec = db.get_all_gps(99999) or []
         except: all_rec = []
-    prov_rec = [r for r in all_rec if str(r.get("region_code","")).upper() in _region_upper]
+    prov_rec = [r for r in all_rec if str(r.get("region_code","")).lower() in _region_keys]
     prov_rec.sort(key=lambda x: int(re.search(r'\d+', str(x.get('batch_id',''))).group()) if re.search(r'\d+', str(x.get('batch_id',''))) else 0)
     total = len(set(r.get("batch_id","") for r in prov_rec))
     _PS = 30; _tp = (len(prov_rec)+_PS-1)//_PS if prov_rec else 1; _cp = 0
@@ -1352,4 +1355,5 @@ def _show_province_detail(pname, pcode, _CRM):
 
 if __name__ == "__main__":
     cli_main()
+
 
