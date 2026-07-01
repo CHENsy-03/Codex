@@ -1,0 +1,1 @@
+                                    print(f"    {lb}: \xe7\xba\xac\xe5\xba\xa6={d.get(chr(108)+chr(97)+chr(116),0):.4f} \xe7\xbb\x8f\xe5\xba\xa6={d.get(chr(108)+chr(110)+chr(103),0):.4f}  \xe4\xb8\x9c\xe5\x90\x91={d.get(chr(101),0):.3f}  \xe5\x8c\x97\xe5\x90\x91={d.get(chr(110),0):.3f}  \xe9\xab\x98\xe5\xba\xa6={d.get(chr(117),0):.3f}")

@@ -334,7 +334,7 @@ def find_district(lat, lon, city):
 
 def generate_city_messages(mode, num_waypoints):
     if mode == 1:
-        city_names = ["绍兴", "杭州"]
+        city_names = ["绍兴", "杭州", "昭通"]
     elif mode == 2:
         city_names = ["绍兴"]
     else:
@@ -476,7 +476,7 @@ def run_menu_mode():
         print("=" * 60)
         print()
         print("一级菜单 - 请选择区域模式:")
-        print("  1. 随机地区生成（绍兴/杭州混合）")
+        print("  1. 随机地区生成（绍兴/杭州/昭通混合）")
         print("  2. 精确地区生成（指定城市）")
         print("  q. 退出")
         print()
@@ -521,7 +521,7 @@ def _specific_submenu():
     print("  3. 昭通(ZT)")
     print("  4. 自定义地区（预留）")
     print("  b. 返回上一级")
-    city = _get_input("请输入 1/2/3/b: ")
+    city = _get_input("请输入 1/2/3/4/b: ")
     if city is None:
         return
     cities, prefix = None, None

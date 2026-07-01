@@ -26,23 +26,6 @@ from position_compare import compare_position
 
 
 # ============================================================
-# 定位器模拟：读取位置值（经纬度 + 高度），H/V/D 精度
-# ============================================================
-def simulate_positioner() -> Dict:
-    """模拟定位器在 1s 内读取位置数据。
-    返回 {"lat": 纬度, "lng": 经度, "alt": 高度(m), "h": 水平精度(cm), "v": 垂直精度(cm), "d": 三维精度(cm)}
-    """
-    time.sleep(0.1)  # 模拟读数延迟
-    return {
-        "lat": round(random.uniform(29.0, 31.5), 6),   # 纬度
-        "lng": round(random.uniform(118.0, 122.0), 6),  # 经度
-        "alt": round(random.uniform(0, 500), 2),         # 高度(m)
-        "h":   round(random.uniform(1.0, 8.0), 2),       # 水平精度(cm)
-        "v":   round(random.uniform(1.0, 8.0), 2),       # 垂直精度(cm)
-        "d":   round(random.uniform(1.0, 8.0), 2),       # 三维精度(cm)
-    }
-
-
 def input_group(label: str) -> Dict:
     """手动输入一组位置数据"""
     print(f"\n--- {label}组数据 ---")
@@ -101,14 +84,13 @@ def main():
     while True:
         print("\n请选择操作：")
         print("  1. 手动录入勘测数据（A/B/C 三组）")
-        print("  2. 模拟定位器自动录入")
-        print("  3. 查看分部服务器数据")
-        print("  4. 查看总部服务器数据")
+        print("  2. 查看分部服务器数据")
+        print("  3. 查看总部服务器数据")
 
-        print("  5. 图表/数据文件导入")
-        print("  6. 网络健康检查区")
-        print("  7. 数据管理 (删除/清除缓存)")
-        print("  8. 系统升级与统计管理")
+        print("  4. 图表/数据文件导入")
+        print("  5. 网络健康检查区")
+        print("  6. 数据管理 (删除/清除缓存)")
+        print("  7. 系统升级与统计管理")
         print("  A. 事件总线状态与回放")
         print("  B. 命令行测试引擎")
         print("  C. GPS 回放系统")
@@ -125,24 +107,21 @@ def main():
             _manual_input()
 
         elif choice == "2":
-            _auto_simulate()
-
-        elif choice == "3":
             _view_shard()
 
-        elif choice == "4":
+        elif choice == "3":
             _view_main()
 
 
-        elif choice == "5":
+        elif choice == "4":
             _chart_import()
-        elif choice == "6":
+        elif choice == "5":
             _show_check_zone()
-        elif choice == "7":
+        elif choice == "6":
             _data_management()
 
 
-        elif choice == "8":
+        elif choice == "7":
             _upgrade_menu()
         elif choice == "A" or choice == "a":
             _eventbus_menu()
@@ -239,27 +218,6 @@ def _manual_input():
     B = input_group("B")
     C = input_group("C")
     _do_survey(region_code, A, B, C)
-
-
-def _auto_simulate():
-    """模拟定位器自动录入"""
-    region_code = _select_region()
-    print("\n模拟定位器读取（1s 内读取位置值）...")
-
-    A = simulate_positioner()
-    time.sleep(0.3)
-    B = simulate_positioner()
-    time.sleep(0.3)
-    C = simulate_positioner()
-
-    # 让三组数据在同一位置附近（模拟同一轮勘测），但精度值不同
-    base_lat, base_lng, base_alt = A["lat"], A["lng"], A["alt"]
-    B["lat"], B["lng"], B["alt"] = base_lat, base_lng, base_alt
-    C["lat"], C["lng"], C["alt"] = base_lat, base_lng, base_alt
-
-    _do_survey(region_code, A, B, C)
-
-
 def _view_shard():
     """查看分部服务器数据 - 三级分层：省→市→数据"""
     from utils.admin_regions import PROVINCES, CITIES as _CITIES
@@ -321,20 +279,48 @@ def _view_shard():
                 if _c.get("gps_records",0) > 0:
                     if input("\n查看详细数据? (输y查看/n跳过): ").strip().lower()=="y":
                         from collections import defaultdict
-                        _gl = db.get_all_gps(200)
+                        _gl = db.get_all_gps(99999)
                         _bt = defaultdict(dict)
                         for r in _gl:
                             if _sel_dn:
                                 _ad = find_admin(r.get("lat",0), r.get("lng",0))
                                 if _ad["l2"] != _sel_dn: continue
                             _bt[r.get("batch_id","?")][r.get("group_label","?")] = r
-                        for bd in sorted(_bt, key=lambda x: str(x)):
-                            gp = _bt[bd]
-                            for lb in ["A","B","C"]:
-                                d = gp.get(lb,{})
-                                print(f"  batch={bd}")
-                                print(f"    {lb}: 纬度={d.get(chr(108)+chr(97)+chr(116),0):.4f} 经度={d.get(chr(108)+chr(110)+chr(103),0):.4f}  东向={d.get(chr(101),0):.3f}  北向={d.get(chr(110),0):.3f}  高度={d.get(chr(117),0):.3f}")
-            input("\n按 Enter 继续...")
+                        _bids = sorted(_bt, key=lambda x: int(re.search(r'\d+', str(x)).group()) if re.search(r'\d+', str(x)) else 0)
+                        _PS = 30
+                        _tp = (len(_bids) + _PS - 1) // _PS if _bids else 1
+                        _cp = 0
+                        while True:
+                            if not _bids:
+                                print("\n  该区县暂无数据，请尝试“查看全部”")
+                                break
+                            _cs = _cp * _PS
+                            _ce = min(_cs + _PS, len(_bids))
+                            for _bx in range(_cs, _ce):
+                                bd = _bids[_bx]
+                                gp = _bt[bd]
+                                for lb in ['A','B','C']:
+                                    d = gp.get(lb,{})
+                                    print(f"  batch={bd}")
+                                    print(f"    {lb}: 纬度={d.get(chr(108)+chr(97)+chr(116),0):.4f} 经度={d.get(chr(108)+chr(110)+chr(103),0):.4f}  东向={d.get(chr(101),0):.3f}  北向={d.get(chr(110),0):.3f}  高度={d.get(chr(117),0):.3f}")
+                            print(f"\n  --- \u7b2c{_cp+1}/{_tp}\u9875 \u5171{len(_bids)}\u4e2a\u6279\u6b21 ---")
+                            if _cp > 0:
+                                nxt = "\u4e0b\u4e00\u9875" if _cp < _tp-1 else "--"
+                                print(f"  1. {nxt}")
+                                print("  2. \u4e0a\u4e00\u9875")
+                                print("  3. \u9000\u51fa")
+                                c = input("\u9009\u62e9: ").strip()
+                                if c == "1" and _cp < _tp-1: _cp += 1
+                                elif c == "2": _cp -= 1
+                                elif c == "3": break
+                            else:
+                                nxt = "\u4e0b\u4e00\u9875" if _tp > 1 else "--"
+                                print(f"  1. {nxt}")
+                                print("  2. \u9000\u51fa")
+                                c = input("\u9009\u62e9: ").strip()
+                                if c == "1" and _tp > 1: _cp += 1
+                                elif c == "2": break
+            input("\n\u6309 Enter \u7ee7\u7eed...")
 
 
 
@@ -966,10 +952,10 @@ def _upgrade_menu():
         print("\n请选择：")
         print("  1. 查看重复检测统计")
         print("  2. 查看序列完整性检测统计")
-        print("  3. 查看熔断机制状态")
-        print("  4. 手动恢复熔断设备")
-        print("  5. 启动统计接口 (端口 8080)")
-        print("  6. 停止统计接口")
+        print("  2. 查看熔断机制状态")
+        print("  3. 手动恢复熔断设备")
+        print("  4. 启动统计接口 (端口 8080)")
+        print("  5. 停止统计接口")
         print("  0. 返回主菜单")
 
         choice = input("\n请选择: ").strip()
@@ -1095,7 +1081,7 @@ def _gps_replay_menu():
     while True:
         print("\n  1. 回放模拟坐标 (绍兴)")
         print("  2. 回放模拟坐标 (杭州)")
-        print("  3. 从文件回放")
+        print("  2. 从文件回放")
         print("  0. 返回")
         ch = input("选择: ").strip()
         if ch == "0": return
@@ -1166,10 +1152,10 @@ def _result_service_menu():
         print(f"\n  已记录设备: {total} 个")
         print("  1. 查询设备结果")
         print("  2. 测试计算设备结果")
-        print("  3. 查看全部结果")
-        print("  4. 启动结果查询接口 (端口 8081)")
-        print("  5. 停止结果查询接口")
-        print("  6. 清空结果")
+        print("  2. 查看全部结果")
+        print("  3. 启动结果查询接口 (端口 8081)")
+        print("  4. 停止结果查询接口")
+        print("  5. 清空结果")
         print("  0. 返回")
         ch = input("\n选择: ").strip()
         if ch == "0":
@@ -1325,57 +1311,44 @@ def _view_main():
 
 
 def _show_province_detail(pname, pcode, _CRM):
-
-    """显示省级详情：最近30条记录"""
-
-    _cities = [(cn, _CRM.get(cn,"")) for cc,cn in [("330100","杭州"),("330600","绍兴"),("530600","昭通市")] if cc.startswith(pcode)]
-
-    all_rec = []; from shard_db import ShardDatabase
-
-    for cn, rc in _cities:
-
-        if not rc: continue
-
-        try:
-
-            with ShardDatabase(rc) as sd:
-
-                for r in sd.get_all_gps(100):
-
-                    all_rec.append(r)
-
-        except: pass
-
-    all_rec.sort(key=lambda x: str(x.get("batch_id","")), reverse=True)
-
-    recent = all_rec[:30]
-
-    total = len(set(r.get("batch_id","") for r in all_rec))
-
-    print(f"\n  {pname}总的无人机勘测点: {total}")
-
-    print(f"  最近存储的{len(recent)}个定位点：")
-
-    _rc_map = {"杭州":"HW","绍兴":"SX","昭通市":"ZT"}
-
-    for r in recent:
-
-        bid = r.get("batch_id","?")
-
-        cn = r.get("region_code","")
-
-        for k,v in _rc_map.items():
-
-            rrc = _CRM.get(k,"")
-
-            if rrc and rrc.upper() == cn.upper():
-
-                cn = v; break
-
-        print(f"    Home-{cn}-batch={bid:<12}  纬度={r.get("lat",0):.4f} 经度={r.get("lng",0):.4f} 东向={r.get("e",0):.3f} 北向={r.get("n",0):.3f} 高度={r.get("u",0):.3f}")
-
+    """显示省级详情：分页显示最近记录"""
+    from main_db import MainDatabase
+    from db_config import REGION_CONFIG
+    _city_rc = [(cn, _CRM.get(cn,"")) for cc,cn in [("330100","杭州"),("330600","绍兴"),("530600","昭通市")] if cc.startswith(pcode)]
+    _region_upper = [REGION_CONFIG.get(rc,{}).get("code","").upper() for _,rc in _city_rc if rc]
+    all_rec = []
+    with MainDatabase() as db:
+        try: all_rec = db.get_all_gps(500) or []
+        except: all_rec = []
+    prov_rec = [r for r in all_rec if str(r.get("region_code","")).upper() in _region_upper]
+    prov_rec.sort(key=lambda x: int(re.search(r'\d+', str(x.get('batch_id',''))).group()) if re.search(r'\d+', str(x.get('batch_id',''))) else 0)
+    total = len(set(r.get("batch_id","") for r in prov_rec))
+    _PS = 30; _tp = (len(prov_rec)+_PS-1)//_PS if prov_rec else 1; _cp = 0
+    while True:
+        _cs = _cp*_PS; _ce = min(_cs+_PS, len(prov_rec))
+        recent = prov_rec[_cs:_ce] if prov_rec else []
+        print(f"\n  {pname}总的无人机勘测点: {total}")
+        print(f"  定位点（第{_cp+1}/{_tp}页）：")
+        for r in recent:
+            bid=r.get("batch_id","?"); rcode=str(r.get("region_code","")).upper()
+            lat=r.get("lat",0); lng=r.get("lng",0)
+            e=r.get("e",0); n=r.get("n",0); u=r.get("u",0)
+            print(f"    Home-{rcode}-batch={bid:<12}  纬度={lat:.4f} 经度={lng:.4f} 东向={e:.3f} 北向={n:.3f} 高度={u:.3f}")
+        print(f"\n  --- 第{_cp+1}/{_tp}页 ---")
+        if _cp > 0:
+            nxt="下一页" if _cp<_tp-1 else "--"
+            print(f"  1. {nxt}"); print("  2. 上一页"); print("  3. 退出")
+            c=input("选择: ").strip()
+            if c=="1" and _cp<_tp-1: _cp+=1
+            elif c=="2": _cp-=1
+            elif c=="3": break
+        else:
+            nxt="下一页" if _tp>1 else "--"
+            print(f"  1. {nxt}"); print("  2. 退出")
+            c=input("选择: ").strip()
+            if c=="1" and _tp>1: _cp+=1
+            elif c=="2": break
     input("\n按 Enter 继续...")
-
 
 if __name__ == "__main__":
     cli_main()
