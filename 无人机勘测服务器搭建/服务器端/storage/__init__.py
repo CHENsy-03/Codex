@@ -1,1 +1,1 @@
-from .sqlite_storage import SQLiteStorage
+from .duckdb_manager import DuckDBManager
