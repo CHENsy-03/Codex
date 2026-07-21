@@ -1,4 +1,4 @@
-﻿"""瀹炴椂缁熻 API 鈥?浣跨敤 Python 鍐呯疆 http.server
+"""瀹炴椂缁熻 API 鈥?浣跨敤 Python 鍐呯疆 http.server
 
 鎻愪緵绔偣:
   GET /api/survey/stats            鈫?鎬讳綋缁熻

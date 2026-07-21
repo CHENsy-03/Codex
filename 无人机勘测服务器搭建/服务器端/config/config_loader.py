@@ -11,6 +11,7 @@ class DatabaseConfig:
     path: str = "data/gnss_data.duckdb"
     memory_limit: str = "4GB"
     temp_directory: str = "data/temp"
+    scanner_threshold_gb: float = 1.0
 
 
 @dataclass
@@ -90,7 +91,8 @@ class ConfigLoader:
             database=DatabaseConfig(
                 path=db_raw.get("path", "data/gnss_data.duckdb"),
                 memory_limit=str(db_raw.get("memory_limit", "4GB")),
-                temp_directory=db_raw.get("temp_directory", "data/temp"),
+            temp_directory=db_raw.get("temp_directory", "data/temp"),
+            scanner_threshold_gb=float(db_raw.get("scanner_threshold_gb", 1.0)),
             ),
             network=NetworkConfig(
                 priority=net.get("priority", ["5g", "4g", "wifi"]),

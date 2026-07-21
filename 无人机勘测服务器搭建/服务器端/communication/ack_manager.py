@@ -113,6 +113,41 @@ class AckManager:
             return {**self.stats, "pending": pending_count}
 
     def reset(self):
+        self.stop_scan()
         with self._lock:
             self._pending.clear()
             self.stats = {"sent": 0, "acked": 0, "nacked": 0, "retransmitted": 0, "failed": 0}
+
+    def restore_pending_from_db(self, device_id: str = None) -> int:
+        """服务器重启后从数据库恢复待确认消息到内存"""
+        if not self._db:
+            return 0
+        records = self._db.load_ack_pending(device_id)
+        count = 0
+        with self._lock:
+            for r in records:
+                dev_id = r["device_id"]; seq = r["sequence"]
+                if dev_id not in self._pending:
+                    self._pending[dev_id] = {}
+                if seq not in self._pending[dev_id]:
+                    msg = PendingMessage(device_id=dev_id, sequence=seq,
+                                         payload=r.get("payload", b""))
+                    self._pending[dev_id][seq] = msg
+                    count += 1
+        return count
+    def start_scan(self, interval=5.0):
+        if hasattr(self, '_scan_thread') and self._scan_thread and self._scan_thread.is_alive():
+            return
+        self._scan_running = True
+        self._scan_thread = threading.Thread(target=self._scan_loop, args=(interval,), daemon=True)
+        self._scan_thread.start()
+    def stop_scan(self):
+        self._scan_running = False
+    def _scan_loop(self, interval):
+        while getattr(self, '_scan_running', False):
+            retry_list = self.get_retransmit_list()
+            for msg in retry_list:
+                if self._send_callback:
+                    try: self._send_callback(msg.device_id, msg.payload)
+                    except Exception: pass
+            time.sleep(interval)

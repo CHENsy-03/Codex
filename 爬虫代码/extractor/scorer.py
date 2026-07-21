@@ -1,5 +1,5 @@
 WEIGHTS = {'title': 5, 'body': 2, 'url': 1}
-THRESHOLD = 6
+THRESHOLD = 0
 
 
 def score_article(article, keywords, weights=None, threshold=None):

@@ -63,7 +63,7 @@ def get_json(url, params=None, site_cfg=None, max_retries=3, timeout=15):
             rl.acquire()
             def _do():
                 jitter_sleep(delay, jitter)
-                headers = {'X-Requested-With': 'XMLHttpRequest','Accept': 'application/json','Referer': url}
+                headers = {'X-Requested-With': 'XMLHttpRequest','Accept': '*/*','Referer': site_cfg.get('search', {}).get('page_url', url) if site_cfg else url}
                 resp = session.get(url, params=params, headers=headers, timeout=timeout)
                 if resp.status_code == 200:
                     return resp.json()

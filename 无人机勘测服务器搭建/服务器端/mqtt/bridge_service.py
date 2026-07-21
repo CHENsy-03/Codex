@@ -1,4 +1,4 @@
-﻿
+
 """MQTT bridge service 鈥?runs ON THE SERVER
 
 Receives survey data from MQTT broker, processes via existing gateway.py,

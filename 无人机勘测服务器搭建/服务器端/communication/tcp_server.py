@@ -42,22 +42,40 @@ class TCPServer:
         self._thread.start()
 
     def stop(self):
-        if self._loop: self._loop.call_soon_threadsafe(self._loop.stop)
+        try:
+            if self._loop and self._loop.is_running():
+                self._loop.call_soon_threadsafe(self._loop.stop)
+        except Exception:
+            pass
 
     def _run(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._serve())
-        self._loop.close()
+        try:
+            self._loop.run_until_complete(self._serve())
+        except RuntimeError:
+            pass
+        try:
+            self._loop.close()
+        except Exception:
+            pass
 
     async def _serve(self):
+        import asyncio as _aio
         cb = self._on_data
         class P(DeviceProtocol):
             def __init__(inner):
                 DeviceProtocol.__init__(inner, on_data=cb)
-        srv = await asyncio.start_server(P, self.host, self.port)
-        print("  TCP listening on", self.host, ":", self.port)
-        async with srv: await srv.serve_forever()
+        try:
+            srv = await asyncio.start_server(P, self.host, self.port)
+            print("  [TCP] 监听中", self.host, ":", self.port)
+            async with srv as server:
+                self._server = server
+                await srv.serve_forever()
+        except (_aio.CancelledError, RuntimeError):
+            pass
+        finally:
+            self._server = None
 
     def get_status(self):
         return {"running": self._server is not None, "host": self.host, "port": self.port}

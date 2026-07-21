@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 5.docx §9 数据库改造 - 分片数据库管理器
 4表结构: device_data / gps_data / result_data / event_log

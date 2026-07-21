@@ -175,8 +175,11 @@ class CommandMessage:
 MESSAGE_CLASS_MAP = {
     MessageType.HEARTBEAT: HeartbeatMessage,
     MessageType.GNSS: GNSSMessage,
+    MessageType.IMU: None,
     MessageType.STATUS: StatusMessage,
+    MessageType.FILE: None,
     MessageType.COMMAND: CommandMessage,
+    MessageType.CONFIG: None,
 }
 
 
@@ -224,3 +227,9 @@ class MessageFactory:
         return [{"code": mt.value, "name": mt.name,
                  "hex": f"0x{mt.value:04X}"}
                 for mt in MessageType]
+from .extended import IMUMessage, FileMessage, ConfigMessage
+MESSAGE_CLASS_MAP.update({
+    MessageType.IMU: IMUMessage,
+    MessageType.FILE: FileMessage,
+    MessageType.CONFIG: ConfigMessage,
+})

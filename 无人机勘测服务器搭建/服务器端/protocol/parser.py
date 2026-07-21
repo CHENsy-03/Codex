@@ -18,6 +18,7 @@ class GPGGAParser(BaseParser):
     @staticmethod
     def parse(raw: bytes) -> Optional[GNSSData]:
         try:
+            pool = _get_data_pool(32)
             line = raw.decode("ascii", errors="ignore").strip()
             parts = line.split(",")
             if len(parts) < 10 or not parts[2] or not parts[4]:
@@ -39,6 +40,7 @@ class GPGGAParser(BaseParser):
             quality = int(parts[6]) if parts[6] else 0
             hdop = float(parts[8]) if len(parts) > 8 and parts[8] else 5.0
 
+            pool = _get_data_pool(32)
             return GNSSData(
                 msg_type="GPGGA",
                 latitude=round(lat, 8),
@@ -71,6 +73,7 @@ class BESTPOSParser(BaseParser):
     @staticmethod
     def parse(raw: bytes) -> Optional[GNSSData]:
         try:
+            pool = _get_data_pool(32)
             line = raw.decode("ascii", errors="ignore").strip()
             if not line.startswith("#BESTPOSA"):
                 return None
@@ -79,9 +82,9 @@ class BESTPOSParser(BaseParser):
                 return None
 
             sol_stat = parts[10] if len(parts) > 10 else ""
-            lat = float(parts[13]) if parts[13] else 0.0
-            lng = float(parts[14]) if parts[14] else 0.0
-            alt = float(parts[15]) if parts[15] else 0.0
+            lat = float(parts[11]) if parts[11] else 0.0
+            lng = float(parts[12]) if parts[12] else 0.0
+            alt = float(parts[13]) if parts[13] else 0.0
 
             sol_map = {"SOL_COMPUTED": 1, "NARROW_INT": 4, "NARROW_FLOAT": 5}
             sol_type = sol_map.get(sol_stat.split(";")[-1] if ";" in sol_stat else sol_stat, 0)
@@ -90,6 +93,7 @@ class BESTPOSParser(BaseParser):
             n_acc = float(parts[18]) if len(parts) > 18 and parts[18] else 0.0
             u_acc = float(parts[19]) if len(parts) > 19 and parts[19] else 0.0
 
+            pool = _get_data_pool(32)
             return GNSSData(
                 msg_type="BESTPOS",
                 latitude=lat, longitude=lng, height=alt,
@@ -119,3 +123,4 @@ class ProtocolDispatcher:
             except Exception:
                 continue
         return None
+from protocol.base import get_global_pool as _get_data_pool

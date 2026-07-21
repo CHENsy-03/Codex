@@ -1,4 +1,4 @@
-﻿"""统一日志配置"""
+"""统一日志配置"""
 import logging, logging.handlers, sys, os
 
 _LOG_CONFIGURED = False

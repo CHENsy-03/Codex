@@ -74,3 +74,73 @@ class ProtocolParser:
             except Exception:
                 continue
         return None
+
+
+class GNSSDataPool:
+    """GNSSData object pool - reuse objects to reduce GC pressure.
+    Usage:
+        pool = GNSSDataPool(pool_size=32)
+        obj = pool.acquire()
+        # ... fill obj fields ...
+        pool.release(obj)
+    """
+    def __init__(self, pool_size: int = 32):
+        self._pool = [GNSSData() for _ in range(min(pool_size, 256))]
+        self._available = list(range(len(self._pool)))
+        self._hits = 0
+        self._misses = 0
+        self._max_size = pool_size
+
+    def acquire(self) -> GNSSData:
+        if self._available:
+            idx = self._available.pop()
+            self._hits += 1
+            return self._pool[idx]
+        self._misses += 1
+        return GNSSData()
+
+    def release(self, obj: GNSSData):
+        for i, pooled in enumerate(self._pool):
+            if pooled is obj:
+                self._clear_fields(pooled)
+                if len(self._available) < self._max_size:
+                    self._available.append(i)
+                return
+
+    @staticmethod
+    def _clear_fields(obj: GNSSData):
+        obj.device_id = ""
+        obj.msg_type = ""
+        obj.latitude = 0.0
+        obj.longitude = 0.0
+        obj.height = 0.0
+        obj.solution_type = 0
+        obj.diff_age = 0.0
+        obj.station_id = ""
+        obj.source_channel = ""
+        obj.raw_data = b""
+        obj.gnss_time = 0
+        obj.e_accuracy = 0.0
+        obj.n_accuracy = 0.0
+        obj.u_accuracy = 0.0
+        obj.server_id = ""
+        obj.created_at = 0
+
+    @property
+    def stats(self) -> dict:
+        return {
+            "pool_size": len(self._pool),
+            "available": len(self._available),
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": f"{self._hits / max(1, self._hits + self._misses) * 100:.1f}%",
+        }
+
+
+_global_pool: Optional[GNSSDataPool] = None
+
+def get_global_pool(pool_size: int = 64) -> GNSSDataPool:
+    global _global_pool
+    if _global_pool is None:
+        _global_pool = GNSSDataPool(pool_size=pool_size)
+    return _global_pool
