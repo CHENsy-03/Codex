@@ -146,7 +146,9 @@ def run_search(site_cfg, keywords, output_dir, max_pages=0, with_detail=False):
         log.warning('No matching results after filtering')
     else:
         log.info('Collected %d articles before scoring', len(all_articles))
-        log.info('Final results count=%d', len(scored := filter_by_score(all_articles, keywords)))
+        log.info('DEBUG: articles=%d, keywords=%s', len(all_articles), str(keywords))
+    for a in all_articles[:1]:
+        log.info('DEBUG: title=[%20s] url=[%30s]', a.get('title','')[:20], a.get('url','')[:30])
     scored = filter_by_score(all_articles, keywords)
     with DedupDB() as dedup:
         scored = dedup.dedup_list(scored)
