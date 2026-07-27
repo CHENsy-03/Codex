@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package uav_server;
+
+// 统一定位数据消息
+message GNSSPosition {
+    string device_id = 1;        // 设备ID
+    string msg_type = 2;         // GPGGA / BESTPOS
+    double latitude = 3;         // 纬度(度)
+    double longitude = 4;        // 经度(度)
+    double height = 5;           // 高度(米)
+    int32 solution_type = 6;     // 0=none,1=fix,2=float,4=rtk_fixed,5=rtk_float
+    double diff_age = 7;         // 差分龄期(秒)
+    string station_id = 8;       // 基准站ID
+    string source_channel = 9;   // 来源: serial/tcp/mqtt
+    bytes raw_data = 10;         // 原始报文
+    int64 gnss_time = 11;        // GNSS时间戳
+    double e_accuracy = 12;      // 东向精度(cm)
+    double n_accuracy = 13;      // 北向精度(cm)
+    double u_accuracy = 14;      // 高度精度(cm)
+    string server_id = 15;       // 接收服务器ID
+    int64 created_at = 16;       // 入库时间戳
+}

@@ -1,0 +1,363 @@
+## 无人机勘测服务器 V2.1
+## Python-Java跨语言通信接口设计方案
+   版本：V1.0
+适用系统：无人机勘测服务器平台
+通信模式：Python服务器 + Java业务端 + 小程序客户端
+## 第一章 项目背景
+## 1.1 项目需求
+   根据服务器与小程序勘测流程需求，系统需要实现：
+   勘测员通过小程序填写项目及环境信息。
+   后台服务器自动评价数据完整性。
+   勘测设备接入指定系统。
+   服务器控制设备开展勘测任务。
+   实时接收设备数据。
+   完成数据计算。
+   将结果反馈至小程序。
+   整体流程：
+   勘测员小程序
+   ↓
+   服务器接口层
+   ↓
+   Python勘测服务器
+   ↓
+   通信管理模块
+   ↓
+   RTK/GNSS/无人机设备
+   ↓
+   结果返回小程序
+## 第二章 系统总体架构
+## 2.1 分层架构设计
+   系统采用分层设计：
+## 第一层：客户端层
+   包括：
+   微信小程序
+   Android应用
+   Web管理端
+   主要功能：
+   项目创建
+   数据填写
+   设备查看
+   任务提交
+   结果查看
+## 第二层：接口服务层
+   采用：
+   HTTP REST API
+   负责：
+   用户认证
+   数据交互
+   任务管理
+   结果反馈
+## 第三层：服务器核心层
+   Python实现：
+   主要模块：
+   Gateway
+   Session Manager
+   Protocol Parser
+   Task Manager
+   Data Processor
+   Storage Manager
+   Cluster Sync
+## 第四层：设备通信层
+   支持：
+   局域网
+   4G
+   5G
+   卫星通信
+   其中：
+   设备默认采用4G通信。
+   原因：
+   成本低。
+   覆盖范围广。
+   GNSS数据量较小。
+   满足长期运行需求。
+## 第三章 通信技术方案
+## 3.1 外部接口
+   采用：
+   HTTPS REST API
+   数据格式：
+   JSON
+   优势：
+   Python支持成熟。
+   Java支持成熟。
+   小程序支持。
+   易调试。
+## 3.2 内部高性能通信
+   服务器内部以及服务器之间采用：
+   protobuf + gRPC
+   使用场景：
+   县级服务器 → 市级服务器。
+   Python模块通信。
+   高性能数据同步。
+## 第四章 接口统一规范
+## 4.1 请求格式
+   所有请求：
+   Header:
+   Authorization:
+   Bearer Token
+   Content-Type:
+   application/json
+## 4.2 返回格式
+   统一返回：
+   {
+   "code":0,
+   "message":"success",
+   "timestamp":1720000000,
+   "data":{}
+   }
+## 第五章 用户认证接口
+## 5.1 用户登录
+   接口：
+   POST
+   /api/v1/auth/login
+   请求：
+   {
+   "username":"admin",
+   "password":"123456"
+   }
+   返回：
+   {
+   "token":"xxxxxx",
+   "expire":7200
+   }
+   后续请求携带：
+   Authorization:
+   Bearer xxxxx
+## 第六章 项目管理接口
+## 6.1 创建勘测项目
+   接口：
+   POST
+   /api/v1/project/create
+   请求：
+   {
+   "project_name":"山区测量项目",
+   "location":"浙江绍兴",
+   "operator":"张三",
+   "description":"RTK测量"
+   }
+   返回：
+   {
+   "project_id":"P20260001"
+   }
+## 第七章 勘测数据提交接口
+## 7.1 上传勘测表
+   接口：
+   POST
+   /api/v1/survey/upload
+   提交：
+   project_id
+   excel文件
+   服务器处理流程：
+   Excel文件
+   ↓
+   数据校验
+   ↓
+   字段转换
+   ↓
+   DuckDB存储
+   ↓
+   自动评分
+   ↓
+   结果生成
+## 第八章 设备管理接口
+## 8.1 设备注册
+   接口：
+   POST
+   /api/v1/device/register
+   请求：
+   {
+   "device_id":"RTK001",
+   "type":"GNSS",
+   "model":"XXX"
+   }
+   返回：
+   {
+   "device_token":"xxxx",
+   "status":"waiting"
+   }
+## 8.2 查询设备状态
+   接口：
+   GET
+   /api/v1/device/status/{device_id}
+   返回：
+   {
+   "device_id":"RTK001",
+   "online":true,
+   "network":"4G",
+   "signal":85,
+   "solution":"RTK_FIXED"
+   }
+## 第九章 勘测任务接口
+## 9.1 创建任务
+   接口：
+   POST
+   /api/v1/task/start
+   请求：
+   {
+   "device_id":"RTK001",
+   "project_id":"P001",
+   "duration":3600
+   }
+   服务器：
+   任务生成
+   ↓
+   Command消息
+   ↓
+   通信模块
+   ↓
+   4G
+   ↓
+   设备
+## 第十章 实时数据接口
+## 10.1 获取实时坐标
+   接口：
+   GET
+   /api/v1/position/latest/{device_id}
+   返回：
+   {
+   "latitude":31.209969,
+   "longitude":121.175424,
+   "height":26.38,
+   "solution":"RTK_FIXED"
+   }
+## 第十一章 勘测结果反馈接口
+## 11.1 查询结果
+   接口：
+   GET
+   /api/v1/result/{project_id}
+   返回：
+   {
+   "project_id":"P001",
+   "result":"PASS",
+   "score":96,
+   "message":"符合规范"
+   }
+## 第十二章 WebSocket实时通信
+   用于：
+   实时位置显示。
+   在线状态显示。
+   勘测进度显示。
+   连接：
+   ws://server/api/ws/device
+   消息：
+   {
+   "type":"position",
+   "device_id":"RTK001",
+   "latitude":31.2,
+   "longitude":121.3
+   }
+## 第十三章 Python SDK设计
+   目录：
+   server_sdk/
+   ├── client.py
+   ├── auth.py
+   ├── device.py
+   ├── project.py
+   ├── survey.py
+   ├── result.py
+   ├── websocket.py
+   └── models/
+## Python调用示例
+   client.login(
+   username,
+   password
+   )
+   device = client.device.status(
+   "RTK001"
+   )
+   result = client.result.get(
+   "P001"
+   )
+## 第十四章 Java SDK设计
+   目录：
+   uav-sdk-java/
+   src/main/java/
+   com.uav.sdk
+   ├── Client.java
+   ├── DeviceApi.java
+   ├── ProjectApi.java
+   ├── ResultApi.java
+   └── model/
+## Java调用示例
+   UavClient client =
+   new UavClient(url);
+   Device device =
+   client.device()
+   .status("RTK001");
+## 第十五章 数据同步接口
+## 县级服务器 → 市级服务器
+   采用：
+   protobuf + gRPC
+   同步内容：
+   设备状态。
+   勘测数据。
+   结果数据。
+   日志信息。
+## 第十六章 错误码设计
+## 第十七章 接口版本管理
+   统一：
+   /api/v1/
+   后续升级：
+   /api/v2/
+   原则：
+   旧接口永久兼容。
+## 第十八章 与通信模块关系
+   完整链路：
+   小程序
+   ↓
+   REST API
+   ↓
+   Python Gateway
+   ↓
+   Task Manager
+   ↓
+   Session Manager
+   ↓
+   Communication Frame
+   ↓
+   4G网络
+   ↓
+   RTK设备
+## 第十九章 4G通信设计说明
+   由于成本因素：
+   设备通信默认：
+   4G公网
+   不采用5G作为默认方案。
+   原因：
+   RTK数据量低。
+   4G覆盖更广。
+   SIM成本低。
+   满足实时定位。
+   5G用于：
+   高密度区域。
+   视频传输。
+   点云上传。
+   卫星用于：
+   无公网区域。
+   灾害环境。
+## 第二十章 后续开发文件
+   后续需要继续生成：
+## 1. Swagger接口文档
+   内容：
+   OpenAPI 3.0
+   API字段定义
+   自动生成SDK
+## 2. protobuf协议文件
+   包括：
+   GNSS消息
+   设备状态
+   任务控制
+   数据同步
+   完成后：
+   Python服务器、Java后台、小程序可并行开发。
+   文档结束
+
+--- Table 1 ---
+错误码 | 说明
+0 | 成功
+1001 | 认证失败
+1002 | 设备不存在
+1003 | 设备离线
+2001 | 数据格式错误
+3001 | 网络异常
+4001 | 权限不足
+5001 | 服务器异常

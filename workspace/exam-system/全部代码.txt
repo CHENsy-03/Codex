@@ -1,0 +1,2793 @@
+============================================================
+File: ExamSystem/client/requirements.txt
+============================================================
+
+python-docx>=1.0.0
+
+============================================================
+File: ExamSystem/client/main.py
+============================================================
+
+"""离线考试系统 —— 入口模块。"""
+from __future__ import annotations
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import importlib.util
+
+from core.backend_manager import BackendManager
+def _check_deps() -> bool:
+    missing: list[str] = []
+    for name, import_name in [("python-docx", "docx")]:
+        if importlib.util.find_spec(import_name) is None:
+            missing.append(name)
+    try:
+        import tkinter
+    except ImportError:
+        missing.append("tkinter")
+        if importlib.util.find_spec(import_name) is None:
+            missing.append(name)
+    if missing:
+        print("缺少依赖：" + ", ".join(missing))
+        print(f"请运行: pip install {' '.join(missing)}")
+        input("按 Enter 键退出…")
+        return False
+    return True
+
+
+def main() -> None:
+    if not _check_deps():
+        sys.exit(1)
+    from app.exam_app import ExamApp
+    bm = BackendManager()
+    if not bm.start():
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            "启动失败",
+            "无法启动后端服务 ExamSystem.exe\n\n"
+            "请确认 ExamSystem.exe 位于以下位置之一：\n"
+            "  - 当前目录\n"
+            "  - ExamSystem/\n"
+            "  - go/\n"
+            "  - EXE文件/"
+        )
+        root.destroy()
+        sys.exit(1)
+    app = ExamApp()
+    try:
+        app.mainloop()
+    finally:
+        bm.stop()
+
+
+if __name__ == "__main__":
+    main()
+
+============================================================
+File: ExamSystem/client/parser.py
+============================================================
+
+#!/usr/bin/env python3
+"""
+独立解析器 —— 将 Word .docx 题库转换为 questions.json。
+
+用法：
+    python parser.py <input.docx> [output.json]
+
+    若省略 output.json，默认输出为当前目录下的 questions.json。
+"""
+
+import sys
+import json
+import os
+# Ensure python-docx is bundled by PyInstaller (lazy import in question_parser)
+try:
+    import docx
+except ImportError:
+    pass
+
+
+def main() -> None:
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        sys.exit(1)
+
+    input_path = sys.argv[1]
+    output_path = sys.argv[2] if len(sys.argv) > 2 else "questions.json"
+
+    if not os.path.exists(input_path):
+        print(f"错误：文件不存在 - {input_path}")
+        sys.exit(1)
+
+    try:
+        from parser.docx_parser import parse_docx
+
+        print(f"解析 {os.path.basename(input_path)}...", end=" ", flush=True)
+        questions = parse_docx(input_path)
+
+        if not questions:
+            print()
+            print("错误：未解析到有效题目")
+            sys.exit(1)
+
+        from export.json_export import export_to_json
+        export_to_json(questions, output_path)
+
+        print("完成。")
+        print(f"已导出 {len(questions)} 道题到 {output_path}")
+
+    except ImportError as e:
+        print()
+        print(f"错误：缺少依赖 - {e}")
+        print("请运行: pip install python-docx")
+        sys.exit(1)
+    except Exception as e:
+        print()
+        print(f"错误：{e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+============================================================
+File: ExamSystem/tools/legacy_exam_engine.py
+============================================================
+
+"""
+【已弃用】此模块由 Go 引擎替代，不再被生产代码引用。
+
+评分逻辑已迁移至：
+  go/internal/engine/session.go   会话提交评分
+  go/internal/engine/exam.go      记录与结果类型
+
+所有考试逻辑统一由 Go 后端处理，Python 端仅负责界面显示与 HTTP 通信。
+"""
+
+"""
+考试引擎模块 —— 管理答题状态、自动评分。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+from question_parser import Question
+
+
+@dataclass
+class AnswerRecord:
+    """单题的作答记录。"""
+    question: Question
+    chosen: Optional[str]
+    is_correct: bool = False
+    earned_score: int = 0
+
+
+@dataclass
+class ExamResult:
+    """一次交卷的完整结果。"""
+    total_score: int = 0
+    earned_score: int = 0
+    correct_count: int = 0
+    total_count: int = 0
+    records: list[AnswerRecord] = field(default_factory=list)
+
+
+class ExamEngine:
+    """考试核心逻辑：加载题目、记录作答、评分。"""
+
+    def __init__(self) -> None:
+        self.questions: list[Question] = []
+        self.question_map: dict[int, Question] = {}
+        self._answers: dict[int, Optional[str]] = {}
+        self._result: Optional[ExamResult] = None
+
+    def load_questions(self, questions: list[Question]) -> None:
+        self.questions = list(questions)
+        self.reset()
+        self.question_map = {q.id: q for q in questions}
+
+    def get_question_count(self) -> int:
+        return len(self.questions)
+
+    def get_total_score(self) -> int:
+        return sum(q.score for q in self.questions)
+
+    def reset(self) -> None:
+        self.question_map.clear()
+        self._answers = {}
+        self._result = None
+
+    def get_question(self, qid: int) -> Optional[Question]:
+        return self.question_map.get(qid)
+
+    def answer(self, qid: int, choice: str) -> None:
+        q = self.get_question(qid)
+        if q is None:
+            raise ValueError(f"question #{qid} not found")
+        if choice not in q.options:
+            raise ValueError(f"invalid choice for question #{qid}: {choice!r}")
+        self._answers[qid] = choice
+
+    def get_answer(self, qid: int) -> Optional[str]:
+        return self._answers.get(qid)
+
+    def is_all_answered(self) -> bool:
+        return all(q.id in self._answers for q in self.questions)
+
+    def get_unanswered_count(self) -> int:
+        total = len(self.questions)
+        answered = sum(1 for q in self.questions if q.id in self._answers)
+        return total - answered
+
+    def submit(self) -> ExamResult:
+        if not self.questions:
+            raise RuntimeError("No questions loaded")
+        if self._result is not None:
+            return self._result
+        records: list[AnswerRecord] = []
+        earned = 0
+        correct_count = 0
+        for q in self.questions:
+            chosen = self._answers.get(q.id)
+            if q.type == "multiple":
+                correct = chosen is not None and set(chosen) == set(q.answer)
+            else:
+                correct = (chosen == q.answer) if chosen else False
+            score_earned = q.score if correct else 0
+            if correct:
+                correct_count += 1
+            earned += score_earned
+            records.append(AnswerRecord(
+                question=q, chosen=chosen,
+                is_correct=correct, earned_score=score_earned,
+            ))
+        self._result = ExamResult(
+            total_score=self.get_total_score(),
+            earned_score=earned,
+            correct_count=correct_count,
+            total_count=len(self.questions),
+            records=records,
+        )
+        return self._result
+
+    def get_result(self) -> Optional[ExamResult]:
+        return self._result
+
+    def has_result(self) -> bool:
+        return self._result is not None
+
+============================================================
+File: ExamSystem/config/config.yaml
+============================================================
+
+server:
+  port: 8080
+  token: "Exam2026"
+
+data:
+  path: "data/questions"
+  session_dir: "data/sessions"
+
+log:
+  server: "logs/server.log"
+  error: "logs/error.log"
+
+exam:
+  show_answer_after_submit: false
+
+============================================================
+File: README.md
+============================================================
+
+﻿# 离线考试系统
+
+一个基于 Python + Tkinter (GUI) + Go (后端引擎) 的桌面离线考试小程序，支持：
+- 上传 Word（.docx）题库并自动解析选择题
+- 可选单独的答案文件覆盖答案
+- 自定义每题分值（默认 1 分）
+- 在线作答，交卷后即时出分
+- 查看逐题解析与正确答案
+
+## 项目结构
+
+```
+ExamSystem/
+│
+├── python/                        # Python 前端
+├── ExamSystem/client/                     # Python 前端源码
+│   ├── main.py                    # 入口文件（自动启动 Go 后端）
+│   ├── parser.py                  # CLI 解析器（docx → json）
+│   ├── requirements.txt           # pip 依赖
+│   ├── app/
+│   │   └── exam_app.py            # Tkinter 桌面 GUI
+│   ├── core/
+│   │   ├── client.py              # HTTP 客户端
+│   │   └── backend_manager.py     # 后端进程管理器
+│   ├── model/
+│   │   └── question.py            # 题目数据模型
+│   ├── parser/
+│   │   ├── docx_parser.py         # Word 解析器
+│   │   └── answer_parser.py       # 答案文件解析器
+│   ├── utils/
+│   │   ├── config.py              # 全局常量
+│   │   ├── logger.py              # 日志模块
+│   │   └── ui.py                  # 鼠标滚轮绑定
+│   └── export/
+│       └── json_export.py         # JSON 导出
+│
+├── ExamSystem/server/                            # Go 后端引擎
+│   ├── cmd/server/main.go         # HTTP 服务入口
+│   ├── cmd/scoretest/main.go      # 评分测试
+│   ├── internal/
+│   │   ├── api/handler.go         # HTTP 路由
+│   │   ├── api/server.go          # 服务器启动
+│   │   ├── config/config.go       # 配置加载
+│   │   ├── logger/logger.go       # 日志
+│   │   ├── engine/                    # 引擎模块
+│   │   │   ├── engine.go          # 题库管理
+│   │   │   ├── exam.go            # 结果类型
+│   │   │   ├── session.go         # 会话评分
+│   │   │   └── session_manager.go # 会话持久化
+│   │   └── storage/               # 存储模块
+│   │       ├── storage.go
+│   │       └── question_loader.go # 题库加载
+│   ├── model/question.go          # 数据模型
+│   ├── go.mod / go.sum
+│
+├── data/                          # 数据
+│   ├── questions/                 # 题库文件（每科一个 .json）
+│   │   ├── default.json           # 默认题库
+│   │   ├── 综合.json               # 后续可添加多个题库
+│   │   └── ...                    # 每文件一科，文件即科目
+│   ├── sessions/                  # 考试会话持久化
+│   └── backup/                    # 题库备份
+│
+├── logs/                          # 日志
+│   ├── server.log                 # Go 服务端日志
+│   ├── client.log                 # Python 客户端日志
+│   └── error.log                  # 错误日志
+│
+├── config/                        # 配置
+│   └── config.yaml                # 主配置文件
+│   ├── combine_code.py            # 源码合并工具
+├── 全部代码.txt
+└── README.md
+```
+
+## 使用说明
+
+### 1. 安装依赖
+
+```bash
+pip install -r ExamSystem/client/requirements.txt
+```
+
+### 2. 启动程序
+
+```bash
+python ExamSystem/client/main.py
+```
+
+程序自动启动 Go 后端（ExamSystem.exe），无需手动运行。
+
+### 3. 考试流程
+
+1. **导入页面**：选择 Word（.docx）题库文件，设置分值，点击"解析题库"
+2. **预览**：表格显示所有题目，可双击修改每题分值
+3. **开始考试**：逐题作答，支持上一题/下一题/提交
+4. **交卷**：显示总分、得分率和逐题解析（分页浏览）
+
+### 4. 题库格式要求
+
+Word 文档每道题按以下格式：
+
+```
+1. 题目文字
+A. 选项一
+B. 选项二
+C. 选项三
+D. 选项四
+答案：A
+```
+
+- 题号支持 `.` `、` `)` `）` 分隔
+- 选项支持 `A.` `A)` `A）` `A、`
+- 答案行支持 `答案：` `正确答案：` `【答案】` 
+- 连续两个空行结束当前题目
+
+### 5. 架构说明
+
+```
+main.py → backend_manager → 启动 Go 后端
+       → ExamApp (Tkinter)
+            ├─ ImportView  (导入/预览)
+            ├─ ExamView    (逐题作答，分页缓存)
+            └─ ResultView  (成绩解析)
+
+通信: ExamView → client.py (HTTP) → Go API → Engine
+```
+
+### 6. 源代码整合
+
+```bash
+python ExamSystem/tools/combine_code.py
+# 生成 全部代码.txt
+```
+
+## 模块架构
+
+```
+Python 架构：
+main.py → BackendManager → ExamApp → ImportView / ExamView / ResultView
+          ↕ HTTP (client.py)
+Go 架构：
+API (/health, /start, /answer, /submit, /questions) → Engine → SessionManager
+
+数据流：
+.docx → docx_parser → Question → JSON → questions.json → Go → API → Python
+```
+
+### 遗留模块
+
+`legacy_exam_engine.py` 为旧版 Python 引擎，已被 Go 替代，保留作参考。
+
+### 注意事项
+
+- 首次运行需要 python-docx 依赖：`pip install -r ExamSystem/client/requirements.txt`
+- Go 后端需要提前编译：`cd ExamSystem\server
+go build -o ..\release\backend\ExamSystem.exe .\cmd\server\
+go build -o ..\release\backend\ExamSystem.exe .\cmd\server\`
+- 如需重新打包 exe：`pyinstaller --onefile --add-data "python;python" main.py`
+
+
+## 发布包结构
+
+为终端用户交付时使用 `ExamSystem/release/` 目录，用户只需双击 `考试系统.exe`。
+
+```
+ExamSystem/release/
+│
+├── 考试系统.exe            # 主界面入口（双击启动）
+│
+├── backend/
+│   └── ExamSystem.exe      # Go 后端引擎（自动启动）
+│
+├── tools/
+│   └── parser.exe          # 命令行题库解析器
+│
+├── config/
+│   └── config.yaml         # 配置文件
+│
+├── data/
+│   ├── questions/          # 题库文件（每科一个 .json）
+│   │   └── default.json
+│   ├── sessions/           # 考试会话持久化
+│   └── backup/             # 题库备份
+│
+└── logs/                   # 运行日志
+    ├── server.log
+    ├── client.log
+    └── error.log
+```
+
+`考试系统.exe` 会自动在 `backend/` 目录下寻找 `ExamSystem.exe` 并启动。\n
+
+============================================================
+File: ExamSystem/client/app/exam_app.py
+============================================================
+
+"""
+离线考试小程序 —— 基于 Tkinter 的桌面 GUI。
+"""
+
+from __future__ import annotations
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from typing import Optional
+
+from utils.config import *
+from model.question import Question
+from parser.docx_parser import parse_docx
+from parser.answer_parser import parse_answer_file, merge_answers
+from core.client import ExamClient
+from utils.ui import bind_mousewheel, unbind_mousewheel
+from dataclasses import dataclass
+
+
+@dataclass
+class _QInfo:
+    """题目摘要——答题记录中的题目信息"""
+    id: int
+    text: str
+    options: dict
+    answer: str
+    score: int
+
+
+@dataclass
+class _AnswerRec:
+    """单题答题记录"""
+    question: _QInfo
+    chosen: str
+    is_correct: bool
+    earned_score: int
+
+
+@dataclass
+class _ResultData:
+    """考试结果"""
+    total_score: int
+    earned_score: int
+    correct_count: int
+    total_count: int
+    records: list
+
+
+# ═══════════════════════════════════════════════════════════════
+#  主应用
+# ═══════════════════════════════════════════════════════════════
+
+class ExamApp(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("离线考试系统")
+        self.geometry(WINDOW_SIZE)
+        self.minsize(WINDOW_MIN_W, WINDOW_MIN_H)
+        self.configure(bg=COLOR_BG)
+        self.client = ExamClient()
+        self.imported_questions: list[Question] = []
+        self._current_frame: Optional[tk.Frame] = None
+        self.exam_result_data: Optional[dict] = None
+        self._show_import_view()
+
+    def _switch_to(self, frame_class: type, **kw) -> None:
+        if self._current_frame:
+            self._current_frame.destroy()
+        self._current_frame = frame_class(self, **kw)
+        self._current_frame.pack(fill="both", expand=True)
+
+    def _show_import_view(self) -> None:
+        self._switch_to(ImportView)
+
+    def _show_exam_view(self) -> None:
+        self._switch_to(ExamView)
+
+    def _show_result_view(self) -> None:
+        self._switch_to(ResultView)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  导入页面
+# ═══════════════════════════════════════════════════════════════
+
+class ImportView(tk.Frame):
+    def __init__(self, master: ExamApp) -> None:
+        super().__init__(master, bg=COLOR_BG)
+        self.master_app = master
+        self._create_widgets()
+        self.after(100, self._try_auto_load)
+
+    def _create_widgets(self) -> None:
+        tk.Label(self, text="导入题库", font=FONT_TITLE,
+                 bg=COLOR_BG, fg=COLOR_PRIMARY).pack(pady=(30, 10))
+        file_frame = tk.Frame(self, bg=COLOR_BG)
+        file_frame.pack(fill="x", padx=60, pady=5)
+        tk.Label(file_frame, text="Word 题库文件：", font=FONT_BODY,
+                 bg=COLOR_BG).pack(side="left")
+        self._file_path_var = tk.StringVar()
+        tk.Entry(file_frame, textvariable=self._file_path_var,
+                 font=FONT_BODY, width=50).pack(side="left", padx=5)
+        tk.Button(file_frame, text="浏览...", font=FONT_BODY,
+                  command=self._browse_file).pack(side="left", padx=2)
+        ans_frame = tk.Frame(self, bg=COLOR_BG)
+        ans_frame.pack(fill="x", padx=60, pady=5)
+        tk.Label(ans_frame, text="答案文件（可选）：", font=FONT_BODY,
+                 bg=COLOR_BG).pack(side="left")
+        self._ans_path_var = tk.StringVar()
+        tk.Entry(ans_frame, textvariable=self._ans_path_var,
+                 font=FONT_BODY, width=50).pack(side="left", padx=5)
+        tk.Button(ans_frame, text="浏览...", font=FONT_BODY,
+                  command=self._browse_answer_file).pack(side="left", padx=2)
+        score_frame = tk.Frame(self, bg=COLOR_BG)
+        score_frame.pack(fill="x", padx=60, pady=5)
+        tk.Label(score_frame, text="每题默认分值：", font=FONT_BODY,
+                 bg=COLOR_BG).pack(side="left")
+        self._score_var = tk.IntVar(value=1)
+        tk.Spinbox(score_frame, from_=1, to=100,
+                   textvariable=self._score_var, width=5,
+                   font=FONT_BODY).pack(side="left", padx=5)
+        tk.Button(self, text="解析题库", font=("微软雅黑", 11, "bold"),
+                  bg=COLOR_PRIMARY, fg="white",
+                  command=self._parse_questions).pack(pady=15)
+        tk.Label(self, text="题目预览：", font=FONT_HEADING,
+                 bg=COLOR_BG, anchor="w").pack(fill="x", padx=60)
+        cols = ("id", "text", "answer", "score")
+        self._tree = ttk.Treeview(self, columns=cols, show="headings",
+                                  height=10, selectmode="browse")
+        self._tree.heading("id", text="题号")
+        self._tree.heading("text", text="题目（前40字）")
+        self._tree.heading("answer", text="答案")
+        self._tree.heading("score", text="分值")
+        self._tree.column("id", width=60, anchor="center")
+        self._tree.column("text", width=500)
+        self._tree.column("answer", width=80, anchor="center")
+        self._tree.column("score", width=80, anchor="center")
+        sb = ttk.Scrollbar(self, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=sb.set)
+        self._tree.pack(side="left", fill="both", expand=True,
+                        padx=(60, 0), pady=5)
+        sb.pack(side="left", fill="y", padx=(0, 60), pady=5)
+        self._tree.bind("<Double-1>", self._edit_score)
+        bottom = tk.Frame(self, bg=COLOR_BG)
+        bottom.pack(fill="x", padx=60, pady=15)
+        self._status_label = tk.Label(bottom, text="请选择 Word 题库文件",
+                                      font=FONT_BODY, bg=COLOR_BG,
+                                      fg=COLOR_SUBTEXT)
+        self._status_label.pack(side="left")
+        self._start_btn = tk.Button(bottom, text="开始考试",
+                                    font=("微软雅黑", 12, "bold"),
+                                    bg=COLOR_SUCCESS, fg="white",
+                                    state="disabled",
+                                    command=self._start_exam)
+        self._start_btn.pack(side="right")
+    def _try_auto_load(self) -> None:
+        """自动加载安装目录下的题库文件。"""
+        import json, os, sys, glob
+        search_dirs = []
+        if getattr(sys, "frozen", False):
+            search_dirs.append(os.path.dirname(sys.executable))
+        else:
+            sd = os.path.dirname(os.path.abspath(__file__))
+            search_dirs.extend([sd, os.path.join(sd, "..", "..")])
+        for base in search_dirs:
+            qdir = os.path.join(base, "data", "questions")
+            if os.path.isdir(qdir):
+                jfs = glob.glob(os.path.join(qdir, "*.json"))
+                if jfs:
+                    self._load_from_json_dir(qdir)
+                    return
+        self._status_label.config(text="未找到已保存的题库，请导入 Word 文件", fg=COLOR_SUBTEXT)
+
+    def _load_from_json_dir(self, qdir: str) -> None:
+        """从 JSON 文件加载题目。"""
+        import json, os, glob
+        questions = []
+        for fpath in sorted(glob.glob(os.path.join(qdir, "*.json"))):
+            try:
+                with open(fpath, encoding="utf-8") as f:
+                    data = json.load(f)
+                items = data.get("questions", data) if isinstance(data, dict) else data
+                for item in items:
+                    q = Question(
+                        id=item["id"],
+                        text=item["text"],
+                        options=item["options"],
+                        answer=item["answer"],
+                        score=item.get("score", 1),
+                        type=item.get("type", "single"),
+                    )
+                    questions.append(q)
+            except Exception:
+                pass
+        if not questions:
+            return
+        for i, q in enumerate(questions, 1):
+            q.id = i
+        self.master_app.imported_questions = questions
+        self._populate_preview(questions)
+        self._refresh_total_score()
+        self._start_btn.config(state="normal")
+        self._status_label.config(text=f"已自动加载题库: {len(questions)} 道题", fg=COLOR_SUCCESS)
+
+    def _browse_file(self) -> None:
+        p = filedialog.askopenfilename(
+            title="选择 Word 题库文件",
+            filetypes=[("Word 文档", "*.docx"), ("所有文件", "*.*")])
+        if p:
+            self._file_path_var.set(p)
+
+    def _browse_answer_file(self) -> None:
+        p = filedialog.askopenfilename(
+            title="选择答案文件",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")])
+        if p:
+            self._ans_path_var.set(p)
+
+    def _parse_questions(self) -> None:
+        path = self._file_path_var.get().strip()
+        if not path:
+            messagebox.showwarning("提示", "请先选择题库文件")
+            return
+        try:
+            questions = parse_docx(path, default_score=self._score_var.get())
+            ans_path = self._ans_path_var.get().strip()
+            if ans_path:
+                questions = merge_answers(questions, parse_answer_file(ans_path))
+            if not questions:
+                messagebox.showwarning("解析结果", "未从文件中解析到有效题目。")
+                return
+            self.master_app.imported_questions = questions
+            self._populate_preview(questions)
+            self._refresh_total_score()
+            self._start_btn.config(state="normal")
+        except Exception as e:
+            messagebox.showerror("解析失败", f"无法解析文件：\n{e}")
+            self._status_label.config(text="解析失败", fg=COLOR_DANGER)
+
+    def _populate_preview(self, questions: list[Question]) -> None:
+        self._tree.selection_remove(self._tree.selection())
+        self._tree.delete(*self._tree.get_children())
+        if not questions:
+            return
+        info = self._tree.pack_info()
+        self._tree.pack_forget()
+        for q in questions:
+            preview = (q.text[:40] + "...") if len(q.text) > 40 else q.text
+            self._tree.insert("", "end",
+                              values=(q.id, preview, q.answer, q.score),
+                              iid=str(q.id))
+        self._tree.pack(info)
+
+    def _refresh_total_score(self) -> None:
+        total = sum(q.score for q in self.master_app.imported_questions)
+        self._status_label.config(text=f"总分：{total} 分", fg=COLOR_SUCCESS)
+
+    def _edit_score(self, _event) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            return
+        vals = self._tree.item(sel[0], "values")
+        if not vals:
+            return
+        ScoreEditDialog(self, int(vals[0]), int(vals[3]) if vals[3] else 1,
+                        self.master_app.imported_questions, self._tree)
+
+    def _start_exam(self) -> None:
+        qs = self.master_app.imported_questions
+        if not qs:
+            messagebox.showwarning("提示", "题库为空，请先解析题目")
+            return
+        result = self.master_app.client.load_questions([q.to_dict() for q in qs])
+        if isinstance(result, dict) and "error" in result:
+            messagebox.showerror("上传失败", f"导入题目到考试引擎失败：{result.get('detail', '未知错误')}")
+            return
+        self.master_app._show_exam_view()
+
+
+class ScoreEditDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Frame, qid: int, current: int,
+                 questions: list[Question], tree: ttk.Treeview) -> None:
+        super().__init__(parent)
+        self.title(f"修改题 #{qid} 分值")
+        self.geometry("300x120")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self.questions = questions
+        self.qid = qid
+        self.tree = tree
+        tk.Label(self, text=f"题目 #{qid} 的分值：",
+                 font=FONT_BODY).pack(pady=(15, 5))
+        self._var = tk.IntVar(value=current)
+        tk.Spinbox(self, from_=1, to=100, textvariable=self._var,
+                   width=8, font=FONT_BODY).pack()
+        tk.Button(self, text="确定", command=self._confirm).pack(pady=10)
+
+    def _confirm(self) -> None:
+        new_score = self._var.get()
+        q = next(q for q in self.questions if q.id == self.qid)
+        q.score = new_score
+        self.tree.item(str(self.qid), values=(q.id,
+                        (q.text[:40] + "...") if len(q.text) > 40 else q.text,
+                        q.answer, q.score))
+        self.master._refresh_total_score()
+        self.destroy()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  考试页面（逐题显示）
+# ═══════════════════════════════════════════════════════════════
+
+class ExamView(tk.Frame):
+    def __init__(self, master: ExamApp) -> None:
+        super().__init__(master, bg=COLOR_BG)
+        self.master_app = master
+        self.current_index = 0
+        self.var: Optional[tk.StringVar] = None
+        self._current_card: Optional[tk.Frame] = None
+        self.answers: dict[int, str] = {}
+        self.page_cache: dict[int, tk.Frame] = {}
+        self.page_vars: dict[int, tk.StringVar] = {}
+        self.session_id = self.master_app.client.start()
+        self._create_widgets()
+        self.show_question()
+
+    def _create_widgets(self) -> None:
+        questions = self.master_app.imported_questions
+        if not questions:
+            return
+        top = tk.Frame(self, bg=COLOR_PRIMARY, height=50)
+        top.pack(fill="x")
+        top.pack_propagate(False)
+        tk.Label(top, text="答题", font=FONT_TITLE,
+                 bg=COLOR_PRIMARY, fg="white").pack(side="left", padx=20)
+        self.progress = tk.Label(top, text="", font=FONT_BODY,
+                                        bg=COLOR_PRIMARY, fg="white")
+        self.progress.pack(side="right", padx=20)
+        self.question_frame = tk.Frame(self, bg=COLOR_BG)
+        self.question_frame.pack(fill="both", expand=True, padx=40, pady=10)
+        bottom = tk.Frame(self, bg=COLOR_BG)
+        bottom.pack(fill="x", padx=40, pady=(5, 20))
+        self._prev_btn = tk.Button(bottom, text="上一题",
+                                   font=FONT_BODY, command=self.previous_question)
+        self._prev_btn.pack(side="left")
+        self._next_btn = tk.Button(bottom, text="下一题",
+                                   font=FONT_BODY, command=self.next_question)
+        self._next_btn.pack(side="left", padx=10)
+        self.next_btn = self._next_btn
+        self._progress_text = tk.Label(bottom, text="", font=FONT_BODY,
+                                       bg=COLOR_BG, fg=COLOR_TEXT)
+        self._progress_text.pack(side="left", expand=True)
+        self._unanswered_label = tk.Label(bottom, text="", font=FONT_BODY,
+                                          bg=COLOR_BG, fg=COLOR_SUBTEXT)
+        self._unanswered_label.pack(side="right", padx=5)
+        self.status = tk.Label(bottom, text="", font=FONT_BODY,
+                               bg=COLOR_BG, fg=COLOR_SUBTEXT)
+        self.status.pack(side="right", padx=5)
+        tk.Button(bottom, text="提交试卷", font=("微软雅黑", 12, "bold"),
+                  bg=COLOR_PRIMARY, fg="white",
+                  command=self._confirm_submit).pack(side="right")
+
+    def show_question(self) -> None:
+        # cached
+        if hasattr(self, '_current_card') and self._current_card is not None:
+            self._current_card.pack_forget()
+        index = self.current_index
+        if index not in self.page_cache:
+            self.build_question(index)
+        card = self.page_cache[index]
+        card.pack(fill="x", pady=20)
+        self._current_card = card
+        self.var = self.page_vars[index]
+        total = len(self.master_app.imported_questions)
+        self.progress.config(text=f"{self.current_index+1}/{total}")
+        self._progress_text.config(text=f"第 {self.current_index+1} 题 / 共 {total} 题")
+        self._prev_btn.config(state="normal" if self.current_index > 0 else "disabled")
+        if self.current_index >= total - 1:
+            self.next_btn.config(text="提交试卷", command=self._confirm_submit)
+        else:
+            self.next_btn.config(text="下一题", command=self.next_question)
+        self._update_progress()
+        self.after(50, self.preload)
+        return
+
+    def _on_answer(self, q: Question, var: tk.StringVar) -> None:
+        choice = var.get()
+        self.answers[q.id] = choice
+        if choice and self.session_id:
+            self.master_app.client.answer(q.id, choice, self.session_id)
+        self._update_progress()
+
+    def _update_progress(self) -> None:
+        ua = len(self.master_app.imported_questions) - sum(1 for q in self.master_app.imported_questions if self.answers.get(q.id))
+        if ua > 0:
+            self._unanswered_label.config(text=f"未答 {ua} 题", fg="#E67E22")
+        else:
+            self._unanswered_label.config(text="已全部作答", fg=COLOR_SUCCESS)
+
+    def update_unanswered(self) -> None:
+        count = len(self.master_app.imported_questions) - len(self.answers)
+        self.status.config(text=f"还有 {count} 题未作答")
+
+    def build_question(self, index: int) -> None:
+        q = self.master_app.imported_questions[index]
+        card = tk.Frame(self.question_frame, bg=COLOR_CARD)
+        tk.Label(card, text=f"第 {q.id} 题 ({q.score}分)",
+                 font=("微软雅黑", 18)).pack()
+        q_lbl = tk.Label(card, text=q.text,
+                 wraplength=900, justify="left")
+        q_lbl.pack(fill="x")
+        def _reflow(evt, lbl=q_lbl):
+            w = evt.width - 20
+            if w > 100: lbl.config(wraplength=w)
+        card.bind("<Configure>", _reflow)
+        var = tk.StringVar()
+        answer = self.answers.get(q.id)
+        if answer:
+            var.set(answer)
+        for key, value in q.options.items():
+            tk.Radiobutton(card,
+                text=f"{key}. {value}",
+                variable=var, value=key,
+                command=lambda q=q, v=var: self._on_answer(q, v)
+            ).pack(anchor="w")
+        self.page_cache[index] = card
+        self.page_vars[index] = var
+
+    def preload(self) -> None:
+        total = len(self.master_app.imported_questions)
+        need_more = False
+        for i in range(self.current_index, min(self.current_index + 4, total)):
+            if i not in self.page_cache:
+                self.build_question(i)
+                need_more = True
+        if len(self.page_cache) > 5:
+            old_idx = self.current_index - 2
+            if old_idx in self.page_cache:
+                self.page_cache[old_idx].destroy()
+                del self.page_cache[old_idx]
+                del self.page_vars[old_idx]
+        if need_more:
+            self.after(100, self.preload)
+
+    def previous_question(self) -> None:
+        if self.current_index > 0:
+            self.current_index -= 1
+            self.show_question()
+
+    def next_question(self) -> None:
+        q = self.master_app.imported_questions[self.current_index]
+        choice = self.var.get()
+        self.answers[q.id] = choice
+        if choice and self.session_id:
+            self.master_app.client.answer(q.id, choice, self.session_id)
+        self.update_unanswered()
+        if self.current_index < len(self.master_app.imported_questions) - 1:
+            self.current_index += 1
+            self.show_question()
+        else:
+            self.submit_exam()
+
+    def _confirm_submit(self) -> None:
+        ua = len(self.master_app.imported_questions) - sum(1 for q in self.master_app.imported_questions if self.answers.get(q.id))
+        if ua > 0:
+            if not messagebox.askyesno("确认交卷", f"还有 {ua} 题未作答，确定提交？"):
+                return
+        else:
+            if not messagebox.askyesno("确认交卷", "确定提交？"):
+                return
+        import traceback
+        try:
+            result = self.master_app.client.submit(session_id=self.session_id)
+            if isinstance(result, dict) and "error" in result:
+                messagebox.showerror("提交失败", result.get("detail", "未知错误"))
+                return
+            self.master_app.exam_result_data = result
+            self.master_app._show_result_view()
+        except Exception as e:
+            messagebox.showerror("交卷失败",
+                f"无法连接考试服务器：\n{e}\n\n请确保 Go 后端已启动。")
+            traceback.print_exc()
+
+    submit_exam = _confirm_submit
+
+# ═══════════════════════════════════════════════════════════════
+#  成绩页面
+# ═══════════════════════════════════════════════════════════════
+
+class ResultView(tk.Frame):
+    def __init__(self, master: ExamApp) -> None:
+        super().__init__(master, bg=COLOR_BG)
+        self.master_app = master
+        self._canvas: Optional[tk.Canvas] = None
+        result_data = master.exam_result_data
+        if result_data is None:
+            messagebox.showerror("错误", "没有考试结果数据")
+            master._show_import_view()
+            return
+        self.result = _ResultData(
+            total_score=result_data["total_score"],
+            earned_score=result_data["earned_score"],
+            correct_count=result_data["correct_count"],
+            total_count=result_data["total_count"],
+            records=[]
+        )
+        for rd in result_data["records"]:
+            qi = _QInfo(
+                id=rd["id"],
+                text=rd["text"],
+                options=rd["options"],
+                answer=rd.get("answer", ""),
+                score=rd["score"],
+            )
+            rec = _AnswerRec(
+                question=qi,
+                chosen=rd["chosen"],
+                is_correct=rd["is_correct"],
+                earned_score=rd["earned_score"],
+            )
+            self.result.records.append(rec)
+        self._create_widgets()
+
+    def _create_widgets(self) -> None:
+        r = self.result
+        pct = (r.earned_score / r.total_score * 100) if r.total_score > 0 else 0
+        tk.Label(self, text="考试成绩", font=FONT_TITLE,
+                 bg=COLOR_BG, fg=COLOR_PRIMARY).pack(pady=(30, 10))
+        score_card = tk.Frame(self, bg=COLOR_CARD, relief="solid", bd=1)
+        score_card.pack(padx=60, pady=10, fill="x")
+        fg = COLOR_SUCCESS if pct >= 60 else COLOR_DANGER
+        tk.Label(score_card,
+                 text=f"{r.earned_score} / {r.total_score}",
+                 font=("微软雅黑", 36, "bold"),
+                 fg=fg, bg=COLOR_CARD).pack(pady=(15, 0))
+        tk.Label(score_card,
+                 text=f"正确 {r.correct_count}/{r.total_count} 题  |  得分率 {pct:.1f}%",
+                 font=FONT_HEADING, bg=COLOR_CARD,
+                 fg=COLOR_TEXT).pack(pady=(0, 15))
+        tk.Label(self, text="逐题解析：", font=FONT_HEADING,
+                 bg=COLOR_BG, anchor="w").pack(fill="x", padx=60, pady=(10, 0))
+        container = tk.Frame(self, bg=COLOR_BG)
+        container.pack(fill="both", expand=True, padx=40, pady=5)
+        canvas = tk.Canvas(container, bg=COLOR_BG, highlightthickness=0)
+        sb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        sf = tk.Frame(canvas, bg=COLOR_BG)
+        sf.bind("<Configure>", lambda e: canvas.configure(
+            scrollregion=canvas.bbox("all") or "0 0 1 1"))
+        canvas.create_window((0, 0), window=sf, anchor="nw")
+        bottom = tk.Frame(self, bg=COLOR_BG)
+        bottom.pack(fill="x", padx=60, pady=15)
+        tk.Button(bottom, text="重新考试", font=("微软雅黑", 11),
+                  bg=COLOR_PRIMARY, fg="white",
+                  command=self._retry).pack(side="left", padx=5)
+        tk.Button(bottom, text="返回首页", font=("微软雅黑", 11),
+                  command=self._go_home).pack(side="left", padx=5)
+        pg_frame = tk.Frame(self, bg=COLOR_BG)
+        pg_frame.pack(fill="x", padx=60, pady=(0, 10))
+        self._prev_page_btn = tk.Button(pg_frame, text="上一页",
+            font=FONT_BODY, command=self._prev_page)
+        self._prev_page_btn.pack(side="left")
+        self._page_label = tk.Label(pg_frame, text="", font=FONT_BODY,
+            bg=COLOR_BG, fg=COLOR_TEXT)
+        self._page_label.pack(side="left", expand=True)
+        self._next_page_btn = tk.Button(pg_frame, text="下一页",
+            font=FONT_BODY, command=self._next_page)
+        self._next_page_btn.pack(side="left")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self._canvas = canvas
+        bind_mousewheel(canvas)
+        self.page_size = 10
+        self.current_page = 0
+        self.record_pages: dict[int, list[tk.Frame]] = {}
+        self.sf = sf
+        self.total_pages = (len(r.records) + self.page_size - 1) // self.page_size
+        self.show_page(0)
+
+    def _retry(self) -> None:
+        if self._canvas:
+            self._canvas.unbind_all("<MouseWheel>")
+            self._canvas.unbind_all("<Button-4>")
+            self._canvas.unbind_all("<Button-5>")
+        self.master_app._show_exam_view()
+
+    def _go_home(self) -> None:
+        if self._canvas:
+            self._canvas.unbind_all("<MouseWheel>")
+            self._canvas.unbind_all("<Button-4>")
+            self._canvas.unbind_all("<Button-5>")
+        self.master_app._show_import_view()
+
+    def _build_record(self, index: int) -> tk.Frame:
+        rec = self.result.records[index]
+        q = rec.question
+        ok = rec.is_correct
+        color = COLOR_SUCCESS if ok else COLOR_DANGER
+        icon = "正确" if ok else "错误"
+        card = tk.Frame(self.sf, bg=COLOR_CARD, relief="solid", bd=1)
+        card.pack(fill="x", pady=6)
+        hdr = tk.Frame(card, bg=COLOR_CARD)
+        hdr.pack(fill="x", padx=15, pady=(8, 2))
+        tk.Label(hdr, text=f"{icon} 第 {q.id} 题（{q.score} 分）",
+                 font=FONT_HEADING, bg=COLOR_CARD, fg=color).pack(side="left")
+        tk.Label(hdr, text=f"得分: {rec.earned_score}/{q.score}",
+                 font=FONT_BODY, bg=COLOR_CARD, fg=color).pack(side="right")
+        q_lbl = tk.Label(card, text=q.text, font=FONT_BODY,
+                 bg=COLOR_CARD, fg=COLOR_TEXT, wraplength=400, justify="left")
+        q_lbl.pack(fill="x", padx=15, pady=(0, 4))
+        def _reflow2(evt, lbl=q_lbl):
+            w = evt.width - 30
+            if w > 100: lbl.config(wraplength=w)
+        card.bind("<Configure>", _reflow2)
+        af = tk.Frame(card, bg=COLOR_CARD)
+        af.pack(fill="x", padx=15, pady=(0, 8))
+        chosen = rec.chosen or "（未作答）"
+        chosen_text = q.options.get(rec.chosen, "") if rec.chosen else ""
+        correct_text = q.options.get(q.answer, "")
+        tk.Label(af, text=f"你的答案: {chosen}. {chosen_text}",
+                 font=FONT_BODY, bg=COLOR_CARD, fg=color).pack(anchor="w")
+        if not ok and q.answer:
+            tk.Label(af, text=f"正确答案: {q.answer}. {correct_text}",
+                     font=FONT_BODY, bg=COLOR_CARD, fg=COLOR_PRIMARY).pack(anchor="w")
+        return card
+
+    def show_page(self, page_num: int) -> None:
+        self.current_page = page_num
+        start = page_num * self.page_size
+        end = min(start + self.page_size, len(self.result.records))
+        
+        # Remove old page records from the scrollable frame
+        for widgets in self.sf.winfo_children():
+            widgets.destroy()
+        
+        # Evict old cache: keep only current and adjacent pages
+        max_pages = 3
+        old_keys = [k for k in self.record_pages if abs(k - page_num) >= max_pages]
+        for k in old_keys:
+            for f in self.record_pages[k]:
+                try:
+                    f.destroy()
+                except Exception:
+                    pass
+            del self.record_pages[k]
+        
+        # Build current page records
+        frames: list[tk.Frame] = []
+        for i in range(start, end):
+            card = self._build_record(i)
+            frames.append(card)
+        self.record_pages[page_num] = frames
+        
+        # Update navigation
+        total = self.total_pages
+        self._page_label.config(
+            text=f"第 {page_num+1}/{total} 页（{start+1}-{end} 题）")
+        self._prev_page_btn.config(state="normal" if page_num > 0 else "disabled")
+        self._next_page_btn.config(
+            state="normal" if page_num < total - 1 else "disabled")
+        # Update scrollregion
+        self.after_idle(lambda: self._canvas.config(
+            scrollregion=self._canvas.bbox("all") or "0 0 1 1"))
+
+    def _prev_page(self) -> None:
+        if self.current_page > 0:
+            self.show_page(self.current_page - 1)
+
+    def _next_page(self) -> None:
+        if self.current_page < self.total_pages - 1:
+            self.show_page(self.current_page + 1)
+
+============================================================
+File: ExamSystem/client/core/client.py
+============================================================
+
+"""
+HTTP client for Go exam backend.
+Centralizes all API calls to decouple GUI from server address.
+"""
+
+from __future__ import annotations
+
+import json
+import urllib.request
+import urllib.error
+
+
+class ExamClient:
+    """Client for the Go exam backend HTTP API."""
+
+    def __init__(self, base_url: str = "http://localhost:8080", token: str = "Exam2026"):
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+
+    def _headers(self) -> dict:
+        h: dict = {"Content-Type": "application/json"}
+        if self.token:
+            h["X-Token"] = self.token
+        return h
+
+    def _request(self, method: str, path: str, data: dict = None, timeout: int = 10) -> dict | list:
+        """Unified HTTP request with error handling."""
+        url = f"{self.base_url}{path}"
+        body = json.dumps(data).encode("utf-8") if data is not None else None
+        req = urllib.request.Request(url, data=body, headers=self._headers(), method=method)
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+            return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return {"error": f"HTTP {e.code}", "detail": str(e)}
+        except urllib.error.URLError as e:
+            return {"error": "backend_unavailable", "detail": f"无法连接服务器: {e.reason}"}
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            return {"error": "request_failed", "detail": str(e)}
+
+    def submit(self, answers: dict[int, str] = None, session_id: str = "") -> dict:
+        """Submit answers and get scoring result."""
+        if isinstance(session_id, str) and session_id:
+            return self._request("POST", f"/submit?session_id={session_id}", {}, 10)
+        data = {str(k): v for k, v in (answers or {}).items()}
+        return self._request("POST", "/submit", data, 10)
+
+    def get_questions(self) -> list[dict]:
+        """Get all questions (public, no answer field)."""
+        result = self._request("GET", "/questions", timeout=10)
+        if isinstance(result, list):
+            return result
+
+    def load_questions(self, questions: list[dict]) -> dict:
+        """Upload imported questions to Go backend for scoring."""
+        result = self._request("POST", "/load_questions", questions, 30)
+        if isinstance(result, dict) and "error" in result:
+            return result
+        return result
+        return []
+
+    def health_check(self) -> dict:
+        """Check server health."""
+        return self._request("GET", "/health", timeout=5)
+
+    def start(self) -> str:
+        """Start a new exam session and return session_id."""
+        result = self._request("POST", "/start", {}, 10)
+        if isinstance(result, dict) and "error" in result:
+            return ""
+        return result.get("session_id", "")
+
+    def load_questions(self, questions: list[dict]) -> dict:
+        """Upload imported questions to Go backend for scoring."""
+        result = self._request("POST", "/load_questions", questions, 30)
+        if isinstance(result, dict) and "error" in result:
+            return result
+        return result.get("session_id", "")
+
+    def answer(self, qid: int, choice: str, session_id: str = "") -> bool:
+        """Send a single answer to the Go backend for tracking."""
+        data = {"session_id": session_id, "qid": qid, "choice": choice}
+        result = self._request("POST", "/answer", data, 5)
+        return "error" not in result
+
+============================================================
+File: ExamSystem/client/core/backend_manager.py
+============================================================
+
+﻿"""
+Backend Manager - manages Go ExamSystem.exe lifecycle.
+Auto-starts backend when GUI launches, stops when GUI exits.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+import time
+import os
+import atexit
+import urllib.request
+import urllib.error
+
+
+class BackendManager:
+    """Manages the Go backend process lifecycle."""
+
+    def __init__(self, exe_path: str = None,
+                 questions_path: str = None,
+                 base_url: str = "http://localhost:8080",
+                 timeout: int = 15):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.process: subprocess.Popen | None = None
+
+        if exe_path is None:
+            exe_path = self._find_exe()
+        self.exe_path = exe_path
+        self.questions_path = questions_path or self._find_questions()
+
+        atexit.register(self.stop)
+
+
+    def _find_exe(self) -> str | None:
+        """Find backend/ExamSystem.exe relative to app location."""
+        if getattr(sys, "frozen", False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "release")
+        for name in ("ExamSystem.exe", "exam_system.exe"):
+            for sub in ("backend", ""):
+                p = os.path.join(base, sub, name) if sub else os.path.join(base, name)
+                if os.path.exists(p):
+                    return os.path.abspath(p)
+        return None
+
+    def _find_questions(self) -> str | None:
+        """Find data/questions/ relative to app location."""
+        if getattr(sys, "frozen", False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+        qdir = os.path.join(base, "data", "questions")
+        if os.path.isdir(qdir):
+            for f in os.listdir(qdir):
+                if f.endswith(".json"):
+                    return os.path.abspath(qdir)
+        for name in ("default.json", "questions.json"):
+            p = os.path.join(base, "data", name)
+            if os.path.exists(p):
+                return os.path.abspath(p)
+        return None
+
+    def is_running(self) -> bool:
+        """Check if the backend health endpoint responds."""
+        try:
+            r = urllib.request.urlopen(f"{self.base_url}/health", timeout=2)
+            return r.status == 200
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+            return False
+
+    def _kill_orphaned(self) -> None:
+        try:
+            subprocess.run("taskkill /F /IM ExamSystem.exe 2>nul", shell=True,
+                          capture_output=True, timeout=5)
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+    def start(self) -> bool:
+        """Start backend. Returns True if running."""
+        if self.is_running():
+            if self.process and self.process.poll() is None:
+                return True
+            self._kill_orphaned()
+        if not self.exe_path or not os.path.exists(self.exe_path):
+            return False
+        try:
+            flags = 0
+            if sys.platform == "win32":
+                try:
+                    flags = subprocess.CREATE_NO_WINDOW
+                except AttributeError:
+                    flags = 0
+            args = [self.exe_path]
+            if self.questions_path:
+                args += ["-questions", self.questions_path]
+            self.process = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, creationflags=flags,
+                cwd=os.path.dirname(self.exe_path))
+        except Exception:
+            return False
+        deadline = time.time() + self.timeout
+        while time.time() < deadline:
+            if self.is_running():
+                return True
+            time.sleep(0.5)
+        self.stop()
+        return False
+
+    def stop(self) -> None:
+        """Stop the backend process."""
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=5)
+            except Exception:
+                try:
+                    self.process.kill()
+                    self.process.wait(timeout=3)
+                except Exception:
+                    pass
+        self.process = None
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *args):
+        self.stop()
+
+============================================================
+File: ExamSystem/client/model/question.py
+============================================================
+
+"""
+题目数据模型 —— 表示一道选择题。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class Question:
+    """一道选择题的数据模型。"""
+    id: int
+    text: str
+    options: dict[str, str]
+    answer: str
+    score: int = 1
+    type: str = "single"
+
+    def __post_init__(self) -> None:
+        if self.answer not in self.options:
+            raise ValueError(
+                "题目 {self.id} 的答案 {self.answer!r} 不在选项 {list(self.options)} 中"
+            )
+        if self.score <= 0:
+            raise ValueError(
+                "题目 {self.id} 的分值必须为正数, 当前值: {self.score}"
+            )
+        if self.type not in ("single", "multiple", "judge"):
+            raise ValueError(
+                "题目 {self.id} 的类型无效: {self.type}"
+            )
+
+    def __hash__(self) -> int:
+        return hash(self.id)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "text": self.text,
+            "options": self.options,
+            "answer": self.answer,
+            "score": self.score,
+            "type": self.type,
+        }
+
+============================================================
+File: ExamSystem/client/parser/docx_parser.py
+============================================================
+
+"""
+Word 文档解析器 —— 从 .docx 文件中提取选择题。
+"""
+from __future__ import annotations
+import re
+from pathlib import Path
+from typing import Optional
+from model.question import Question
+_RE_Q_NUM = re.compile(r"^(\d+)\s*[.、）)．]\s*(.*)")
+_RE_OPT = re.compile(r"^([A-Z])\s*[.、）)．]\s*(.*)")
+_RE_ANS = re.compile(r"(?:正确答案|答案|【答案】)\s*[：:]?\s*([A-Z])")
+def _detect_type(options: dict[str, str], answer: str) -> str:
+    if len(answer) > 1:
+        return "multiple"
+    keys = list(options.keys())
+    if len(keys) == 2:
+        vals = {v.lower() for v in options.values()}
+        if "true" in vals and "false" in vals:
+            return "judge"
+        if "对" in vals and "错" in vals:
+            return "judge"
+    return "single"
+def parse_docx(filepath: str, default_score: int = 1) -> list[Question]:
+    """解析 Word 文档，返回题目列表。"""
+    from docx import Document
+    if not Path(filepath).exists():
+        raise FileNotFoundError(f"File not found: {filepath}")
+    try:
+        doc = Document(filepath)
+    except Exception:
+        raise ValueError("Word file is damaged or invalid")
+    paragraphs = [p.text.strip() for p in doc.paragraphs]
+    questions: list[Question] = []
+    current_text_parts: list[str] = []
+    current_options: dict[str, str] = {}
+    current_answer: Optional[str] = None
+    inside = False
+    def _flush() -> None:
+        nonlocal inside, current_text_parts, current_options, current_answer
+        if not inside:
+            return
+        if current_options and current_answer:
+            q_id = len(questions) + 1
+            text = "\n".join(current_text_parts).strip()
+            questions.append(
+                Question(
+                    id=q_id, text=text, options=current_options,
+                    answer=current_answer, score=default_score,
+                    type=_detect_type(current_options, current_answer),
+                )
+            )
+        inside = False
+        current_text_parts = []
+        current_options = {}
+        current_answer = None
+    empty_count = 0
+    for para in paragraphs:
+        if not para:
+            empty_count += 1
+            if empty_count >= 2:
+                _flush()
+            continue
+        empty_count = 0
+        m_q = _RE_Q_NUM.match(para)
+        if m_q:
+            _flush()
+            inside = True
+            current_text_parts.append(m_q.group(2))
+            continue
+        m_o = _RE_OPT.match(para)
+        if m_o and inside:
+            key, val = m_o.group(1), m_o.group(2)
+            current_options[key] = val
+            continue
+        m_a = _RE_ANS.search(para)
+        if m_a and inside:
+            current_answer = m_a.group(1)
+            continue
+        if inside:
+            current_text_parts.append(para)
+    _flush()
+    return questions
+
+============================================================
+File: ExamSystem/client/parser/answer_parser.py
+============================================================
+
+"""
+答案文件解析器 —— 从 .txt 答案文件中提取答案映射。
+"""
+
+from __future__ import annotations
+
+import re
+
+from model.question import Question
+
+
+def parse_answer_file(filepath: str) -> dict[int, str]:
+    """解析单独的答案文件（每行格式: "1:A" 或 "1 A"）。"""
+    result: dict[int, str] = {}
+    for enc in ("utf-8", "gbk", "utf-16"):
+        try:
+            with open(filepath, encoding=enc) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    m = re.match(r"(\d+)\s*[:：\s]\s*([A-Z])", line)
+                    if m:
+                        result[int(m.group(1))] = m.group(2)
+            return result
+        except UnicodeDecodeError:
+            continue
+    with open(filepath, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            m = re.match(r"(\d+)\s*[:：\s]\s*([A-Z])", line)
+            if m:
+                result[int(m.group(1))] = m.group(2)
+    return result
+
+
+def merge_answers(questions: list[Question], answer_map: dict[int, str]) -> list[Question]:
+    """用独立答案文件的内容覆盖文档中原有的答案。"""
+    for q in questions:
+        if q.id in answer_map:
+            ans = answer_map[q.id]
+            if ans in q.options:
+                q.answer = ans
+    return questions
+
+
+def format_questions_preview(questions: list[Question]) -> str:
+    """生成题目预览文本（供控制台或日志使用）。"""
+    lines = [f"共解析到 {len(questions)} 道题：\n"]
+    for q in questions:
+        opts = "  ".join(f"{k}. {v}" for k, v in q.options.items())
+        lines.append(
+            f"#{q.id} [{q.score}分] {q.text[:40]}...  {opts}  -> 答案: {q.answer}"
+        )
+    return "\n".join(lines)
+
+============================================================
+File: ExamSystem/client/utils/config.py
+============================================================
+
+"""
+全局配置 —— 颜色、字体、窗口大小、默认分值。
+"""
+
+# ── 颜色 ──
+COLOR_BG      = "#F5F5F5"
+COLOR_PRIMARY = "#2B579A"
+COLOR_SUCCESS = "#27AE60"
+COLOR_DANGER  = "#E74C3C"
+COLOR_CARD    = "#FFFFFF"
+COLOR_TEXT    = "#2C3E50"
+COLOR_SUBTEXT = "#7F8C8D"
+
+# ── 字体 ──
+FONT_TITLE    = ("微软雅黑", 16, "bold")
+FONT_HEADING  = ("微软雅黑", 12, "bold")
+FONT_BODY     = ("微软雅黑", 10)
+
+# ── 窗口 ──
+WINDOW_SIZE   = "960x720"
+WINDOW_MIN_W  = 800
+WINDOW_MIN_H  = 600
+
+# ── 默认值 ──
+DEFAULT_SCORE = 1
+LOAD_BATCH_SIZE = 50
+
+============================================================
+File: ExamSystem/client/utils/logger.py
+============================================================
+
+"""
+日志模块 —— 统一 logging 配置，替代 print。
+"""
+
+import logging
+import sys
+import os
+import os
+
+
+def get_logger(name: str = "ExamApp") -> logging.Logger:
+    """获取或创建 logger，确保 handler 不重复。"""
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    if logger.handlers:
+        return logger
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(console)
+    try:
+        import os
+        os.makedirs("logs", exist_ok=True)
+        fh = logging.FileHandler("logs/client.log", encoding="utf-8")
+        fh.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        logger.addHandler(fh)
+    except Exception:
+        pass
+    return logger
+
+
+def get_error_logger(name: str = "ExamApp.Error") -> logging.Logger:
+    """获取错误日志记录器，写入 logs/error.log。"""
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.ERROR)
+    if logger.handlers:
+        return logger
+    console = logging.StreamHandler(sys.stderr)
+    console.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(console)
+    try:
+        import os
+        os.makedirs("logs", exist_ok=True)
+        fh = logging.FileHandler("logs/error.log", encoding="utf-8")
+        fh.setLevel(logging.ERROR)
+        fh.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        logger.addHandler(fh)
+    except Exception:
+        pass
+    return logger
+
+
+def set_level(level: int) -> None:
+    logging.getLogger("ExamApp").setLevel(level)
+
+============================================================
+File: ExamSystem/client/utils/ui.py
+============================================================
+
+"""UI utilities - mousewheel support."""
+
+from __future__ import annotations
+
+
+def bind_mousewheel(canvas) -> None:
+    def _on_wheel(event):
+        delta = getattr(event, "delta", 0)
+        num = getattr(event, "num", 0)
+        if num == 4 or (num == 0 and delta > 0):
+            canvas.yview_scroll(-1, "units")
+        elif num == 5 or (num == 0 and delta < 0):
+            canvas.yview_scroll(1, "units")
+    def _on_enter(event):
+        canvas.bind_all("<MouseWheel>", _on_wheel)
+        canvas.bind_all("<Button-4>", _on_wheel)
+        canvas.bind_all("<Button-5>", _on_wheel)
+    def _on_leave(event):
+        canvas.unbind_all("<MouseWheel>")
+        canvas.unbind_all("<Button-4>")
+        canvas.unbind_all("<Button-5>")
+    canvas.bind("<Enter>", _on_enter)
+    canvas.bind("<Leave>", _on_leave)
+
+def unbind_mousewheel(canvas) -> None:
+    try:
+        canvas.unbind_all("<MouseWheel>")
+        canvas.unbind_all("<Button-4>")
+        canvas.unbind_all("<Button-5>")
+    except Exception:
+        pass
+
+============================================================
+File: ExamSystem/client/export/json_export.py
+============================================================
+
+"""
+JSON 导出 —— 将 Question 对象列表导出为 JSON 文件。
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime
+
+from model.question import Question
+
+VERSION = "1.0"
+
+
+def export_to_json(questions: list[Question], filepath: str, ensure_ascii: bool = False, indent: int = 2) -> str:
+    """将题目列表导出为 JSON 文件。"""
+    data = {
+        "version": VERSION,
+        "create_time": datetime.now().strftime("%Y-%m-%d"),
+        "count": len(questions),
+        "questions": [q.to_dict() for q in questions],
+    }
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=ensure_ascii, indent=indent)
+    return filepath
+
+
+def export_to_json_string(questions: list[Question], ensure_ascii: bool = False, indent: int = 2) -> str:
+    """将题目列表导出为 JSON 字符串。"""
+    data = {
+        "version": VERSION,
+        "create_time": datetime.now().strftime("%Y-%m-%d"),
+        "count": len(questions),
+        "questions": [q.to_dict() for q in questions],
+    }
+    return json.dumps(data, ensure_ascii=ensure_ascii, indent=indent)
+
+============================================================
+File: ExamSystem/server/go.mod
+============================================================
+
+module examsystem
+
+go 1.22
+
+require gopkg.in/yaml.v3 v3.0.1
+
+============================================================
+File: ExamSystem/server/go.sum
+============================================================
+
+gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405 h1:yhCVgyC4o1eVCa2tZl7eS0r+SDo693bJlVdllGtEeKM=
+gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
+gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
+gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
+
+============================================================
+File: ExamSystem/server/cmd/server/main.go
+============================================================
+
+package main
+
+import (
+    "flag"
+    "log"
+
+    "examsystem/internal/api"
+    "examsystem/internal/config"
+    "examsystem/internal/logger"
+    "examsystem/internal/storage"
+)
+
+func main() {
+    configPath := flag.String("config", "config.yaml", "Path to config.yaml")
+    questionsPath := flag.String("questions", "", "Path to questions.json (overrides config)")
+    flag.Parse()
+
+    cfg, err := config.Load(*configPath)
+    if err != nil {
+        cfg, err = config.Load("../config/config.yaml")
+    }
+    if err != nil {
+        cfg, err = config.Load("./config/config.yaml")
+    }
+    if err != nil {
+        cfg, err = config.Load("../config.yaml")
+    }
+    if err != nil {
+        log.Fatalf("Failed to load config, tried: %s, ../config/config.yaml, ./config/config.yaml, ../config.yaml", *configPath)
+    }
+    logger.InitFromConfig(cfg.Log.Server, cfg.Log.Error)
+    // fallback to legacy Path field
+    if cfg.Log.Server == "" && cfg.Log.Error == "" && cfg.Log.Path != "" {
+        logger.InitFromPath(cfg.Log.Path)
+    }
+    srv := api.NewServer(cfg)
+
+    loadPath := *questionsPath
+    if loadPath == "" {
+        loadPath = cfg.Data.Path
+    }
+    qs, err := storage.LoadQuestionsFromFile(loadPath)
+    if err != nil {
+        log.Fatalf("加载题库失败: %v", err)
+    }
+    if len(qs) == 0 {
+        log.Fatalf("题库为空: %s", loadPath)
+    }
+    logger.Info.Printf("加载 %d 题成功", len(qs))
+    srv.Engine.LoadQuestions(qs)
+
+    if err := srv.Start(); err != nil {
+        log.Fatalf("Server failed: %v", err)
+    }
+}
+
+============================================================
+File: ExamSystem/server/cmd/scoretest/main.go
+============================================================
+
+package main
+
+import (
+    "fmt"
+    "examsystem/internal/engine"
+    "examsystem/model"
+)
+
+func main() {
+    questions := make([]model.Question, 100)
+    for i := range questions {
+        id := i + 1
+        questions[i] = model.Question{
+            ID:      id,
+            Text:    fmt.Sprintf("Question %d", id),
+            Options: map[string]string{"A": "A Opt", "B": "B Opt", "C": "C Opt", "D": "D Opt"},
+            Answer:  "A",
+            Score:   1,
+        }
+    }
+
+    eng := engine.New()
+    eng.LoadQuestions(questions)
+	sess := eng.CreateSession()
+
+    for i := 1; i <= 95; i++ {
+        sess.Answer(i, "A")
+    }
+    for i := 96; i <= 100; i++ {
+        sess.Answer(i, "B")
+    }
+
+    result := sess.Submit()
+    fmt.Printf("考试结果:%d", result.EarnedScore)
+}
+
+============================================================
+File: ExamSystem/server/internal/config/config.go
+============================================================
+
+package config
+
+import (
+    "os"
+    "gopkg.in/yaml.v3"
+)
+
+type ExamConfig struct {
+    ShowAnswerAfterSubmit bool `yaml:"show_answer_after_submit"`
+}
+
+type Config struct {
+    Server ServerConfig `yaml:"server"`
+    Data   DataConfig   `yaml:"data"`
+    Log    LogConfig    `yaml:"log"`
+    Exam   ExamConfig   `yaml:"exam"`
+}
+
+type ServerConfig struct {
+    Port  int    `yaml:"port"`
+    Token string `yaml:"token"`
+}
+
+type DataConfig struct {
+    Path       string `yaml:"path"`
+    SessionDir string `yaml:"session_dir"`
+}
+
+type LogConfig struct {
+    Path   string `yaml:"path"`   // legacy fallback
+    Server string `yaml:"server"`
+    Error  string `yaml:"error"`
+}
+
+func Load(path string) (*Config, error) {
+    data, err := os.ReadFile(path)
+    if err != nil {
+        return nil, err
+    }
+    var cfg Config
+    if err := yaml.Unmarshal(data, &cfg); err != nil {
+        return nil, err
+    }
+    if cfg.Server.Port == 0 {
+        cfg.Server.Port = 8080
+    }
+    return &cfg, nil
+}
+
+============================================================
+File: ExamSystem/server/internal/logger/logger.go
+============================================================
+
+package logger
+
+import (
+    "io"
+    "log"
+    "os"
+    "path/filepath"
+)
+
+var (
+    Info  *log.Logger
+    Warn  *log.Logger
+    Error *log.Logger
+)
+
+func Init() {
+    flags := log.Ldate | log.Ltime | log.Lmsgprefix
+    Info = log.New(os.Stdout, "[INFO] ", flags)
+    Warn = log.New(os.Stdout, "[WARN] ", flags)
+    Error = log.New(os.Stderr, "[ERROR] ", flags)
+}
+
+func SetOutput(w io.Writer) {
+    flags := log.Ldate | log.Ltime | log.Lmsgprefix
+    Info = log.New(w, "[INFO] ", flags)
+    Warn = log.New(w, "[WARN] ", flags)
+    Error = log.New(w, "[ERROR] ", flags)
+}
+
+func InitFromConfig(serverPath, errorPath string) {
+    flags := log.Ldate | log.Ltime | log.Lmsgprefix
+    // Server log: Info + Warn
+    if serverPath != "" {
+        dir := filepath.Dir(serverPath)
+        os.MkdirAll(dir, 0755)
+        f, err := os.OpenFile(serverPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+        if err == nil {
+            Info = log.New(f, "[INFO] ", flags)
+            Warn = log.New(f, "[WARN] ", flags)
+        } else {
+            Info = log.New(os.Stdout, "[INFO] ", flags)
+            Warn = log.New(os.Stdout, "[WARN] ", flags)
+        }
+    } else {
+        Info = log.New(os.Stdout, "[INFO] ", flags)
+        Warn = log.New(os.Stdout, "[WARN] ", flags)
+    }
+    // Error log
+    if errorPath != "" {
+        dir := filepath.Dir(errorPath)
+        os.MkdirAll(dir, 0755)
+        f, err := os.OpenFile(errorPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+        if err == nil {
+            Error = log.New(f, "[ERROR] ", flags)
+        } else {
+            Error = log.New(os.Stderr, "[ERROR] ", flags)
+        }
+    } else {
+        Error = log.New(os.Stderr, "[ERROR] ", flags)
+    }
+}
+
+func InitFromPath(path string) {
+    if path == "" {
+        Init()
+        return
+    }
+    dir := filepath.Dir(path)
+    os.MkdirAll(dir, 0755)
+    f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+    if err != nil {
+        Init()
+        return
+    }
+    SetOutput(f)
+}
+
+============================================================
+File: ExamSystem/server/model/question.go
+============================================================
+
+package model
+
+type Question struct {
+    ID      int               `json:"id"`
+    Text    string            `json:"text"`
+    Options map[string]string `json:"options"`
+    Answer  string            `json:"answer"`
+    Score   int               `json:"score"`
+    Type    string            `json:"type,omitempty"`
+}
+
+============================================================
+File: ExamSystem/server/internal/engine/engine.go
+============================================================
+
+package engine
+
+import "examsystem/model"
+
+type Engine struct {
+    Questions []model.Question
+    QuestionMap map[int]*model.Question
+}
+
+func New() *Engine {
+    return &Engine{
+        QuestionMap: make(map[int]*model.Question),
+    }
+}
+
+func (e *Engine) LoadQuestions(qs []model.Question) {
+    e.Questions = qs
+    e.QuestionMap = make(map[int]*model.Question, len(qs))
+    for i := range qs {
+        e.QuestionMap[qs[i].ID] = &qs[i]
+    }
+}
+
+func (e *Engine) GetQuestionCount() int {
+    return len(e.Questions)
+}
+
+============================================================
+File: ExamSystem/server/internal/storage/storage.go
+============================================================
+
+package storage
+
+import (
+    "encoding/json"
+    "os"
+    "examsystem/model"
+)
+
+type Storage struct {
+    DataDir string
+}
+
+func New(dataDir string) *Storage {
+    return &Storage{DataDir: dataDir}
+}
+
+func (s *Storage) SaveQuestions(qs []model.Question, path string) error {
+    data, err := json.MarshalIndent(qs, "", "  ")
+    if err != nil {
+        return err
+    }
+    const perm = 0o644
+    return os.WriteFile(path, data, perm)
+}
+
+============================================================
+File: ExamSystem/server/internal/storage/question_loader.go
+============================================================
+
+package storage
+
+import (
+    "encoding/json"
+    "io/fs"
+    "os"
+    "sort"
+
+    "examsystem/model"
+)
+
+type questionFile struct {
+    Version    string           `json:"version,omitempty"`
+    CreateTime string           `json:"create_time,omitempty"`
+    Count      int              `json:"count,omitempty"`
+    Questions  []model.Question `json:"questions,omitempty"`
+}
+
+func LoadQuestionsFromFile(path string) ([]model.Question, error) {
+    // If path is a directory, load all .json files and merge
+    if info, err := os.Stat(path); err == nil && info.IsDir() {
+        return loadQuestionsFromDir(path)
+    }
+    data, err := os.ReadFile(path)
+    if err != nil {
+        return nil, err
+    }
+    // Try new format: { "version": "2.0", "questions": [...] }
+    var qf questionFile
+    if err := json.Unmarshal(data, &qf); err == nil && qf.Version != "" {
+        return qf.Questions, nil
+    }
+    // Fall back to old format: plain array [...]
+    var questions []model.Question
+    if err := json.Unmarshal(data, &questions); err != nil {
+        return nil, err
+    }
+    return questions, nil
+}
+
+func loadQuestionsFromDir(dir string) ([]model.Question, error) {
+    entries, err := os.ReadDir(dir)
+    if err != nil {
+        return nil, err
+    }
+    // Sort to ensure consistent order
+    sort.Slice(entries, func(i, j int) bool {
+        return entries[i].Name() < entries[j].Name()
+    })
+    var all []model.Question
+    seen := make(map[int]bool)
+    for _, e := range entries {
+        if e.IsDir() {
+            continue
+        }
+        if len(e.Name()) < 5 || e.Name()[len(e.Name())-5:] != ".json" {
+            continue
+        }
+        qs, err := LoadQuestionsFromFile(dir + "/" + e.Name())
+        if err != nil {
+            continue
+        }
+        for i := range qs {
+            if !seen[qs[i].ID] {
+                seen[qs[i].ID] = true
+                all = append(all, qs[i])
+            }
+        }
+    }
+    if len(all) == 0 {
+        return nil, fs.ErrNotExist
+    }
+    return all, nil
+}
+
+============================================================
+File: ExamSystem/server/internal/engine/exam.go
+============================================================
+
+package engine
+
+import "examsystem/model"
+
+type AnswerRecord struct {
+    Question    *model.Question
+    Chosen      string
+    IsCorrect   bool
+    EarnedScore int
+}
+
+type ExamResult struct {
+    TotalScore   int
+    EarnedScore  int
+    CorrectCount int
+    TotalCount   int
+    Records      []AnswerRecord
+}
+
+============================================================
+File: ExamSystem/server/internal/engine/session.go
+============================================================
+
+package engine
+
+import (
+    "fmt"
+)
+
+// ExamSession holds per-submission state (answers + cached result).
+// Multiple sessions can exist simultaneously for different clients.
+type ExamSession struct {
+    engine  *Engine
+    Answers map[int]string
+    result  *ExamResult
+}
+
+func (e *Engine) CreateSession() *ExamSession {
+    return &ExamSession{
+        engine:  e,
+        Answers: make(map[int]string),
+    }
+}
+
+func (s *ExamSession) GetQuestionCount() int {
+    return len(s.engine.Questions)
+}
+
+func (s *ExamSession) Answer(qid int, choice string) error {
+    q := s.engine.QuestionMap[qid]
+    if q == nil {
+        return fmt.Errorf("question #%d not found", qid)
+    }
+    if _, ok := q.Options[choice]; !ok {
+        return fmt.Errorf("invalid choice %q for question #%d", choice, qid)
+    }
+    s.Answers[qid] = choice
+    return nil
+}
+
+func (s *ExamSession) GetUnansweredCount() int {
+    count := 0
+    for _, q := range s.engine.Questions {
+        if _, ok := s.Answers[q.ID]; !ok {
+            count++
+        }
+    }
+    return count
+}
+
+func (s *ExamSession) GetTotalScore() int {
+    total := 0
+    for _, q := range s.engine.Questions {
+        total += q.Score
+    }
+    return total
+}
+
+func (s *ExamSession) Submit() ExamResult {
+    if s.result != nil {
+        return *s.result
+    }
+    var records []AnswerRecord
+    earned := 0
+    correctCount := 0
+    for i := range s.engine.Questions {
+        q := &s.engine.Questions[i]
+        chosen := s.Answers[q.ID]
+        correct := false
+        correct = compareAnswer(chosen, q.Answer)
+        scoreEarned := 0
+        if correct {
+            correctCount++
+            scoreEarned = q.Score
+        }
+        earned += scoreEarned
+        records = append(records, AnswerRecord{
+            Question:    q,
+            Chosen:      chosen,
+            IsCorrect:   correct,
+            EarnedScore: scoreEarned,
+        })
+    }
+    result := ExamResult{
+        TotalScore:   s.GetTotalScore(),
+        EarnedScore:  earned,
+        CorrectCount: correctCount,
+        TotalCount:   len(s.engine.Questions),
+        Records:      records,
+    }
+    s.result = &result
+    return result
+}
+
+func (s *ExamSession) CalculateScore() int {
+    total := 0
+    for i := range s.engine.Questions {
+        q := &s.engine.Questions[i]
+        chosen := s.Answers[q.ID]
+        if compareAnswer(chosen, q.Answer) {
+            total += q.Score
+        }
+    }
+    return total
+}
+
+func compareAnswer(chosen, correct string) bool {
+    if chosen == "" {
+        return false
+    }
+    chosen = unique(chosen)
+    correct = unique(correct)
+    if len(chosen) != len(correct) {
+        return false
+    }
+    if len(chosen) <= 1 {
+        return chosen == correct
+    }
+    cm := make(map[rune]bool)
+    for _, c := range chosen {
+        cm[c] = true
+    }
+    for _, c := range correct {
+        if !cm[c] {
+            return false
+        }
+    }
+    return true
+}
+
+func unique(s string) string {
+    seen := make(map[rune]bool)
+    result := make([]rune, 0, len(s))
+    for _, c := range s {
+        if !seen[c] {
+            seen[c] = true
+            result = append(result, c)
+        }
+    }
+    return string(result)
+}
+
+============================================================
+File: ExamSystem/server/internal/engine/session_manager.go
+============================================================
+
+package engine
+
+import (
+    "crypto/rand"
+    "encoding/hex"
+    "encoding/json"
+    "os"
+    "path/filepath"
+    "sync"
+    "time"
+
+    "examsystem/model"
+)
+
+type SessionData struct {
+    SessionID   string          `json:"session_id"`
+    Status      string          `json:"status"`
+    CreatedAt   string          `json:"created_at"`
+    SubmittedAt string          `json:"submitted_at,omitempty"`
+    QuestionIDs []int           `json:"question_ids,omitempty"`
+    Questions   []model.Question   `json:"questions,omitempty"`
+    Answers     map[int]string  `json:"answers"`
+    Result      *ExamResultData `json:"result,omitempty"`
+}
+
+type ExamResultData struct {
+    TotalScore   int `json:"total_score"`
+    EarnedScore  int `json:"earned_score"`
+    CorrectCount int `json:"correct_count"`
+    TotalCount   int `json:"total_count"`
+}
+
+type SessionManager struct {
+    mu          sync.RWMutex
+    sessions    map[string]*ExamSession
+    engine      *Engine
+    sessionsDir string
+}
+
+func NewSessionManager(engine *Engine, sessionsDir string) *SessionManager {
+    sm := &SessionManager{
+        sessions:    make(map[string]*ExamSession),
+        engine:      engine,
+        sessionsDir: sessionsDir,
+    }
+    if sessionsDir != "" {
+        os.MkdirAll(sessionsDir, 0755)
+        sm.loadAllFromDisk()
+    }
+    return sm
+}
+
+func (sm *SessionManager) Create() (*ExamSession, string) {
+    sm.mu.Lock()
+    defer sm.mu.Unlock()
+    b := make([]byte, 16)
+    rand.Read(b)
+    sessionID := hex.EncodeToString(b)
+    sess := sm.engine.CreateSession()
+    sm.sessions[sessionID] = sess
+    sm.saveLocked(sessionID)
+    return sess, sessionID
+}
+
+func (sm *SessionManager) Get(sessionID string) *ExamSession {
+    sm.mu.RLock()
+    sess := sm.sessions[sessionID]
+    sm.mu.RUnlock()
+    return sess
+}
+
+func (sm *SessionManager) SaveAnswer(sessionID string, qid int, choice string) error {
+    sm.mu.Lock()
+    defer sm.mu.Unlock()
+    sess := sm.sessions[sessionID]
+    if sess == nil {
+        return nil
+    }
+    if err := sess.Answer(qid, choice); err != nil {
+        return err
+    }
+    sm.saveLocked(sessionID)
+    return nil
+}
+
+func (sm *SessionManager) SubmitSession(sessionID string) (*ExamResult, error) {
+    sm.mu.Lock()
+    defer sm.mu.Unlock()
+    sess := sm.sessions[sessionID]
+    if sess == nil {
+        return nil, nil
+    }
+    result := sess.Submit()
+    sm.saveLocked(sessionID)
+    return &result, nil
+}
+
+func (sm *SessionManager) Delete(sessionID string) {
+    sm.mu.Lock()
+    defer sm.mu.Unlock()
+    delete(sm.sessions, sessionID)
+    if sm.sessionsDir != "" {
+        os.Remove(filepath.Join(sm.sessionsDir, sessionID+".json"))
+    }
+}
+
+func (sm *SessionManager) saveLocked(sessionID string) {
+    if sm.sessionsDir == "" {
+        return
+    }
+    sess := sm.sessions[sessionID]
+    if sess == nil {
+        return
+    }
+    // Preserve original CreatedAt from disk
+    createdAt := time.Now().Format(time.RFC3339)
+    if existing, err := os.ReadFile(filepath.Join(sm.sessionsDir, sessionID+".json")); err == nil {
+        var old SessionData
+        if json.Unmarshal(existing, &old) == nil && old.CreatedAt != "" {
+            createdAt = old.CreatedAt
+        }
+    }
+    data := SessionData{
+        SessionID: sessionID,
+        Status:    "active",
+        CreatedAt: createdAt,
+        Answers:   make(map[int]string),
+    }
+    data.QuestionIDs = make([]int, len(sm.engine.Questions))
+    for i, q := range sm.engine.Questions {
+        data.QuestionIDs[i] = q.ID
+    }
+    data.Questions = make([]model.Question, len(sm.engine.Questions))
+    copy(data.Questions, sm.engine.Questions)
+    for k, v := range sess.Answers {
+        data.Answers[k] = v
+    }
+    if sess.result != nil {
+        data.Status = "submitted"
+        data.SubmittedAt = time.Now().Format(time.RFC3339)
+        data.Result = &ExamResultData{
+            TotalScore:   sess.result.TotalScore,
+            EarnedScore:  sess.result.EarnedScore,
+            CorrectCount: sess.result.CorrectCount,
+            TotalCount:   sess.result.TotalCount,
+        }
+    }
+    raw, _ := json.MarshalIndent(data, "", "  ")
+    os.WriteFile(filepath.Join(sm.sessionsDir, sessionID+".json"), raw, 0644)
+}
+
+func (sm *SessionManager) loadAllFromDisk() {
+    if sm.sessionsDir == "" {
+        return
+    }
+    entries, err := os.ReadDir(sm.sessionsDir)
+    if err != nil {
+        return
+    }
+    for _, e := range entries {
+        if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
+            continue
+        }
+        sessionID := e.Name()[:len(e.Name())-5]
+        raw, err := os.ReadFile(filepath.Join(sm.sessionsDir, e.Name()))
+        if err != nil {
+            continue
+        }
+        var data SessionData
+        if err := json.Unmarshal(raw, &data); err != nil {
+            continue
+        }
+        sess := sm.engine.CreateSession()
+        if len(data.Questions) > 0 {
+            tempEng := New()
+            tempEng.LoadQuestions(data.Questions)
+            sess.engine = tempEng
+        }
+        for k, v := range data.Answers {
+            sess.Answers[k] = v
+        }
+        if data.Result != nil {
+            sess.result = &ExamResult{
+                TotalScore:   data.Result.TotalScore,
+                EarnedScore:  data.Result.EarnedScore,
+                CorrectCount: data.Result.CorrectCount,
+                TotalCount:   data.Result.TotalCount,
+            }
+        }
+        sm.sessions[sessionID] = sess
+    }
+}
+
+============================================================
+File: ExamSystem/server/internal/api/handler.go
+============================================================
+
+package api
+
+import (
+    "encoding/json"
+    "net/http"
+    "strconv"
+
+    "examsystem/internal/config"
+	"examsystem/internal/engine"
+    "examsystem/internal/logger"
+    "examsystem/model"
+    "examsystem/internal/storage"
+)
+
+type RecordResponse struct {
+    ID          int               `json:"id"`
+    Text        string            `json:"text"`
+    Options     map[string]string `json:"options"`
+    Answer      string            `json:"answer"`
+    Score       int               `json:"score"`
+    Chosen      string            `json:"chosen"`
+    IsCorrect   bool              `json:"is_correct"`
+    EarnedScore int               `json:"earned_score"`
+}
+
+type SubmitResponse struct {
+    TotalScore   int              `json:"total_score"`
+    EarnedScore  int              `json:"earned_score"`
+    CorrectCount int              `json:"correct_count"`
+    TotalCount   int              `json:"total_count"`
+    Records      []RecordResponse `json:"records"`
+}
+
+type QuestionResponse struct {
+    ID      int               `json:"id"`
+    Text    string            `json:"text"`
+    Options map[string]string `json:"options"`
+    Score   int               `json:"score"`
+}
+
+type Handler struct {
+    Engine          *engine.Engine
+    Storage         *storage.Storage
+    SessionManager  *engine.SessionManager
+    Config          *config.Config
+}
+
+func NewHandler(eng *engine.Engine, stg *storage.Storage, sm *engine.SessionManager, cfg *config.Config) *Handler {
+    return &Handler{Engine: eng, Storage: stg, SessionManager: sm, Config: cfg}
+}
+
+func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+    mux.HandleFunc("GET /health", h.healthCheck)
+    mux.HandleFunc("GET /questions", h.auth(h.handleQuestions))
+    mux.HandleFunc("POST /submit", h.auth(h.handleSubmit))
+    mux.HandleFunc("POST /answer", h.auth(h.handleAnswer))
+    mux.HandleFunc("POST /start", h.auth(h.handleStart))
+    mux.HandleFunc("POST /load_questions", h.auth(h.handleLoadQuestions))
+}
+
+func (h *Handler) healthCheck(w http.ResponseWriter, r *http.Request) {
+    logger.Info.Println("Health check called")
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (h *Handler) handleQuestions(w http.ResponseWriter, r *http.Request) {
+    questions := h.Engine.Questions
+    resp := make([]QuestionResponse, len(questions))
+    for i, q := range questions {
+        resp[i] = QuestionResponse{
+            ID:      q.ID,
+            Text:    q.Text,
+            Options: q.Options,
+            Score:   q.Score,
+        }
+    }
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(resp)
+}
+
+func (h *Handler) handleSubmit(w http.ResponseWriter, r *http.Request) {
+    var result engine.ExamResult
+    if sessionID := r.URL.Query().Get("session_id"); sessionID != "" {
+        res, err := h.SessionManager.SubmitSession(sessionID)
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusNotFound)
+            return
+        }
+        if res == nil {
+            http.Error(w, "session not found", http.StatusNotFound)
+            return
+        }
+        result = *res
+    } else {
+        var raw map[string]string
+        if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+            http.Error(w, "Invalid JSON", http.StatusBadRequest)
+            return
+        }
+        sess := h.Engine.CreateSession()
+        for qidStr, choice := range raw {
+            qid, err := strconv.Atoi(qidStr)
+            if err != nil {
+                continue
+            }
+            if err := sess.Answer(qid, choice); err != nil {
+                http.Error(w, err.Error(), http.StatusBadRequest)
+                return
+            }
+        }
+        result = sess.Submit()
+    }
+
+    var records []RecordResponse
+    for i := range result.Records {
+        rec := &result.Records[i]
+        records = append(records, RecordResponse{
+            ID:          rec.Question.ID,
+            Text:        rec.Question.Text,
+            Options:     rec.Question.Options,
+            Answer: func() string {
+                if h.Config.Exam.ShowAnswerAfterSubmit {
+                    return rec.Question.Answer
+                }
+                return ""
+            }(),
+            Score:       rec.Question.Score,
+            Chosen:      rec.Chosen,
+            IsCorrect:   rec.IsCorrect,
+            EarnedScore: rec.EarnedScore,
+        })
+    }
+
+    resp := SubmitResponse{
+        TotalScore:   result.TotalScore,
+        EarnedScore:  result.EarnedScore,
+        CorrectCount: result.CorrectCount,
+        TotalCount:   result.TotalCount,
+        Records:      records,
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(resp)
+}
+
+func (h *Handler) handleAnswer(w http.ResponseWriter, r *http.Request) {
+    var body struct {
+        SessionID string `json:"session_id"`
+        QID    int    `json:"qid"`
+        Choice string `json:"choice"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+        http.Error(w, "Invalid JSON", http.StatusBadRequest)
+        return
+    }
+    if body.SessionID != "" {
+        if err := h.SessionManager.SaveAnswer(body.SessionID, body.QID, body.Choice); err != nil {
+            http.Error(w, err.Error(), http.StatusBadRequest)
+            return
+        }
+    }
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+}
+
+func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
+    if len(h.Engine.Questions) == 0 {
+        http.Error(w, "No questions loaded", http.StatusBadRequest)
+        return
+    }
+    _, sessionID := h.SessionManager.Create()
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{"session_id": sessionID})
+}
+
+
+
+func (h *Handler) handleLoadQuestions(w http.ResponseWriter, r *http.Request) {
+    var questions []model.Question
+    if err := json.NewDecoder(r.Body).Decode(&questions); err != nil {
+        http.Error(w, "Invalid JSON", http.StatusBadRequest)
+        return
+    }
+    if len(questions) == 0 {
+        http.Error(w, "No questions provided", http.StatusBadRequest)
+        return
+    }
+    h.Engine.LoadQuestions(questions)
+    logger.Info.Printf("Loaded %d questions via API", len(questions))
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "status": "ok",
+        "count":  len(questions),
+    })
+}
+func (h *Handler) auth(next http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        if h.Config.Server.Token != "" {
+            if r.Header.Get("X-Token") != h.Config.Server.Token {
+                http.Error(w, "Unauthorized", http.StatusUnauthorized)
+                return
+            }
+        }
+        next(w, r)
+    }
+}
+
+============================================================
+File: ExamSystem/server/internal/api/server.go
+============================================================
+
+package api
+
+import (
+    "fmt"
+    "log"
+    "net/http"
+    "path/filepath"
+    "examsystem/internal/config"
+    "examsystem/internal/engine"
+    "examsystem/internal/logger"
+    "examsystem/internal/storage"
+)
+
+type Server struct {
+    Engine  *engine.Engine
+    Storage *storage.Storage
+    Config  *config.Config
+    Handler *Handler
+}
+
+func NewServer(cfg *config.Config) *Server {
+    stg := storage.New(cfg.Data.Path)
+    eng := engine.New()
+    sessionsDir := cfg.Data.SessionDir
+    if sessionsDir == "" {
+        sessionsDir = filepath.Join(filepath.Dir(cfg.Data.Path), "sessions")
+    }
+    sm := engine.NewSessionManager(eng, sessionsDir)
+    handler := NewHandler(eng, stg, sm, cfg)
+    return &Server{
+        Engine:  eng,
+        Storage: stg,
+        Config:  cfg,
+        Handler: handler,
+    }
+}
+
+func recoveryMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        defer func() {
+            if err := recover(); err != nil {
+                log.Printf("PANIC in %s %s: %v", r.Method, r.URL.Path, err)
+                http.Error(w, "Internal Server Error: "+fmt.Sprint(err), http.StatusInternalServerError)
+            }
+        }()
+        next.ServeHTTP(w, r)
+    })
+}
+
+func (s *Server) Start() error {
+    mux := http.NewServeMux()
+    s.Handler.RegisterRoutes(mux)
+    addr := fmt.Sprintf(":%d", s.Config.Server.Port)
+    logger.Info.Printf("Starting exam system server on %s", addr)
+    return http.ListenAndServe(addr, recoveryMiddleware(mux))
+}
+

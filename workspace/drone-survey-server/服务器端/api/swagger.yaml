@@ -1,0 +1,130 @@
+openapi: "3.0.3"
+info:
+  title: "UAV Survey Server V2.1 API"
+  version: "2.1.0"
+  description: "REST API for UAV survey server - auth, project, device, task, position, result"
+servers:
+  - url: "http://127.0.0.1:8080/api/v1"
+    description: "Local development server"
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    ApiResponse:
+      type: object
+      properties:
+        code: {type: integer, example: 0}
+        message: {type: string, example: "success"}
+        timestamp: {type: integer, example: 1720000000}
+        data: {type: object}
+    LoginRequest:
+      type: object
+      properties:
+        username: {type: string, example: "admin"}
+        password: {type: string, example: "admin123"}
+    ProjectRequest:
+      type: object
+      properties:
+        project_name: {type: string, example: "Mountain Survey"}
+        location: {type: string, example: "Zhejiang Shaoxing"}
+        operator: {type: string, example: "Zhang San"}
+        description: {type: string}
+security:
+  - BearerAuth: []
+paths:
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: "User login"
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: "Login success with token"
+  /project/create:
+    post:
+      tags: [Project]
+      summary: "Create survey project"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectRequest"
+      responses:
+        "200":
+          description: "Project created"
+  /project/list:
+    get:
+      tags: [Project]
+      summary: "List all projects"
+      responses:
+        "200":
+          description: "Project list"
+  /project/{id}:
+    get:
+      tags: [Project]
+      summary: "Get project detail"
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: "Project detail"
+  /device/register:
+    post:
+      tags: [Device]
+      summary: "Register a new device"
+      responses:
+        "200":
+          description: "Device registered"
+  /device/status/{id}:
+    get:
+      tags: [Device]
+      summary: "Get device status"
+      responses:
+        "200":
+          description: "Device status"
+  /device/list:
+    get:
+      tags: [Device]
+      summary: "List all devices"
+      responses:
+        "200":
+          description: "Device list"
+  /task/start:
+    post:
+      tags: [Task]
+      summary: "Start a survey task"
+      responses:
+        "200":
+          description: "Task started"
+  /position/latest/{id}:
+    get:
+      tags: [Position]
+      summary: "Get latest position"
+      responses:
+        "200":
+          description: "Latest position"
+  /result/{id}:
+    get:
+      tags: [Result]
+      summary: "Get survey result"
+      responses:
+        "200":
+          description: "Survey result"
+  /survey/upload:
+    post:
+      tags: [Survey]
+      summary: "Upload survey data (JSON/CSV)"
+      responses:
+        "200":
+          description: "Data uploaded with score"

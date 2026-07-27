@@ -1,0 +1,14 @@
+server:
+  port: 8080
+  token: "Exam2026"
+
+data:
+  path: "data/questions"
+  session_dir: "data/sessions"
+
+log:
+  server: "logs/server.log"
+  error: "logs/error.log"
+
+exam:
+  show_answer_after_submit: false

@@ -1,0 +1,5099 @@
+======================================================================
+  爬虫系统 v3.4
+  文件数: 90
+======================================================================
+
+
+############################################################
+# FILE: api\__init__.py
+############################################################
+
+from api.server import app, create_app
+
+
+############################################################
+# FILE: api\server.py
+############################################################
+
+import json, os, logging, threading
+
+try:
+    from fastapi import FastAPI, Query, HTTPException
+    from fastapi.responses import PlainTextResponse
+    from pydantic import BaseModel
+    FASTAPI_OK = True
+except ImportError:
+    FASTAPI_OK = False
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
+log = logging.getLogger('api')
+
+from parser.html_parser import extract_title, extract_date, extract_content
+from extractor.scorer import score_article
+from monitor.metrics import get_collector
+
+
+def _load_sites():
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(base, 'config', 'site.json'), 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+if FASTAPI_OK:
+    app = FastAPI(title='Crawler API v2.0', description='Parser Service')
+
+    class ParseRequest(BaseModel):
+        url: str = ''
+        html: str = ''
+
+    @app.post('/parse')
+    async def parse_html(req: ParseRequest):
+        if not req.html or len(req.html) < 100:
+            raise HTTPException(400, 'HTML content required (min 100 chars)')
+        title = extract_title(req.html)
+        date = extract_date(req.html)
+        content = extract_content(req.html)
+        result = score_article({'title': title, 'content': content, 'url': req.url}, ('',))
+        collector = get_collector()
+        collector.inc('parse_total')
+        collector.inc('parse_success')
+        return {
+            'url': req.url, 'title': title, 'publish_date': date,
+            'content': content[:500], 'content_len': len(content), 'score': result['score'],
+        }
+
+    @app.get('/health')
+    async def health():
+        return {'status': 'ok'}
+
+    @app.get('/ready')
+    async def ready():
+        return {'status': 'ready'}
+
+    @app.get('/sites')
+    async def list_sites():
+        sites = _load_sites()
+        return [{'key': k, 'name': v['name'], 'domain': v['domain']} for k, v in sites.items()]
+
+    @app.get('/articles')
+    async def query_articles(keyword: str = Query(None), site: str = Query(None), limit: int = Query(50)):
+        from storage.manager import StorageManager
+        store = StorageManager()
+        result = store.query_articles(keyword=keyword, site=site, limit=limit)
+        store.close()
+        return {'count': len(result), 'articles': [{k: v for k, v in a.items() if k != 'content'} for a in result]}
+
+    @app.get('/tasks')
+    async def list_tasks(limit: int = Query(20)):
+        from storage.manager import StorageManager
+        store = StorageManager()
+        if store.duck_conn:
+            result = store.duck_conn.execute(
+                'SELECT id, keyword, site, status, article_count, created_at FROM task ORDER BY created_at DESC LIMIT ?', [limit]
+            ).fetchall()
+            cols = ['id', 'keyword', 'site', 'status', 'article_count', 'created_at']
+            tasks = [dict(zip(cols, [str(v) for v in row])) for row in result]
+        else:
+            tasks = []
+        store.close()
+        return {'count': len(tasks), 'tasks': tasks}
+
+    @app.get('/statistics')
+    async def get_statistics():
+        from storage.manager import StorageManager
+        store = StorageManager()
+        stats = store.get_statistics()
+        store.close()
+        return stats
+
+    @app.get('/metrics')
+    async def metrics():
+        collector = get_collector()
+        return PlainTextResponse(collector.dump_prometheus(), media_type='text/plain')
+
+    @app.on_event('startup')
+    async def startup_parser_worker():
+        threading.Thread(target=_run_parser_worker, daemon=True).start()
+        log.info('Parser worker started (bg)')
+
+else:
+    app = None
+
+
+def _run_parser_worker():
+    import time
+    try:
+        import redis as _redis
+    except ImportError:
+        log.warning('redis-py not installed, parser worker disabled')
+        return
+    r = _redis.Redis(host='localhost', port=6379, decode_responses=True)
+    log.info('Parser worker listening on crawler:html')
+    while True:
+        try:
+            result = r.brpop('crawler:html', timeout=5)
+            if result is None:
+                continue
+            _, data = result
+            payload = json.loads(data)
+            url = payload.get('url', '')
+            html = payload.get('html', '')
+            title = payload.get('title', '')
+            if not html or len(html) < 100:
+                continue
+            parsed_title = extract_title(html) or title
+            parsed_date = extract_date(html)
+            parsed_content = extract_content(html)
+            score_result = score_article({'title': parsed_title, 'content': parsed_content, 'url': url}, ('',))
+            result_payload = json.dumps({
+                'url': url, 'title': parsed_title, 'publish_date': parsed_date,
+                'content': parsed_content, 'score': score_result['score'],
+            }, ensure_ascii=False)
+            r.lpush('crawler:result', result_payload)
+            collector = get_collector()
+            collector.inc('parse_total')
+            collector.inc('parse_success')
+            log.info('PARSED -> result_queue: %s (%d chars)', parsed_title[:50], len(parsed_content or ''))
+        except Exception as e:
+            log.error('Parser worker error: %s', e)
+            time.sleep(2)
+
+
+def create_app():
+    return app
+
+
+############################################################
+# FILE: config\__init__.py
+############################################################
+
+
+
+############################################################
+# FILE: config\grafana-dashboard.json
+############################################################
+
+{
+  "title": "Crawler Platform",
+  "panels": [
+    {"title": "Crawl Rate", "targets": [{"expr": "rate(crawl_total[5m])"}], "type": "graph"},
+    {"title": "Success Rate", "targets": [{"expr": "crawl_success / crawl_total * 100"}], "type": "stat"},
+    {"title": "Avg Latency (ms)", "targets": [{"expr": "rate(crawl_latency_sum[5m]) / rate(crawl_latency_count[5m])"}], "type": "stat"},
+    {"title": "Site Status", "targets": [{"expr": "up{job='go-spider'}"}], "type": "stat"},
+    {"title": "Article Trends", "targets": [{"expr": "articles_total"}], "type": "graph"}
+  ]
+}
+
+
+############################################################
+# FILE: config\http.json
+############################################################
+
+{
+  "czj_beijing": { "delay": 1.5, "jitter": 0.8 },
+  "czj_hangzhou": { "delay": 2.0, "jitter": 1.0, "selenium_wait": 10 },
+  "sxcs_shaoxing": { "delay": 2.0, "jitter": 1.0, "selenium_wait": 10 },
+  "sc_czt": { "delay": 3.0, "jitter": 1.5, "selenium_wait": 15 },
+  "sd_czt": { "delay": 2.0, "jitter": 1.0 },
+  "_global": { "max_retries": 3, "timeout": 15, "max_pages": 0 }
+}
+
+
+############################################################
+# FILE: config\keywords.json
+############################################################
+
+{
+  "低空经济": {
+    "expand": [
+      "低空经济",
+      "低空",
+      "无人机",
+      "通用航空",
+      "通航"
+    ],
+    "min_results": 5
+  },
+  "人工智能": {
+    "expand": [
+      "人工智能",
+      "AI",
+      "大模型"
+    ],
+    "min_results": 5
+  }
+}
+
+
+############################################################
+# FILE: config\keywords.py
+############################################################
+
+import json, os
+
+DEFAULT_KEYWORDS = (
+    '低空经济',
+    '低空政策',
+    '低空监管',
+    '低空',
+)
+
+def _load_keywords_config():
+    path = os.path.join(os.path.dirname(__file__), 'keywords.json')
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+_kw_config = _load_keywords_config()
+
+def get_expand_keywords(keyword):
+    group = _kw_config.get(keyword, {})
+    return group.get('expand', [keyword])
+
+def get_min_results(keyword):
+    group = _kw_config.get(keyword, {})
+    return group.get('min_results', 0)
+
+LOW_ALT_KEYWORDS = list(set(kw for g in _kw_config.values() for kw in g.get('expand', []))) or [
+    '低空经济','低空','无人机','通用航空','航空产业','eVTOL','飞行器','低空产业园','低空招标',
+]
+
+
+############################################################
+# FILE: config\parser.json
+############################################################
+
+{
+  "_global": { "max_detail_chars": 3000, "ai_enabled": false }
+}
+
+
+############################################################
+# FILE: config\prometheus.yml
+############################################################
+
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'go-spider'
+    static_configs:
+      - targets: ['localhost:8080']
+    metrics_path: /metrics
+
+  - job_name: 'python-parser'
+    static_configs:
+      - targets: ['localhost:8000']
+    metrics_path: /metrics
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['localhost:9121']
+
+
+############################################################
+# FILE: config\schema.sql
+############################################################
+
+-- Crawler Database Schema (MySQL 8.0+)
+
+CREATE DATABASE IF NOT EXISTS crawler_db
+    DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+USE crawler_db;
+
+CREATE TABLE IF NOT EXISTS article (
+    id               BIGINT AUTO_INCREMENT PRIMARY KEY,
+    url              VARCHAR(1000) NOT NULL,
+    title            VARCHAR(500),
+    summary          TEXT,
+    content          LONGTEXT,
+    publish_time     DATETIME,
+    province         VARCHAR(100),
+    site             VARCHAR(200),
+    keyword          VARCHAR(200),
+    score            INT DEFAULT 0,
+    matched_keywords VARCHAR(500),
+    crawl_time       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    detail_fetched   TINYINT(1) DEFAULT 0,
+    source_type      VARCHAR(50),
+    status           VARCHAR(20) DEFAULT 'new',
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE INDEX idx_url_hash (MD5(url)),
+    INDEX idx_site (site),
+    INDEX idx_keyword (keyword),
+    INDEX idx_publish_time (publish_time),
+    INDEX idx_score (score),
+    INDEX idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS task (
+    id          VARCHAR(32) PRIMARY KEY,
+    keyword     VARCHAR(200),
+    site        VARCHAR(100),
+    status      ENUM('created','running','completed','failed') DEFAULT 'created',
+    article_count INT DEFAULT 0,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_status (status),
+    INDEX idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS crawl_log (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    url         VARCHAR(1000) NOT NULL,
+    status      SMALLINT NOT NULL,
+    cost_ms     INT DEFAULT 0,
+    error       TEXT,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_url (url(255)),
+    INDEX idx_status (status),
+    INDEX idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+############################################################
+# FILE: config\score.json
+############################################################
+
+{
+  "_global": {
+    "title_weight": 5,
+    "body_weight": 1,
+    "url_weight": 0,
+    "threshold": 2
+  },
+  "czj_beijing": {
+    "title_weight": 5,
+    "body_weight": 1,
+    "url_weight": 0,
+    "threshold": 3
+  },
+  "czj_hangzhou": {
+    "title_weight": 5,
+    "body_weight": 1,
+    "url_weight": 0,
+    "threshold": 2
+  },
+  "sxcs_shaoxing": {
+    "title_weight": 5,
+    "body_weight": 1,
+    "url_weight": 0,
+    "threshold": 2
+  }
+}
+
+############################################################
+# FILE: config\site.json
+############################################################
+
+{
+  "czj_beijing": {
+    "name": "北京市财政局",
+    "domain": "czj.beijing.gov.cn",
+    "base_url": "https://czj.beijing.gov.cn",
+    "search": {
+      "type": "trs_json",
+      "page_url": "https://czj.beijing.gov.cn/so/s",
+      "api_url": "https://czj.beijing.gov.cn/so/ss/query/s",
+      "params": { "siteCode": "1100000092", "pageSize": 20 }
+    },
+    "extract": { "mode": "trs" }
+  },
+  "czj_hangzhou": {
+    "name": "杭州市财政局",
+    "domain": "czj.hangzhou.gov.cn",
+    "base_url": "https://czj.hangzhou.gov.cn",
+    "search": {
+      "type": "jpaas_jsearch",
+      "page_url": "https://search.zj.gov.cn/api-gateway/jpaas-jsearch-web-server/search",
+      "api_url": "https://search.zj.gov.cn/api-gateway/jpaas-jsearch-web-server/interface/search/app/info",
+      "params": {
+        "serviceId": "YcTOd1ftgC5dxzJ8RhCBN",
+        "websiteid": "330100000000",
+        "webId": "3217",
+        "cateid": "6N89tbnrVTYIQK5jt7q3T",
+        "pos": "title,content,bu11etincontent_701803,content_556463,vc_content"
+      }
+    },
+    "extract": { "mode": "jpaas" }
+  },
+  "sxcs_shaoxing": {
+    "name": "绍兴市财政局",
+    "domain": "sxcs.sx.gov.cn",
+    "base_url": "https://sxcs.sx.gov.cn",
+    "search": {
+      "type": "jpaas_jsearch",
+      "page_url": "https://search.zj.gov.cn/api-gateway/jpaas-jsearch-web-server/search",
+      "api_url": "https://search.zj.gov.cn/api-gateway/jpaas-jsearch-web-server/interface/search/app/info",
+      "params": {
+        "serviceId": "YcTOd1ftgC5dxzJ8RhCBN",
+        "websiteid": "330600000000",
+        "webId": "2959",
+        "cateid": "6N89tbnrVTYIQK5jt7q3T",
+        "pos": "title,content,bu11etincontent_701803,content_556463,vc_content"
+      }
+    },
+    "extract": { "mode": "jpaas" }
+  },
+  "sc_czt": {
+    "name": "四川省财政厅",
+    "domain": "czt.sc.gov.cn",
+    "base_url": "https://czt.sc.gov.cn",
+    "search": {
+      "type": "html",
+      "page_url": "https://czt.sc.gov.cn/guestweb4/s",
+      "params": { "searchWord": "", "siteCode": "5100000092" }
+    },
+    "extract": { "mode": "sichuan" }
+  },
+  "sd_czt": {
+    "name": "山东省财政厅",
+    "domain": "czt.shandong.gov.cn",
+    "base_url": "http://czt.shandong.gov.cn",
+    "search": {
+      "type": "trs_json",
+      "page_url": "http://czt.shandong.gov.cn/so/s",
+      "api_url": "http://czt.shandong.gov.cn/so/ss/query/s",
+      "params": { "siteCode": "", "pageSize": 20 }
+    },
+    "extract": { "mode": "trs" }
+  }
+}
+
+
+############################################################
+# FILE: config\system.json
+############################################################
+
+{
+  "worker": 4,
+  "queue_size": 1000,
+  "environment": "dev"
+}
+
+
+############################################################
+# FILE: core\__init__.py
+############################################################
+
+from core.query_expander import QueryExpander
+
+
+############################################################
+# FILE: core\query_expander.py
+############################################################
+
+import json
+from pathlib import Path
+
+
+class QueryExpander:
+
+    def __init__(self):
+        path = Path("config/keywords.json")
+        if path.exists():
+            self.rules = json.loads(
+                path.read_text(
+                    encoding="utf-8"
+                )
+            )
+        else:
+            self.rules = {}
+
+    def expand(self, keyword):
+        rule = self.rules.get(keyword)
+        if not rule:
+            return [keyword]
+        return rule.get(
+            "expand",
+            [keyword]
+        )
+
+    def min_results(self, keyword):
+        rule = self.rules.get(keyword)
+        if not rule:
+            return 5
+        return rule.get(
+            "min_results",
+            5
+        )
+
+
+############################################################
+# FILE: crawler\__init__.py
+############################################################
+
+from crawler.pipeline import run_pipeline
+from crawler.detail_scheduler import need_fetch_detail, _fetch_one_detail
+from crawler.crawl_scheduler import crawl_url
+
+
+############################################################
+# FILE: crawler\crawl_scheduler.py
+############################################################
+
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from httpx.fetch import fetch, reset_all_sessions
+from parser.html_parser import extract_title, extract_date, extract_content
+from extractor.scorer import filter_by_score
+from dedup.sqlite_cache import DedupDB
+from storage.json_store import save_results
+from scheduler.search_scheduler import search_with_plugin
+from utils import RequestContext
+
+from crawler.detail_scheduler import need_fetch_detail, _fetch_one_detail
+
+log = logging.getLogger('crawler.orchestrator')
+
+
+def crawl_url(url, site_cfg, keywords=()):
+    resp = fetch(url, site_cfg)
+    if not resp:
+        return None
+    return {
+        'title': extract_title(resp.text),
+        'url': url,
+        'publish_date': extract_date(resp.text),
+        'summary': '',
+        'content': extract_content(resp.text, site_cfg),
+        'source': site_cfg.get('name', '') if site_cfg else '',
+        'source_keywords': list(keywords),
+    }
+
+
+############################################################
+# FILE: crawler\detail_scheduler.py
+############################################################
+
+import logging
+
+from httpx.fetch import fetch
+from parser.html_parser import extract_content
+
+log = logging.getLogger('crawler.detail')
+
+
+def need_fetch_detail(article):
+    content = article.get('content', '') or ''
+    summary = article.get('summary', '') or ''
+    text = content if len(content) > len(summary) else summary
+    if not text or len(text.strip()) < 80:
+        return True
+    if text.count('<') > text.count('>') + 3:
+        return True
+    stripped = text.strip()
+    if stripped.endswith('...') or stripped.endswith('\u2026'):
+        return True
+    if len(stripped) > 2000:
+        return False
+    if len(stripped) > 300 and stripped[-1] not in ',;\uff0c\uff1b':
+        return False
+    return len(stripped) < 200
+
+
+def _fetch_one_detail(url, site_cfg):
+    try:
+        resp = fetch(url, site_cfg)
+        if resp:
+            return extract_content(resp.text, site_cfg)
+    except Exception:
+        log.warning('_fetch_one_detail failed: %s', url[:80])
+    return None
+
+
+############################################################
+# FILE: crawler\pipeline.py
+############################################################
+
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from httpx.fetch import fetch, reset_all_sessions
+from parser.html_parser import extract_title, extract_date, extract_content
+from extractor.scorer import filter_by_score
+from dedup.url_hash import UrlHashCache
+from storage.manager import StorageManager
+from core.query_expander import QueryExpander
+from search.keyword_expand import expand_keywords
+from search.result_merge import search_hit_rate, content_hit_rate
+from utils import RequestContext
+from plugins import search as search_with_plugin
+from crawler.detail_scheduler import need_fetch_detail, _fetch_one_detail
+
+log = logging.getLogger('crawler.pipeline')
+
+
+def process_url(url, site_cfg, keywords=()):
+    resp = fetch(url, site_cfg)
+    if not resp:
+        return None
+    return {
+        'title': extract_title(resp.text),
+        'url': url,
+        'publish_date': extract_date(resp.text),
+        'summary': '',
+        'content': extract_content(resp.text, site_cfg),
+        'source': site_cfg.get('name', '') if site_cfg else '',
+        'source_keywords': list(keywords),
+    }
+
+
+def run_pipeline(site_cfg, keywords, output_dir, max_pages=0, with_detail=False):
+    ctx = RequestContext(site_cfg.get('name', ''))
+    reset_all_sessions()
+    expander = QueryExpander()
+    all_articles = []
+    for kw in keywords:
+        queries = expander.expand(kw)
+        log.info(ctx.fmt('Expanded keywords: %s -> %s'), kw, queries)
+        for q in queries:
+            stype = site_cfg.get('search', {}).get('type', '').upper()
+            log.info(ctx.fmt('[%s] %s'), stype, q)
+            with ctx.timed('search'):
+                articles = search_with_plugin(site_cfg, q, max_pages)
+            for a in articles:
+                a['matched_keyword'] = q
+            all_articles.extend(articles)
+            if len(all_articles) >= expander.min_results(kw):
+                log.info(ctx.fmt('  enough results (%d >= %d), stop expanding'), len(all_articles), expander.min_results(kw))
+                break
+        for a in all_articles:
+            a.setdefault('site', site_cfg.get('name', ''))
+            a.setdefault('province', site_cfg.get('province', site_cfg.get('name', '').replace('财政局','').replace('财政厅','')))
+
+    if all_articles is None:
+        log.warning('Search failed')
+    elif len(all_articles) == 0:
+        log.warning('No matching results after filtering')
+    else:
+        log.info(ctx.fmt('Collected %d articles before scoring'), len(all_articles))
+    expanded = expand_keywords(keywords)
+    with ctx.timed('dedup'):
+        dedup = UrlHashCache()
+        all_articles = dedup.dedup_list(all_articles)
+
+    search_hit = search_hit_rate(all_articles, expanded)
+    content_hit = content_hit_rate(all_articles, expanded)
+    log.info(ctx.fmt('  search_hit: %d/%d (%.1f%%) | content_hit: %d/%d (%.1f%%)'),
+             search_hit['search_hit'], search_hit['found'], search_hit['search_hit_rate'],
+             content_hit['content_hit'], content_hit['found'], content_hit['content_hit_rate'])
+    filtered = [a for a in all_articles if a.get('content_hit', True)]
+    if len(filtered) < len(all_articles):
+        log.info(ctx.fmt('  content_hit filter: %d -> %d articles'), len(all_articles), len(filtered))
+    all_articles = filtered
+    for a in all_articles[:10]:
+        log.info(ctx.fmt('  SEARCH: %s | %s'), a.get('title','')[:70], a.get('url','')[:60])
+
+    with ctx.timed('scoring'):
+        scored = filter_by_score(all_articles, keywords, site_cfg=site_cfg)
+    if with_detail and scored:
+        workers = site_cfg.get('_system', {}).get('worker', 3)
+        with ctx.timed('detail'):
+            ctx.metrics.requests['total'] += 1
+            to_fetch = [a for a in scored if need_fetch_detail(a)]
+        skip = len(scored) - len(to_fetch)
+        ctx.metrics.articles['detail_skipped'] = skip
+        ctx.metrics.articles['detail_fetched'] = len(to_fetch)
+        if skip > 0:
+            log.info('Detail fetch: %d skip (content OK), %d to fetch', skip, len(to_fetch))
+            if to_fetch:
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    future_map = {executor.submit(_fetch_one_detail, a.get('url', ''), site_cfg): a for a in to_fetch}
+                    for future in as_completed(future_map):
+                        a = future_map[future]
+                        try:
+                            body = future.result(timeout=30)
+                            if body:
+                                a['content'] = body
+                                a['summary'] = body[:300]
+                        except Exception as e:
+                            log.warning('Detail fetch failed %s: %s', a.get('url', '')[:50], e)
+
+    ctx.metrics.articles['found'] = len(all_articles)
+    ctx.metrics.articles['scored'] = len(scored)
+    store = StorageManager(output_dir, site_cfg.get('name', 'result'))
+    saved_count = store.save(scored)
+    store.close()
+    ctx.metrics.articles['saved'] = len(scored)
+    log.info(ctx.fmt('Saved: DuckDB (%d)'), saved_count)
+    log.info(ctx.summary())
+    return scored
+
+
+############################################################
+# FILE: dedup\__init__.py
+############################################################
+
+
+
+############################################################
+# FILE: dedup\bloom.py
+############################################################
+
+import logging
+
+log = logging.getLogger('dedup.bloom')
+
+
+class BloomFilter:
+    """Placeholder for Redis Bloom filter. Currently delegates to in-memory set."""
+
+    def __init__(self, capacity=100000, error_rate=0.01):
+        self._seen = set()
+        log.info('Bloom filter placeholder (memory set), capacity=%d', capacity)
+
+    def add(self, url):
+        self._seen.add(url)
+
+    def contains(self, url):
+        return url in self._seen
+
+    def size(self):
+        return len(self._seen)
+
+
+class RedisBloomFilter:
+    """Future: RedisBloom implementation. Replace BloomFilter when Redis is available."""
+
+    def __init__(self, redis_client, key='crawler:bloom'):
+        self.redis = redis_client
+        self.key = key
+        log.info('Redis Bloom filter: key=%s (stub - requires RedisBloom module)', key)
+
+    def add(self, url):
+        # Future: self.redis.execute_command('BF.ADD', self.key, url)
+        pass
+
+    def contains(self, url):
+        # Future: return self.redis.execute_command('BF.EXISTS', self.key, url)
+        return False
+
+
+############################################################
+# FILE: dedup\sqlite_cache.py
+############################################################
+
+import sqlite3, hashlib, os, logging
+log = logging.getLogger('crawler.dedup')
+
+
+class DedupDB:
+    def __init__(self, db_path=None):
+        if db_path is None:
+            db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'output', 'crawler.db')
+        self.db_path = os.path.abspath(db_path)
+        self._init_db()
+
+    def _init_db(self):
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.execute(('CREATE TABLE IF NOT EXISTS crawled ('
+                          'url_hash TEXT PRIMARY KEY, url TEXT NOT NULL, title TEXT, '
+                          'crawl_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP, score INTEGER DEFAULT 0)'))
+        self.conn.commit()
+
+    def _url_hash(self, url):
+        return hashlib.md5(url.encode('utf-8')).hexdigest()
+
+    def is_duplicate(self, url):
+        h = self._url_hash(url)
+        return self.conn.execute('SELECT 1 FROM crawled WHERE url_hash = ?', (h,)).fetchone() is not None
+
+    def mark_crawled(self, url, title='', score=0):
+        self.conn.execute('INSERT OR IGNORE INTO crawled VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)',
+                          (self._url_hash(url), url, title[:200], score))
+        self.conn.commit()
+
+    def dedup_list(self, articles):
+        result = []
+        for a in articles:
+            url = a.get('url', '')
+            if url and not self.is_duplicate(url):
+                self.mark_crawled(url, a.get('title', ''), a.get('score', 0))
+                result.append(a)
+        return result
+
+    def close(self):
+        if hasattr(self, 'conn'):
+            self.conn.close()
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        self.close()
+
+
+############################################################
+# FILE: dedup\url_hash.py
+############################################################
+
+import hashlib
+import logging
+
+log = logging.getLogger('dedup.url_hash')
+
+
+class UrlHashCache:
+    """In-memory URL dedup using MD5 hash set. Lightweight, no disk I/O."""
+
+    def __init__(self):
+        self._seen = set()
+
+    def is_duplicate(self, url):
+        h = hashlib.md5(url.encode()).hexdigest()
+        if h in self._seen:
+            return True
+        self._seen.add(h)
+        return False
+
+    def dedup_list(self, articles):
+        result = []
+        for a in articles:
+            url = a.get('url', '')
+            if url and not self.is_duplicate(url):
+                result.append(a)
+        return result
+
+    def size(self):
+        return len(self._seen)
+
+    def clear(self):
+        self._seen.clear()
+
+
+############################################################
+# FILE: docker-compose.yml
+############################################################
+
+version: '3.8'
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    ports: ['9090:9090']
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+    command: ['--config.file=/etc/prometheus/prometheus.yml']
+
+  grafana:
+    image: grafana/grafana:latest
+    ports: ['3000:3000']
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./config/grafana-dashboard.json:/etc/grafana/provisioning/dashboards/crawler.json
+
+  redis:
+    image: redis:7-alpine
+    ports: ['6379:6379']
+
+
+############################################################
+# FILE: extractor\__init__.py
+############################################################
+
+
+
+############################################################
+# FILE: extractor\cleaner.py
+############################################################
+
+from parser.multi_strategy import clean_text
+
+
+def clean_article(article):
+    """清洗单篇文章各字段"""
+    for field in ['title', 'summary', 'content', 'source']:
+        if field in article:
+            article[field] = clean_text(article[field])
+    return article
+
+
+############################################################
+# FILE: extractor\scorer.py
+############################################################
+
+from search.keyword_expand import expand_keywords
+
+WEIGHTS = {'title': 5, 'body': 1, 'url': 0}
+THRESHOLD = 2
+
+
+def score_article(article, keywords, weights=None, threshold=None, site_cfg=None):
+    if weights is None:
+        site_score = site_cfg.get('score', {}) if site_cfg else {}
+        site_w = {k: site_score.get(k, WEIGHTS[k]) for k in WEIGHTS}
+        weights = site_w
+    if threshold is None:
+        site_score = site_cfg.get('score', {}) if site_cfg else {}
+        threshold = site_score.get('threshold', THRESHOLD)
+    title = article.get('title', '') or ''
+    body = article.get('content', '') or article.get('summary', '') or ''
+    url = article.get('url', '') or ''
+    total_score = 0
+    matched_kws = []
+    for kw in keywords:
+        kw_score = 0
+        if kw in title:
+            kw_score += weights['title']
+        if kw in body:
+            kw_score += weights['body']
+        if kw in url:
+            kw_score += weights['url']
+        if kw_score > 0:
+            matched_kws.append(kw)
+            total_score += kw_score
+    return {'score': total_score, 'passed': total_score >= threshold, 'matched_keywords': matched_kws}
+
+
+def filter_by_score(articles, keywords, weights=None, threshold=None, site_cfg=None):
+    expanded = expand_keywords(keywords)
+    results = []
+    for a in articles:
+        r = score_article(a, expanded, weights, threshold, site_cfg)
+        if r['passed']:
+            a['score'] = r['score']
+            a['matched_keywords'] = r['matched_keywords']
+            results.append(a)
+    results.sort(key=lambda x: x.get('score', 0), reverse=True)
+    return results
+
+
+############################################################
+# FILE: frontend\index.html
+############################################################
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Crawler Platform Dashboard</title>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+body { font-family: 'Segoe UI', sans-serif; margin: 0; background: #f0f2f5; }
+.header { background: linear-gradient(135deg, #1a73e8, #0d47a1); color: #fff; padding: 20px 30px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap: 15px; padding: 20px; }
+.card { background: #fff; border-radius: 8px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,.1); }
+.card .value { font-size: 2em; font-weight: bold; color: #1a73e8; }
+.card .label { color: #666; font-size: .9em; margin-top: 5px; }
+.chart-box { background: #fff; border-radius: 8px; padding: 20px; margin: 0 20px 20px; box-shadow: 0 1px 3px rgba(0,0,0,.1); }
+table { width: 100%; border-collapse: collapse; margin: 20px; }
+th,td { padding: 10px; text-align: left; border-bottom: 1px solid #eee; }
+th { background: #f5f5f5; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="header">
+    <h1>爬虫平台监控面板</h1>
+    <p>实时抓取数量 | 成功率 | 平均耗时 | 网站状态 | 文章趋势</p>
+  </div>
+  <div class="grid">
+    <div class="card"><div class="value">{{ stats.total }}</div><div class="label">总抓取数</div></div>
+    <div class="card"><div class="value">{{ stats.success }}%</div><div class="label">成功率</div></div>
+    <div class="card"><div class="value">{{ stats.avgLatency }}ms</div><div class="label">平均耗时</div></div>
+    <div class="card"><div class="value">{{ stats.sitesUp }}/{{ stats.sitesTotal }}</div><div class="label">在线站点</div></div>
+  </div>
+  <div class="chart-box"><h3>文章趋势</h3><canvas id="trendChart" height="80"></canvas></div>
+  <div style="padding:0 20px"><h3>最新文章</h3></div>
+  <table><thead><tr><th>标题</th><th>来源</th><th>时间</th><th>评分</th></tr></thead>
+    <tbody><tr v-for="a in articles"><td><a :href="a.url" target="_blank">{{ a.title }}</a></td><td>{{ a.source }}</td><td>{{ a.publish_time }}</td><td>{{ a.score }}</td></tr></tbody>
+  </table>
+</div>
+<script>
+const { createApp, ref, onMounted } = Vue;
+createApp({
+  setup() {
+    const stats = ref({ total: 0, success: 0, avgLatency: 0, sitesUp: 0, sitesTotal: 0 });
+    const articles = ref([]);
+    const API = 'http://localhost:8080';
+    async function refresh() {
+      try {
+        let r = await fetch(API+'/articles');
+        let data = await r.json();
+        articles.value = data.articles || [];
+        stats.value.total = data.count || articles.value.length;
+      } catch(e) {}
+      try {
+        let r = await fetch(API+'/sites');
+        let sites = await r.json();
+        stats.value.sitesTotal = sites.length;
+        stats.value.sitesUp = sites.length;
+      } catch(e) {}
+    }
+    onMounted(() => { refresh(); setInterval(refresh, 10000); });
+    return { stats, articles };
+  }
+}).mount('#app');
+</script>
+</body>
+</html>
+
+
+############################################################
+# FILE: go-spider\go.mod
+############################################################
+
+module crawler-platform
+
+go 1.26.5
+
+require (
+	github.com/PuerkitoBio/goquery v1.12.0
+	github.com/gin-gonic/gin v1.12.0
+	github.com/go-resty/resty/v2 v2.17.2
+	github.com/redis/go-redis/v9 v9.21.0
+	github.com/spf13/viper v1.21.0
+)
+
+
+############################################################
+# FILE: go-spider\internal\api\handler.go
+############################################################
+
+package api
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"sync"
+	"time"
+
+	"crawler-platform/internal/client"
+	"crawler-platform/internal/config"
+	"crawler-platform/internal/worker"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+type Task struct {
+	ID        string       `json:"id"`
+	Site      string       `json:"site"`
+	Keywords  string       `json:"keywords"`
+	Status    string       `json:"status"`
+	CreatedAt time.Time    `json:"created_at"`
+	Stats     worker.Stats `json:"stats"`
+}
+
+type TaskStore struct {
+	mu    sync.RWMutex
+	tasks map[string]*Task
+}
+
+func NewTaskStore() *TaskStore {
+	return &TaskStore{tasks: make(map[string]*Task)}
+}
+
+func (ts *TaskStore) Create(site, keywords string) *Task {
+	task := &Task{
+		ID:        uuid.New().String()[:8],
+		Site:      site,
+		Keywords:  keywords,
+		Status:    "created",
+		CreatedAt: time.Now(),
+	}
+	ts.mu.Lock()
+	ts.tasks[task.ID] = task
+	ts.mu.Unlock()
+	return task
+}
+
+func (ts *TaskStore) Get(id string) *Task {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return ts.tasks[id]
+}
+
+func (ts *TaskStore) Update(id string, status string, stats worker.Stats) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if t, ok := ts.tasks[id]; ok {
+		t.Status = status
+		t.Stats = stats
+	}
+}
+
+type CreateTaskReq struct {
+	Site     string `json:"site" binding:"required"`
+	Keywords string `json:"keywords" binding:"required"`
+	MaxPages int    `json:"max_pages"`
+	Workers  int    `json:"workers"`
+}
+
+func (s *Server) health(c *gin.Context) {
+	c.JSON(200, gin.H{"status": "ok"})
+}
+
+func (s *Server) ready(c *gin.Context) {
+	c.JSON(200, gin.H{"status": "ready"})
+}
+
+func (s *Server) createTask(c *gin.Context) {
+	var req CreateTaskReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Workers == 0 {
+		req.Workers = 4
+	}
+	if req.MaxPages == 0 {
+		req.MaxPages = 1
+	}
+
+	task := s.store.Create(req.Site, req.Keywords)
+
+	go func() {
+		cfg, err := config.Load(req.Site, "../config")
+		if err != nil {
+			log.Printf("[task:%s] config error: %v", task.ID, err)
+			s.store.Update(task.ID, "failed", worker.Stats{})
+			return
+		}
+
+		articles := client.SearchArticles(cfg, req.Keywords)
+		log.Printf("[task:%s] found %d articles", task.ID, len(articles))
+
+		for _, a := range articles {
+			s.manager.Submit(worker.Task{URL: a.URL, Title: a.Title, SiteCfg: cfg})
+		}
+
+		for {
+			stats := s.manager.Stats()
+			s.store.Update(task.ID, "running", stats)
+			if stats.Completed+stats.Failed >= stats.Submitted && stats.QueueLen == 0 {
+				s.store.Update(task.ID, "completed", stats)
+				log.Printf("[task:%s] completed: %d ok, %d failed", task.ID, stats.Completed, stats.Failed)
+				return
+			}
+			time.Sleep(3 * time.Second)
+		}
+	}()
+
+	c.JSON(202, gin.H{"task_id": task.ID, "status": "created"})
+}
+
+func (s *Server) taskStatus(c *gin.Context) {
+	id := c.Query("id")
+	if id == "" {
+		c.JSON(400, gin.H{"error": "id required"})
+		return
+	}
+	task := s.store.Get(id)
+	if task == nil {
+		c.JSON(404, gin.H{"error": "task not found"})
+		return
+	}
+	c.JSON(200, task)
+}
+
+func (s *Server) listArticles(c *gin.Context) {
+	if s.redis == nil {
+		c.JSON(503, gin.H{"error": "redis not available"})
+		return
+	}
+
+	var articles []map[string]interface{}
+	for i := 0; i < 50; i++ {
+		payload, err := s.redis.PopResult()
+		if err != nil || payload == nil {
+			break
+		}
+		articles = append(articles, map[string]interface{}{
+			"url": payload.URL, "title": payload.Title,
+			"score": payload.Score,
+		})
+	}
+
+	c.JSON(200, gin.H{"count": len(articles), "articles": articles})
+	_ = fmt.Sprintf
+}
+
+func (s *Server) metrics(c *gin.Context) {
+	c.String(200, "# TYPE crawler gauge\ncrawler_info{version=\"1.0\"} 1\n")
+}
+
+func (s *Server) listSites(c *gin.Context) {
+	c.JSON(200, []gin.H{
+		{"key": "czj_beijing", "name": "北京市财政局"},
+		{"key": "czj_hangzhou", "name": "杭州市财政局"},
+	})
+}
+
+func init() {
+	_ = json.Marshal
+	_ = http.StatusOK
+}
+
+
+############################################################
+# FILE: go-spider\internal\api\router.go
+############################################################
+
+package api
+
+import (
+	"crawler-platform/internal/queue"
+	"crawler-platform/internal/worker"
+
+	"github.com/gin-gonic/gin"
+)
+
+type Server struct {
+	router  *gin.Engine
+	redis   *queue.RedisQueue
+	manager *worker.WorkerManager
+	store   *TaskStore
+}
+
+func NewServer(rq *queue.RedisQueue, mgr *worker.WorkerManager) *Server {
+	s := &Server{
+		router:  gin.Default(),
+		redis:   rq,
+		manager: mgr,
+		store:   NewTaskStore(),
+	}
+	s.routes()
+	return s
+}
+
+func (s *Server) routes() {
+	s.router.GET("/health", s.health)
+	s.router.GET("/ready", s.ready)
+	s.router.GET("/task/status", s.taskStatus)
+	s.router.POST("/task/create", s.createTask)
+	s.router.GET("/articles", s.listArticles)
+
+	// API wrapper copies Python FastAPI routes for compatibility
+	s.router.GET("/metrics", s.metrics)
+	s.router.GET("/sites", s.listSites)
+}
+
+func (s *Server) Run(addr string) error {
+	return s.router.Run(addr)
+}
+
+
+############################################################
+# FILE: go-spider\internal\client\resty.go
+############################################################
+
+package client
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/url"
+	"strings"
+	"time"
+
+	"crawler-platform/internal/config"
+
+	"github.com/go-resty/resty/v2"
+)
+
+type Article struct {
+	Title string `json:"title"`
+	URL   string `json:"url"`
+}
+
+type RestyFetcher struct {
+	client *resty.Client
+	delay  time.Duration
+}
+
+func NewRestyFetcher(delaySec float64) *RestyFetcher {
+	c := resty.New().
+		SetTimeout(15 * time.Second).
+		SetRetryCount(3).
+		SetRetryWaitTime(1 * time.Second).
+		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36").
+		SetHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	return &RestyFetcher{client: c, delay: time.Duration(delaySec * float64(time.Second))}
+}
+
+func (f *RestyFetcher) Fetch(url string) (string, error) {
+	if f.delay > 0 {
+		time.Sleep(f.delay)
+	}
+	resp, err := f.client.R().Get(url)
+	if err != nil {
+		return "", fmt.Errorf("fetch %s: %w", url, err)
+	}
+	if resp.StatusCode() >= 400 {
+		return "", fmt.Errorf("fetch %s: HTTP %d", url, resp.StatusCode())
+	}
+	return resp.String(), nil
+}
+
+func SearchArticles(cfg *config.SiteConfig, keyword string) []Article {
+	search := cfg.Search
+	if search.APIURL == "" {
+		return nil
+	}
+
+	switch search.Type {
+	case "trs_json":
+		return searchTRS(cfg, keyword)
+	case "jpaas_jsearch":
+		return searchJPAAS(cfg, keyword)
+	default:
+		log.Printf("[client] unknown search type: %s", search.Type)
+		return nil
+	}
+}
+
+func searchTRS(cfg *config.SiteConfig, keyword string) []Article {
+	params := map[string]string{}
+	for k, v := range cfg.Search.Params {
+		params[k] = fmt.Sprintf("%v", v)
+	}
+	params["qt"] = keyword
+	params["pageSize"] = fmt.Sprintf("%v", cfg.Search.Params["pageSize"])
+	params["page"] = "1"
+
+	form := url.Values{}
+	for k, v := range params {
+		form.Set(k, v)
+	}
+
+	c := resty.New().SetTimeout(15 * time.Second)
+	resp, err := c.R().
+		SetHeader("Content-Type", "application/x-www-form-urlencoded").
+		SetFormDataFromValues(form).
+		Post(cfg.Search.APIURL)
+
+	if err != nil {
+		log.Printf("[trs] search error: %v", err)
+		return nil
+	}
+
+	var result struct {
+		ResultDocs []struct {
+			Title   string `json:"title"`
+			URL     string `json:"url"`
+			Summary string `json:"summary"`
+		} `json:"resultDocs"`
+	}
+	if err := json.Unmarshal(resp.Body(), &result); err != nil {
+		log.Printf("[trs] parse error: %v", err)
+		return nil
+	}
+
+	var articles []Article
+	for _, doc := range result.ResultDocs {
+		url := doc.URL
+		if !strings.HasPrefix(url, "http") {
+			url = cfg.BaseURL + url
+		}
+		articles = append(articles, Article{Title: doc.Title, URL: url})
+	}
+	log.Printf("[trs] %s -> %d results", keyword, len(articles))
+	return articles
+}
+
+func searchJPAAS(cfg *config.SiteConfig, keyword string) []Article {
+	params := map[string]string{
+		"q":        keyword,
+		"p":        "1",
+		"pg":       "10",
+		"sortType": "1",
+	}
+	for k, v := range cfg.Search.Params {
+		params[k] = fmt.Sprintf("%v", v)
+	}
+
+	c := resty.New().SetTimeout(15 * time.Second)
+	resp, err := c.R().
+		SetHeader("X-Requested-With", "XMLHttpRequest").
+		SetHeader("Accept", "*/*").
+		SetQueryParams(params).
+		Get(cfg.Search.APIURL)
+
+	if err != nil {
+		log.Printf("[jpaas] search error: %v", err)
+		return nil
+	}
+
+	var result struct {
+		Code string `json:"code"`
+		Data struct {
+			AppSearchResultBeanList []struct {
+				MapSearchResult struct {
+					Items []struct {
+						Data struct {
+							Title string `json:"title_str"`
+							URL   string `json:"url"`
+						} `json:"data"`
+					} `json:"items"`
+				} `json:"mapSearchResult"`
+				Title string `json:"title_str"`
+				URL   string `json:"url"`
+			} `json:"appSearchResultBeanList"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body(), &result); err != nil {
+		log.Printf("[jpaas] parse error: %v", err)
+		return nil
+	}
+
+	var articles []Article
+	for _, doc := range result.Data.AppSearchResultBeanList {
+		title := doc.Title
+		articleURL := doc.URL
+		if doc.MapSearchResult.Items != nil {
+			for _, item := range doc.MapSearchResult.Items {
+				if item.Data.Title != "" {
+					title = item.Data.Title
+				}
+				if item.Data.URL != "" {
+					articleURL = item.Data.URL
+				}
+			}
+		}
+		if articleURL == "" || title == "" {
+			continue
+		}
+		if strings.HasPrefix(articleURL, "http://") {
+			articleURL = strings.Replace(articleURL, "http://", "https://", 1)
+		}
+		articles = append(articles, Article{Title: title, URL: articleURL})
+	}
+	log.Printf("[jpaas] %s -> %d results", keyword, len(articles))
+	return articles
+}
+
+
+############################################################
+# FILE: go-spider\internal\config\config.go
+############################################################
+
+package config
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+// SiteConfig mirrors Python's site_cfg dict
+type SiteConfig struct {
+	Name      string       `json:"name"`
+	Domain    string       `json:"domain"`
+	BaseURL   string       `json:"base_url"`
+	Search    SearchConfig `json:"search"`
+	Extract   ExtractConfig `json:"extract"`
+	Score     ScoreConfig  `json:"score"`
+	RateLimit RateLimitConfig `json:"rate_limit"`
+}
+
+type SearchConfig struct {
+	Type    string            `json:"type"`
+	PageURL string            `json:"page_url"`
+	APIURL  string            `json:"api_url"`
+	Params  map[string]interface{} `json:"params"`
+}
+
+type ExtractConfig struct {
+	Mode string `json:"mode"`
+}
+
+type ScoreConfig struct {
+	TitleWeight int `json:"title_weight"`
+	BodyWeight  int `json:"body_weight"`
+	URLWeight   int `json:"url_weight"`
+	Threshold   int `json:"threshold"`
+}
+
+type RateLimitConfig struct {
+	Delay float64 `json:"delay"`
+	Jitter float64 `json:"jitter"`
+}
+
+func Load(siteKey, configDir string) (*SiteConfig, error) {
+	sitePath := filepath.Join(configDir, "site.json")
+	httpPath := filepath.Join(configDir, "http.json")
+	scorePath := filepath.Join(configDir, "score.json")
+
+	sites := make(map[string]SiteConfig)
+	if err := loadJSON(sitePath, &sites); err != nil {
+		return nil, fmt.Errorf("site config: %w", err)
+	}
+
+	cfg, ok := sites[siteKey]
+	if !ok {
+		return nil, fmt.Errorf("site not found: %s", siteKey)
+	}
+
+	httpData := make(map[string]RateLimitConfig)
+	if err := loadJSON(httpPath, &httpData); err == nil {
+		if rl, ok := httpData[siteKey]; ok {
+			cfg.RateLimit = rl
+		}
+	}
+
+	scoreData := make(map[string]ScoreConfig)
+	if err := loadJSON(scorePath, &scoreData); err == nil {
+		if sc, ok := scoreData[siteKey]; ok {
+			cfg.Score = sc
+		} else if global, ok := scoreData["_global"]; ok {
+			cfg.Score = global
+		}
+	}
+
+	return &cfg, nil
+}
+
+func MustLoad(siteKey, configDir string) *SiteConfig {
+	cfg, err := Load(siteKey, configDir)
+	if err != nil {
+		panic(err)
+	}
+	return cfg
+}
+
+func loadJSON(path string, v interface{}) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, v)
+}
+
+
+############################################################
+# FILE: go-spider\internal\httpx\breaker.go
+############################################################
+
+package httpx
+
+import (
+	"log"
+	"sync"
+	"time"
+)
+
+type BreakerState int
+
+const (
+	Closed BreakerState = iota
+	Open
+	HalfOpen
+)
+
+func (s BreakerState) String() string {
+	switch s {
+	case Closed: return "CLOSED"
+	case Open: return "OPEN"
+	case HalfOpen: return "HALF_OPEN"
+	default: return "UNKNOWN"
+	}
+}
+
+type CircuitBreaker struct {
+	mu               sync.Mutex
+	name             string
+	state            BreakerState
+	failureCount     int
+	failureThreshold int
+	recoveryTimeout  time.Duration
+	lastFailureTime  time.Time
+}
+
+func NewBreaker(name string, threshold int, recovery time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
+		name:             name,
+		state:            Closed,
+		failureThreshold: threshold,
+		recoveryTimeout:  recovery,
+	}
+}
+
+func (cb *CircuitBreaker) Allow() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	switch cb.state {
+	case Closed:
+		return true
+	case Open:
+		if time.Since(cb.lastFailureTime) >= cb.recoveryTimeout {
+			cb.state = HalfOpen
+			log.Printf("[breaker:%s] OPEN -> HALF_OPEN", cb.name)
+			return true
+		}
+		return false
+	case HalfOpen:
+		return true
+	}
+	return false
+}
+
+func (cb *CircuitBreaker) Success() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failureCount = 0
+	if cb.state == HalfOpen {
+		cb.state = Closed
+		log.Printf("[breaker:%s] HALF_OPEN -> CLOSED", cb.name)
+	}
+}
+
+func (cb *CircuitBreaker) Failure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failureCount++
+	cb.lastFailureTime = time.Now()
+	if cb.failureCount >= cb.failureThreshold && cb.state != Open {
+		cb.state = Open
+		log.Printf("[breaker:%s] CLOSED -> OPEN (failures=%d)", cb.name, cb.failureCount)
+	}
+	if cb.state == HalfOpen {
+		cb.state = Open
+		log.Printf("[breaker:%s] HALF_OPEN -> OPEN", cb.name)
+	}
+}
+
+func (cb *CircuitBreaker) State() BreakerState {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	return cb.state
+}
+
+
+############################################################
+# FILE: go-spider\internal\httpx\client.go
+############################################################
+
+package httpx
+
+import (
+	"fmt"
+	"log"
+	"net/url"
+	"time"
+
+	"github.com/go-resty/resty/v2"
+)
+
+type Client struct {
+	resty   *resty.Client
+	limiter *RateLimiter
+	breaker *CircuitBreaker
+	retry   RetryConfig
+	deadQ   *DeadQueue
+}
+
+func NewClient(name string) *Client {
+	return &Client{
+		resty: resty.New().
+			SetTimeout(15 * time.Second).
+			SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"),
+		limiter: NewRateLimiter(3.0),
+		breaker: NewBreaker(name, 3, 60*time.Second),
+		retry:   DefaultRetryConfig,
+		deadQ:   NewDeadQueue(100),
+	}
+}
+
+func (c *Client) Get(rawURL string) (string, error) {
+	domain := extractDomain(rawURL)
+	breaker := c.breaker
+
+	if !breaker.Allow() {
+		err := fmt.Errorf("breaker OPEN for %s", domain)
+		c.deadQ.Push(DeadTask{URL: rawURL, Error: err.Error(), Time: time.Now()})
+		return "", err
+	}
+
+	var result string
+	err := RetryWithBackoff(c.retry, func() error {
+		c.limiter.Wait(rawURL)
+
+		resp, e := c.resty.R().Get(rawURL)
+		if e != nil {
+			breaker.Failure()
+			return e
+		}
+		if resp.StatusCode() >= 400 {
+			breaker.Failure()
+			return fmt.Errorf("HTTP %d", resp.StatusCode())
+		}
+		breaker.Success()
+		result = resp.String()
+		return nil
+	})
+
+	if err != nil {
+		log.Printf("[httpx] GET FAIL %s: %v", rawURL[:80], err)
+		c.deadQ.Push(DeadTask{URL: rawURL, Error: err.Error(), Time: time.Now()})
+		return "", err
+	}
+
+	return result, nil
+}
+
+func (c *Client) DeadQueue() *DeadQueue { return c.deadQ }
+func (c *Client) SetRateLimit(rps float64) { c.limiter.rate = rps }
+
+func extractDomain(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "unknown"
+	}
+	return u.Host
+}
+
+
+############################################################
+# FILE: go-spider\internal\httpx\limiter.go
+############################################################
+
+package httpx
+
+import (
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+)
+
+type RateLimiter struct {
+	mu       sync.Mutex
+	buckets  map[string]*tokenBucket
+	rate     float64
+}
+
+type tokenBucket struct {
+	tokens   float64
+	lastTime time.Time
+}
+
+func NewRateLimiter(defaultRPS float64) *RateLimiter {
+	return &RateLimiter{
+		buckets: make(map[string]*tokenBucket),
+		rate:    defaultRPS,
+	}
+}
+
+func (rl *RateLimiter) domainRate(domain string) float64 {
+	if strings.Contains(domain, "gov.cn") {
+		return 2.0
+	}
+	return rl.rate
+}
+
+func (rl *RateLimiter) Wait(rawURL string) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return
+	}
+	domain := u.Host
+
+	rl.mu.Lock()
+	bucket, ok := rl.buckets[domain]
+	if !ok {
+		bucket = &tokenBucket{tokens: 1, lastTime: time.Now()}
+		rl.buckets[domain] = bucket
+	}
+
+	rate := rl.domainRate(domain)
+	now := time.Now()
+	elapsed := now.Sub(bucket.lastTime).Seconds()
+	bucket.tokens += elapsed * rate
+	if bucket.tokens > rate {
+		bucket.tokens = rate
+	}
+	bucket.lastTime = now
+
+	if bucket.tokens < 1.0 {
+		waitTime := time.Duration((1.0 - bucket.tokens) / rate * float64(time.Second))
+		rl.mu.Unlock()
+		time.Sleep(waitTime)
+		rl.mu.Lock()
+		bucket.tokens = 0
+		bucket.lastTime = time.Now()
+	} else {
+		bucket.tokens -= 1.0
+	}
+	rl.mu.Unlock()
+}
+
+
+############################################################
+# FILE: go-spider\internal\httpx\retry.go
+############################################################
+
+package httpx
+
+import (
+	"log"
+	"math"
+	"time"
+)
+
+type RetryConfig struct {
+	MaxRetries int
+	BaseDelay  time.Duration
+	MaxDelay   time.Duration
+}
+
+var DefaultRetryConfig = RetryConfig{
+	MaxRetries: 3,
+	BaseDelay:  1 * time.Second,
+	MaxDelay:   30 * time.Second,
+}
+
+type DeadQueue struct {
+	ch chan DeadTask
+}
+
+type DeadTask struct {
+	URL   string
+	Error string
+	Time  time.Time
+}
+
+func NewDeadQueue(size int) *DeadQueue {
+	return &DeadQueue{ch: make(chan DeadTask, size)}
+}
+
+func (dq *DeadQueue) Push(task DeadTask) {
+	select {
+	case dq.ch <- task:
+	default:
+		log.Printf("[dead-queue] full, dropping: %s", task.URL[:60])
+	}
+}
+
+func (dq *DeadQueue) PopAll() []DeadTask {
+	var tasks []DeadTask
+	for {
+		select {
+		case t := <-dq.ch:
+			tasks = append(tasks, t)
+		default:
+			return tasks
+		}
+	}
+}
+
+func RetryWithBackoff(cfg RetryConfig, fn func() error) error {
+	var lastErr error
+	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(math.Min(
+				float64(cfg.BaseDelay)*math.Pow(2, float64(attempt-1)),
+				float64(cfg.MaxDelay),
+			))
+			log.Printf("[retry] attempt %d/%d after %v", attempt, cfg.MaxRetries, delay)
+			time.Sleep(delay)
+		}
+
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		log.Printf("[retry] attempt %d/%d FAILED: %v", attempt, cfg.MaxRetries, err)
+	}
+	return lastErr
+}
+
+
+############################################################
+# FILE: go-spider\internal\queue\redis.go
+############################################################
+
+package queue
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+type HTMLPayload struct {
+	URL     string `json:"url"`
+	Site    string `json:"site"`
+	Keyword string `json:"keyword"`
+	Level   int    `json:"level"`
+	HTML    string `json:"html,omitempty"`
+	Time    string `json:"time"`
+}
+
+type RedisQueue struct {
+	client    *redis.Client
+	urlQueue  string
+	htmlQueue string
+	errQueue  string
+	resQueue  string
+}
+
+func NewRedisQueue(addr string) *RedisQueue {
+	client := redis.NewClient(&redis.Options{
+		Addr:         addr,
+		DialTimeout:  3 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+	})
+	return &RedisQueue{
+		client:    client,
+		urlQueue:  "crawler:url",
+		htmlQueue: "crawler:html",
+		errQueue:  "crawler:error",
+		resQueue:  "crawler:result",
+	}
+}
+
+func (rq *RedisQueue) Ping() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return rq.client.Ping(ctx).Err()
+}
+
+func (rq *RedisQueue) PushURLTask(url, site, keyword string, level int) error {
+	payload := HTMLPayload{
+		URL: url, Site: site, Keyword: keyword, Level: level,
+		Time: time.Now().Format(time.RFC3339),
+	}
+	return rq.push(rq.urlQueue, payload)
+}
+
+func (rq *RedisQueue) PushHTML(url, title, html string) error {
+	payload := HTMLPayload{
+		URL: url, Title: title, HTML: html,
+		Time: time.Now().Format(time.RFC3339),
+	}
+	return rq.push(rq.htmlQueue, payload)
+}
+
+func (rq *RedisQueue) PushError(url, errMsg string) error {
+	payload := HTMLPayload{
+		URL: url, Error: errMsg,
+		Time: time.Now().Format(time.RFC3339),
+	}
+	return rq.push(rq.errQueue, payload)
+}
+
+func (rq *RedisQueue) push(queue string, payload HTMLPayload) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return rq.client.LPush(ctx, queue, data).Err()
+}
+
+func (rq *RedisQueue) PopURL() (*HTMLPayload, error) {
+	return rq.pop(rq.urlQueue)
+}
+
+func (rq *RedisQueue) PopHTML() (*HTMLPayload, error) {
+	return rq.pop(rq.htmlQueue)
+}
+
+func (rq *RedisQueue) PopResult() (*HTMLPayload, error) {
+	return rq.pop(rq.resQueue)
+}
+
+func (rq *RedisQueue) pop(queue string) (*HTMLPayload, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := rq.client.BRPop(ctx, 3*time.Second, queue).Result()
+	if err != nil {
+		return nil, err
+	}
+	var payload HTMLPayload
+	if err := json.Unmarshal([]byte(result[1]), &payload); err != nil {
+		return nil, err
+	}
+	return &payload, nil
+}
+
+
+############################################################
+# FILE: go-spider\internal\store\mysql.go
+############################################################
+
+package store
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+)
+
+type Article struct {
+	ID             uint      `gorm:"primaryKey" json:"id"`
+	URL            string    `gorm:"type:varchar(1000);not null;uniqueIndex:idx_url_hash,length:32" json:"url"`
+	Title          string    `gorm:"type:varchar(500)" json:"title"`
+	Summary        string    `gorm:"type:text" json:"summary"`
+	Content        string    `gorm:"type:longtext" json:"content"`
+	PublishTime    time.Time `json:"publish_time"`
+	Province       string    `gorm:"type:varchar(100)" json:"province"`
+	Site           string    `gorm:"type:varchar(200)" json:"site"`
+	Keyword        string    `gorm:"type:varchar(200)" json:"keyword"`
+	Score          int       `gorm:"default:0" json:"score"`
+	MatchedKeywords string   `gorm:"type:varchar(500)" json:"matched_keywords"`
+	CrawlTime      time.Time `json:"crawl_time"`
+	DetailFetched  bool      `gorm:"default:false" json:"detail_fetched"`
+	SourceType     string    `gorm:"type:varchar(50)" json:"source_type"`
+	Status         string    `gorm:"type:varchar(20);default:new" json:"status"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+type Task struct {
+	ID           string    `gorm:"type:varchar(32);primaryKey" json:"id"`
+	Keyword      string    `gorm:"type:varchar(200)" json:"keyword"`
+	Site         string    `gorm:"type:varchar(100)" json:"site"`
+	Status       string    `gorm:"type:varchar(20);default:created" json:"status"`
+	ArticleCount int       `gorm:"default:0" json:"article_count"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+type CrawlLog struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	URL       string    `gorm:"type:varchar(1000);not null" json:"url"`
+	Status    int       `gorm:"not null" json:"status"`
+	CostMs    int       `gorm:"default:0" json:"cost_ms"`
+	Error     string    `gorm:"type:text" json:"error"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type MySQLStore struct {
+	db *gorm.DB
+}
+
+func NewMySQLStore(dsn string) (*MySQLStore, error) {
+	if dsn == "" {
+		dsn = fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True",
+			envDefault("MYSQL_USER", "root"),
+			envDefault("MYSQL_PASSWORD", ""),
+			envDefault("MYSQL_HOST", "localhost"),
+			envDefault("MYSQL_PORT", "3306"),
+			envDefault("MYSQL_DATABASE", "crawler_db"),
+		)
+	}
+
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Warn),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("mysql connect: %w", err)
+	}
+
+	if err := db.AutoMigrate(&Article{}, &Task{}, &CrawlLog{}); err != nil {
+		return nil, fmt.Errorf("auto migrate: %w", err)
+	}
+
+	log.Println("[store] MySQL connected, tables migrated")
+	return &MySQLStore{db: db}, nil
+}
+
+func (s *MySQLStore) SaveArticle(a *Article) error {
+	return s.db.Where("url = ?", a.URL).Assign(a).FirstOrCreate(a).Error
+}
+
+func (s *MySQLStore) SaveTask(t *Task) error {
+	return s.db.Where("id = ?", t.ID).Assign(t).FirstOrCreate(t).Error
+}
+
+func (s *MySQLStore) UpdateTask(id, status string, count int) {
+	s.db.Model(&Task{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"status": status, "article_count": count,
+	})
+}
+
+func (s *MySQLStore) LogCrawl(url string, httpStatus, costMs int, errMsg string) {
+	s.db.Create(&CrawlLog{
+		URL: url, Status: httpStatus, CostMs: costMs, Error: errMsg,
+	})
+}
+
+func (s *MySQLStore) QueryArticles(keyword string, limit int) ([]Article, error) {
+	var articles []Article
+	q := s.db.Order("score DESC").Limit(limit)
+	if keyword != "" {
+		q = q.Where("title LIKE ?", "%"+keyword+"%")
+	}
+	err := q.Find(&articles).Error
+	return articles, err
+}
+
+func envDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+
+############################################################
+# FILE: go-spider\internal\worker\pool.go
+############################################################
+
+package worker
+
+import (
+	"log"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"crawler-platform/internal/client"
+	"crawler-platform/internal/config"
+	"crawler-platform/internal/queue"
+)
+
+type Task struct {
+	URL     string
+	Title   string
+	SiteCfg *config.SiteConfig
+}
+
+type Stats struct {
+	Submitted int64
+	Completed int64
+	Failed    int64
+	QueueLen  int
+}
+
+type Pool struct {
+	workers   int
+	taskCh    chan Task
+	stopCh    chan struct{}
+	wg        sync.WaitGroup
+	redis     *queue.RedisQueue
+	fetcher   *client.RestyFetcher
+	submitted atomic.Int64
+	completed atomic.Int64
+	failed    atomic.Int64
+}
+
+func NewPool(workerCount int, rq *queue.RedisQueue) *Pool {
+	return &Pool{
+		workers: workerCount,
+		taskCh:  make(chan Task, 1000),
+		stopCh:  make(chan struct{}),
+		redis:   rq,
+	}
+}
+
+func (p *Pool) Start() {
+	p.fetcher = client.NewRestyFetcher(0.5)
+	for i := 0; i < p.workers; i++ {
+		p.wg.Add(1)
+		go p.worker(i)
+	}
+	log.Printf("[worker] pool started with %d workers", p.workers)
+}
+
+func (p *Pool) Stop() {
+	close(p.stopCh)
+	p.wg.Wait()
+	log.Println("[worker] pool stopped")
+}
+
+func (p *Pool) Submit(task Task) {
+	p.submitted.Add(1)
+	p.taskCh <- task
+}
+
+func (p *Pool) Stats() Stats {
+	return Stats{
+		Submitted: p.submitted.Load(),
+		Completed: p.completed.Load(),
+		Failed:    p.failed.Load(),
+		QueueLen:  len(p.taskCh),
+	}
+}
+
+func (p *Pool) worker(id int) {
+	defer p.wg.Done()
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case task := <-p.taskCh:
+			p.process(id, task)
+		}
+	}
+}
+
+func (p *Pool) process(id int, task Task) {
+	html, err := p.fetcher.Fetch(task.URL)
+	if err != nil {
+		log.Printf("[worker-%d] FETCH FAIL %s: %v", id, task.URL[:60], err)
+		p.failed.Add(1)
+		return
+	}
+	log.Printf("[worker-%d] FETCHED: %s (%d bytes)", id, task.Title[:40], len(html))
+
+		if p.redis != nil {
+			if err := p.redis.PushHTML(task.URL, task.Title, html); err != nil {
+				log.Printf("[worker-%d] REDIS HTML FAIL: %v", id, err)
+				p.redis.PushError(task.URL, fmt.Sprintf("redis_push_fail: %v", err))
+				p.failed.Add(1)
+				return
+			}
+			log.Printf("[worker-%d] -> Redis HTML: %s (%d bytes)", id, task.Title[:40], len(html))
+			p.redis.PushError(task.URL, fmt.Sprintf("fetch_fail: %v", err))
+	} else {
+		log.Printf("[worker-%d] FETCHED: %s (%d bytes) [no Redis]", id, task.Title[:40], len(html))
+	}
+
+	p.completed.Add(1)
+}
+// WorkerManager: public API wrapping the worker pool
+// Architecture: WorkerManager -> Pool -> N goroutines
+// Each goroutine: Fetch(URL) -> Save HTML -> Push to Redis
+type WorkerManager struct {
+	pool *Pool
+}
+
+func NewWorkerManager(workerCount int, rq *queue.RedisQueue) *WorkerManager {
+	return &WorkerManager{pool: NewPool(workerCount, rq)}
+}
+
+func (wm *WorkerManager) Start()        { wm.pool.Start() }
+func (wm *WorkerManager) Stop()         { wm.pool.Stop() }
+func (wm *WorkerManager) Submit(t Task) { wm.pool.Submit(t) }
+func (wm *WorkerManager) Stats() Stats  { return wm.pool.Stats() }
+
+
+############################################################
+# FILE: go-spider\main.go
+############################################################
+
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"crawler-platform/internal/client"
+	"crawler-platform/internal/config"
+	"crawler-platform/internal/api"
+	"crawler-platform/internal/queue"
+	"crawler-platform/internal/worker"
+)
+
+func main() {
+	siteKey := flag.String("site", "", "site key from config")
+	keywords := flag.String("keywords", "", "search keywords (comma separated)")
+	workers := flag.Int("workers", 4, "worker pool size")
+	apiPort := flag.Int("api", 0, "start API server on port")
+	redisAddr := flag.String("redis", "localhost:6379", "redis address")
+	flag.Parse()
+
+	if *apiPort > 0 {
+		redisQueue := queue.NewRedisQueue(*redisAddr)
+		redisQueue.Ping()
+		mgr := worker.NewWorkerManager(*workers, redisQueue)
+		mgr.Start()
+		defer mgr.Stop()
+
+		server := api.NewServer(redisQueue, mgr)
+		addr := fmt.Sprintf(":%d", *apiPort)
+		log.Printf("[api] Gin server starting on %s", addr)
+		if err := server.Run(addr); err != nil {
+			log.Fatalf("[api] server error: %v", err)
+		}
+		return
+	}
+
+	if *siteKey == "" || *keywords == "" {
+		fmt.Println("Usage: go-spider --site czj_beijing --keywords 低空经济")
+		os.Exit(1)
+	}
+
+	cfg := config.MustLoad(*siteKey, "../config")
+	log.Printf("[spider] site=%s domain=%s workers=%d", cfg.Name, cfg.Domain, *workers)
+
+	redisQueue := queue.NewRedisQueue(*redisAddr)
+	if err := redisQueue.Ping(); err != nil {
+		log.Printf("[spider] Redis not available (%v), using direct mode", err)
+		redisQueue = nil
+	}
+
+	mgr := worker.NewWorkerManager(*workers, redisQueue)
+	mgr.Start()
+
+	articles := client.SearchArticles(cfg, *keywords)
+	log.Printf("[spider] found %d articles for keyword=%s", len(articles), *keywords)
+
+	for _, article := range articles {
+		mgr.Submit(worker.Task{
+			URL:     article.URL,
+			Title:   article.Title,
+			SiteCfg: cfg,
+		})
+	}
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			stats := mgr.Stats()
+			log.Printf("[spider] stats: submitted=%d completed=%d failed=%d queue=%d",
+				stats.Submitted, stats.Completed, stats.Failed, stats.QueueLen)
+			if stats.Completed+stats.Failed >= stats.Submitted && stats.QueueLen == 0 {
+				log.Println("[spider] all tasks completed, shutting down")
+				mgr.Stop()
+				fmt.Println("Done.")
+				return
+			}
+		case <-sig:
+			log.Println("[spider] received signal, shutting down")
+			mgr.Stop()
+			return
+		}
+	}
+}
+
+
+############################################################
+# FILE: httpx\__init__.py
+############################################################
+
+from httpx.fetch import fetch, post_json, get_json, reset_all_sessions
+from httpx.session_pool import get_session_for_domain, get_random_session, clear_session
+from httpx.rate_limiter import rate_limiter_manager
+from httpx.circuit_breaker import breaker_manager
+from httpx.ua_pool import UAPool
+from httpx.jitter import jitter_sleep
+
+
+############################################################
+# FILE: httpx\_breaker.py
+############################################################
+
+import time
+import logging
+
+log = logging.getLogger('crawler.circuit_breaker')
+
+
+class CircuitBreaker:
+    """熔断机制：连续失败>=3次->冷却60秒->自动恢复"""
+
+    OPEN = 'OPEN'
+    HALF_OPEN = 'HALF_OPEN'
+    CLOSED = 'CLOSED'
+
+    def __init__(self, failure_threshold=3, recovery_timeout=60, name='default'):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failure_count = 0
+        self.state = self.CLOSED
+        self.last_failure_time = 0
+        self.name = name
+
+    def call(self, func, *args, **kwargs):
+        if self.state == self.OPEN:
+            if time.time() - self.last_failure_time >= self.recovery_timeout:
+                log.info('[CB:%s] HALF_OPEN', self.name)
+                self.state = self.HALF_OPEN
+            else:
+                raise RuntimeError(f'[CB:{self.name}] OPEN, cooling {self.recovery_timeout}s')
+        try:
+            result = func(*args, **kwargs)
+            if self.state == self.HALF_OPEN:
+                log.info('[CB:%s] Recovered', self.name)
+                self.state = self.CLOSED
+                self.failure_count = 0
+            return result
+        except Exception as e:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            log.warning('[CB:%s] Fail %d/%d: %s', self.name,
+                        self.failure_count, self.failure_threshold, str(e)[:60])
+            if self.failure_count >= self.failure_threshold:
+                log.warning('[CB:%s] OPEN', self.name)
+                self.state = self.OPEN
+            raise
+
+    def reset(self):
+        self.failure_count = 0
+        self.state = self.CLOSED
+
+
+############################################################
+# FILE: httpx\_token_bucket.py
+############################################################
+
+import time
+
+
+class RateLimiter:
+    """令牌桶算法限流器"""
+
+    def __init__(self, rate=5, per=1):
+        self.rate = float(rate)
+        self.per = float(per)
+        self.allowance = self.rate
+        self.last_check = time.time()
+
+    def acquire(self, block=True):
+        now = time.time()
+        elapsed = now - self.last_check
+        self.last_check = now
+        self.allowance += elapsed * (self.rate / self.per)
+        if self.allowance > self.rate:
+            self.allowance = self.rate
+        if self.allowance < 1:
+            if block:
+                sleep_time = (1 - self.allowance) * (self.per / self.rate)
+                time.sleep(sleep_time)
+                self.allowance = 0
+            return False
+        self.allowance -= 1
+        return True
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+
+############################################################
+# FILE: httpx\circuit_breaker.py
+############################################################
+
+from httpx._breaker import CircuitBreaker
+
+
+class BreakerManager:
+    """Domain-keyed CircuitBreaker pool. 每个域名共享一个熔断器，有历史记忆。"""
+
+    _pool = {}
+
+    @classmethod
+    def get(cls, domain, failure_threshold=3, recovery_timeout=60):
+        if domain not in cls._pool:
+            cls._pool[domain] = CircuitBreaker(
+                failure_threshold=failure_threshold,
+                recovery_timeout=recovery_timeout,
+                name=domain
+            )
+        return cls._pool[domain]
+
+    @classmethod
+    def reset(cls, domain=None):
+        if domain:
+            cls._pool.pop(domain, None)
+        else:
+            cls._pool.clear()
+
+    @classmethod
+    def stats(cls):
+        return {d: {'state': b.state, 'failures': b.failure_count}
+                for d, b in cls._pool.items()}
+
+
+breaker_manager = BreakerManager()
+
+
+############################################################
+# FILE: httpx\fetch.py
+############################################################
+
+import logging
+import time
+from urllib.parse import urlparse, urlencode
+import requests as req
+from httpx.session_pool import get_session_for_domain, clear_session
+from httpx.jitter import jitter_sleep
+from httpx.rate_limiter import rate_limiter_manager
+from httpx.circuit_breaker import breaker_manager
+
+log = logging.getLogger('crawler.http_client')
+
+def _retry(session, domain, url, rate_cfg, max_retries, timeout, request_fn):
+    """统一重试逻辑：RateLimiter -> Jitter -> CircuitBreaker -> HTTP"""
+    delay = rate_cfg.get('delay', 1.5)
+    jitter = rate_cfg.get('jitter', 0.8)
+    max_r = rate_cfg.get('max_retry', max_retries)
+    rl = rate_limiter_manager.get(domain, rate=rate_cfg.get('rate', max(0.5, 1.0 / (delay or 1.5))), per=1)
+    cb = breaker_manager.get(domain)
+    for attempt in range(1, max_r + 1):
+        try:
+            rl.acquire()
+            def _do():
+                jitter_sleep(delay, jitter)
+                resp = request_fn(session)
+                if resp.status_code >= 300:
+                    raise Exception('HTTP ' + str(resp.status_code))
+                return resp
+            return cb.call(_do)
+        except RuntimeError as e:
+            if 'OPEN' in str(e):
+                log.warning('Breaker open for %s, skip %s', domain, url[:50])
+                return None
+            raise
+        except Exception as e:
+            if attempt < max_r:
+                log.warning('Retry %d/%d for %s: %s', attempt, max_r, url[:50], str(e)[:60])
+                time.sleep(attempt)
+            else:
+                log.warning('Failed after %d retries: %s', max_r, url[:50])
+    return None
+
+def reset_all_sessions():
+    clear_session()
+    log.info('All HTTP sessions reset')
+
+
+def fetch(url, site_cfg=None, max_retries=3, timeout=15):
+    domain = urlparse(url).netloc
+    session = get_session_for_domain(domain)
+    rate_cfg = site_cfg.get('rate_limit', {}) if site_cfg else {}
+    return _retry(session, domain, url, rate_cfg, max_retries, timeout,
+                  lambda s: s.get(url, timeout=timeout))
+
+def get_json(url, params=None, site_cfg=None, max_retries=3, timeout=15):
+    from urllib.parse import urlparse
+    domain = urlparse(url).netloc
+    session = get_session_for_domain(domain)
+    rate_cfg = site_cfg.get('rate_limit', {}) if site_cfg else {}
+    def _do_get(s):
+        headers = {'X-Requested-With': 'XMLHttpRequest','Accept': '*/*',
+                   'Referer': site_cfg.get('search', {}).get('page_url', url) if site_cfg else url}
+        return s.get(url, params=params, headers=headers, timeout=timeout)
+    resp = _retry(session, domain, url, rate_cfg, max_retries, timeout, _do_get)
+    if resp and resp.status_code == 200:
+        return resp.json()
+    return None
+
+def post_json(url, data, site_cfg=None, max_retries=3, timeout=15):
+    """POST请求（form-encoded），专为TRS API设计"""
+    domain = urlparse(url).netloc
+    session = get_session_for_domain(domain)
+    rate_cfg = site_cfg.get('rate_limit', {}) if site_cfg else {}
+    def _do_post(s):
+        headers = {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'}
+        return s.post(url, data=urlencode(data), headers=headers, timeout=timeout)
+    resp = _retry(session, domain, url, rate_cfg, max_retries, timeout, _do_post)
+    if resp is None:
+        return None
+    try:
+        return resp.json()
+    except Exception:
+        log.warning('post_json response parse failed')
+        return None
+
+
+############################################################
+# FILE: httpx\jitter.py
+############################################################
+
+import random
+import time
+
+
+def jitter_sleep(base_delay=1.5, jitter=0.8):
+    """随机延迟：sleep = base_delay + random(0, jitter)"""
+    delay = max(0.0, base_delay + random.uniform(0, jitter))
+    if delay > 0:
+        time.sleep(delay)
+    return delay
+
+
+def get_jitter_value(base_delay=1.5, jitter=0.8):
+    """返回延迟值但不sleep，供调用方自行决定何时sleep"""
+    return max(0.0, base_delay + random.uniform(0, jitter))
+
+
+############################################################
+# FILE: httpx\rate_limiter.py
+############################################################
+
+import time
+from httpx._token_bucket import RateLimiter
+
+
+class RateLimiterManager:
+    """Domain-keyed singleton RateLimiter pool. 每个域名共享一个限流器，防止限流失效。"""
+
+    _pool = {}
+
+    @classmethod
+    def get(cls, domain, rate=1.0, per=1):
+        if domain not in cls._pool:
+            cls._pool[domain] = RateLimiter(rate=rate, per=per)
+        return cls._pool[domain]
+
+    @classmethod
+    def reset(cls, domain=None):
+        if domain:
+            cls._pool.pop(domain, None)
+        else:
+            cls._pool.clear()
+
+    @classmethod
+    def stats(cls):
+        return {d: {'allowance': rl.allowance, 'rate': rl.rate}
+                for d, rl in cls._pool.items()}
+
+
+rate_limiter_manager = RateLimiterManager()
+
+
+############################################################
+# FILE: httpx\session_pool.py
+############################################################
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from httpx.ua_pool import UAPool
+
+_ua_pool = UAPool()
+_session_pool = {}
+
+
+def _build_adapter(max_retries=3, pool_conn=10, pool_size=20):
+    retry_strategy = Retry(
+        total=max_retries, backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    return HTTPAdapter(pool_connections=pool_conn, pool_maxsize=pool_size, max_retries=retry_strategy)
+
+
+def get_session_for_domain(domain, max_retries=3):
+    """Domain-bound Session with Connection Pool + KeepAlive + Cookie sharing"""
+    if domain not in _session_pool:
+        ua = _ua_pool.get_for_domain(domain)
+        s = requests.Session()
+        s.headers.update({
+            'User-Agent': ua,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Connection': 'keep-alive',
+        })
+        s.mount('http://', _build_adapter(max_retries))
+        s.mount('https://', _build_adapter(max_retries))
+        _session_pool[domain] = s
+    return _session_pool[domain]
+
+
+def clear_session(domain=None):
+    if domain:
+        _session_pool.pop(domain, None)
+    else:
+        _session_pool.clear()
+
+
+def get_random_session():
+    ua = _ua_pool.get_random()
+    s = requests.Session()
+    s.headers.update({'User-Agent': ua})
+    return s
+
+
+def get_pool_stats():
+    """Debug: return session pool info"""
+    return {d: {'headers': dict(s.headers), 'cookies': dict(s.cookies.get_dict())}
+            for d, s in _session_pool.items()}
+
+
+############################################################
+# FILE: httpx\ua_pool.py
+############################################################
+
+import hashlib
+import random
+
+
+class UAPool:
+    """UA绑定Session机制：每个域名绑定固定UA，不每次随机"""
+
+    UA_LIST = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Edg/131.0.0.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/18.1 Safari/605.1.15',
+    ]
+
+    def __init__(self):
+        self._domain_ua = {}
+
+    def get_for_domain(self, domain):
+        if domain not in self._domain_ua:
+            idx = int(hashlib.md5(domain.encode()).hexdigest(), 16) % len(self.UA_LIST)
+            self._domain_ua[domain] = self.UA_LIST[idx]
+        return self._domain_ua[domain]
+
+    def get_random(self):
+        return random.choice(self.UA_LIST)
+
+
+############################################################
+# FILE: main.py
+############################################################
+
+#!/usr/bin/env python3
+import sys, os, logging, argparse
+
+base = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, base)
+
+os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+os.environ.setdefault('PYTHONUTF8', '1')
+if os.name == 'nt':
+    try: os.system('chcp 65001 > nul 2>nul')
+    except: pass
+
+from scheduler.dispatcher import crawl_url, run_search
+from httpx.fetch import fetch, post_json
+from parser.multi_strategy import clean_text, normalize_date
+from config.keywords import DEFAULT_KEYWORDS
+import json
+
+logging.basicConfig(level=logging.DEBUG if os.environ.get('CRAWLER_ENV','')=='dev' else logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
+log = logging.getLogger('main')
+
+
+def load_config(site_key=None):
+    config_dir = os.path.join(base, 'config')
+    def _load(name):
+        with open(os.path.join(config_dir, name), 'r', encoding='utf-8') as f:
+            return json.load(f)
+    site_data = _load('site.json')
+    http_data = _load('http.json')
+    score_data = _load('score.json')
+    system_data = _load('system.json')
+    parser_data = _load('parser.json')
+    if site_key:
+        site = site_data.get(site_key)
+        if not site:
+            raise ValueError('Site not found: ' + site_key)
+        site['rate_limit'] = http_data.get(site_key, http_data.get('_global', {}))
+        site['score'] = score_data.get(site_key, score_data.get('_global', {}))
+        global_parser = parser_data.get('_global', {})
+        if global_parser:
+            site.setdefault('extract', {}).update(global_parser)
+        site['_system'] = system_data
+        return site
+    return {'sites': site_data, 'http': http_data, 'score': score_data, 'parser': parser_data}
+
+
+def read_url_list(path):
+    if not os.path.exists(path):
+        log.error('File not found: %s', path)
+        return []
+    with open(path, 'r', encoding='utf-8') as f:
+        return [l.strip() for l in f if l.strip() and not l.startswith('#')]
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description='\u653f\u5e9c\u7f51\u7ad9\u653f\u7b56\u722c\u866b')
+    p.add_argument('--site', default='', help='\u7ad9\u70b9\u914d\u7f6e\u540d')
+    p.add_argument('--keywords', nargs='+', default=None, help='\u641c\u7d22\u5173\u952e\u8bcd')
+    p.add_argument('--urls', metavar='FILE', help='\u4ece\u6587\u4ef6\u8bfb\u53d6URL\u5217\u8868')
+    p.add_argument('--output', default='output', help='\u8f93\u51fa\u76ee\u5f55')
+    p.add_argument('--with-detail', action='store_true', help='\u6293\u53d6\u6587\u7ae0\u6b63\u6587')
+    p.add_argument('--max-pages', type=int, default=0, help='\u6700\u5927\u7ffb\u9875\u6570')
+    p.add_argument('--discover', metavar='URL', help='\u81ea\u52a8\u53d1\u73b0\u7ad9\u70b9\u914d\u7f6e')
+    p.add_argument('--self-test', action='store_true', help='\u8fd0\u884c\u81ea\u68c0')
+    p.add_argument('--serve', type=int, nargs='?', const=8000, default=None, metavar='PORT', help='Start FastAPI server')
+    p.add_argument('--no-dedup', action='store_true', help='\u7981\u7528SQLite\u53bb\u91cd')
+    return p.parse_args()
+
+
+def run_self_test():
+    log.info('-- Self tests --')
+    assert clean_text('<em>\u4f4e\u7a7a</em>&nbsp;\u7ecf\u6d4e') == '\u4f4e\u7a7a \u7ecf\u6d4e'
+    assert normalize_date('\u65e5\u671f\uff1a2025\u5e746\u67087\u65e5') == '2025-06-07'
+    log.info('  clean_text/normalize_date: OK')
+    html = '<div class=\'TRS_Editor\'><p>\u4f4e\u7a7a\u7ecf\u6d4e\u653f\u7b56\u6b63\u6587\u5185\u5bb9\u3002</p></div>'
+    content = extract_content(html)
+    assert '\u4f4e\u7a7a\u7ecf\u6d4e' in content
+    log.info('  Content extraction: OK')
+    log.info('All self-tests passed!')
+    return True
+
+
+def discover_site(url):
+    # Auto-discover site search configuration
+    import requests, re, json
+    from urllib.parse import urljoin, urlparse
+    log = logging.getLogger('discover')
+    log.info('-- Site discovery: %s --', url)
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'Mozilla/5.0'})
+    for path in ('/so/s', '/search/s', '/site/s', '/search', '/s'):
+        try:
+            resp = session.get(url.rstrip('/') + path + '?q=test', timeout=10)
+            if resp.status_code == 200 and len(resp.text) > 500:
+                log.info('  Found search page: %s', url.rstrip('/') + path)
+                sc = re.search('siteCode\\s*[=:]\\s*(\\d+)', resp.text)
+                site_code = sc.group(0).split('=')[-1].strip('"').strip("'") if sc else ''
+                search_url = urljoin(url, 'so/ss/query/s')
+                cfg = {'name': 'Auto-' + urlparse(url).netloc,
+                       'domain': urlparse(url).netloc,
+                       'base_url': url,
+                       'search_page_url': url.rstrip('/') + path,
+                       'search_api_url': search_url,
+                       'site_code': site_code or 'unknown',
+                       'api_type': 'trs_json'}
+                log.info('  siteCode=%s', site_code or '?')
+                print(); print('-- Generated config (add to sites_config.json) --')
+                print(json.dumps(cfg, ensure_ascii=False, indent=2))
+                return
+        except:
+            continue
+    log.warning('  No search page found')
+def main():
+    args = parse_args()
+    if args.discover:
+        discover_site(args.discover)
+        return
+    if args.self_test:
+        run_self_test()
+        return
+
+    if args.serve is not None:
+        try:
+            import uvicorn
+            from api.server import create_app
+            app = create_app()
+            if app is None:
+                log.error('FastAPI not installed. Run: pip install fastapi uvicorn')
+                return
+            log.info('Starting API server on port %d ...', args.serve)
+            uvicorn.run(app, host='0.0.0.0', port=args.serve)
+        except ImportError:
+            log.error('FastAPI/uvicorn not installed. Run: pip install fastapi uvicorn')
+        return
+
+    keywords = tuple(args.keywords) if args.keywords else DEFAULT_KEYWORDS
+    if not keywords and not args.urls:
+        log.warning('\u8bf7\u6307\u5b9a--keywords\u6216--urls')
+        return
+
+    output_dir = os.path.join(base, args.output)
+    site_cfg = load_config(args.site) if args.site else None
+
+    if args.urls:
+        urls = read_url_list(args.urls)
+        if not urls:
+            log.warning('No URLs found in: %s', args.urls); return
+        log.info('=== URL Fetch Mode ===')
+        log.info('Total URLs: %d', len(urls))
+        articles = []
+        for idx, url in enumerate(urls, 1):
+            log.info('  [%d/%d] %s', idx, len(urls), url[:70])
+            article = crawl_url(url, site_cfg or load_config('czj_beijing'), keywords)
+            if article:
+                articles.append(article)
+        if not articles:
+            log.warning('No articles fetched'); return
+        from storage.json_store import save_results
+        scored = filter_by_score(articles, keywords) if keywords else articles
+        jp, cp = save_results(scored, output_dir, 'urls')
+        print('  [OK]', len(scored), 'articles saved ->', jp)
+        return
+
+    if not site_cfg:
+        log.warning('\u8bf7\u6307\u5b9a--site\u7ad9\u70b9\u540d'); return
+
+    log.info('=' * 60)
+    log.info('  Site: %s (%s)', site_cfg.get('name', args.site), site_cfg.get('domain', ''))
+    log.info('  Keywords: %s', ', '.join(keywords))
+    log.info('=' * 60)
+
+    run_search(site_cfg, keywords, output_dir, args.max_pages, args.with_detail)
+
+
+if __name__ == '__main__':
+    main()
+
+
+############################################################
+# FILE: monitor\__init__.py
+############################################################
+
+from monitor.metrics import get_collector, MetricsCollector
+from monitor.health import start_health_server, HealthHandler
+from monitor.logger import setup_json_logging, JSONFormatter
+from monitor.report import daily_report, trend_summary
+
+
+############################################################
+# FILE: monitor\health.py
+############################################################
+
+import json
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from monitor.metrics import get_collector
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/health':
+            self._respond(200, {'status': 'ok'})
+        elif self.path == '/ready':
+            self._respond(200, {'status': 'ready', 'checks': {'db': True, 'http': True, 'plugins': True}})
+        elif self.path == '/metrics':
+            collector = get_collector()
+            body = collector.dump_prometheus()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(body.encode())
+        else:
+            self._respond(404, {'error': 'not found'})
+
+    def _respond(self, code, data):
+        body = json.dumps(data, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_server(port=9090, daemon=True):
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    if daemon:
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        return server
+    return server.serve_forever()
+
+
+############################################################
+# FILE: monitor\logger.py
+############################################################
+
+import logging
+import json
+import sys
+from datetime import datetime, timezone
+
+
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        return json.dumps({
+            'ts': datetime.now(timezone.utc).isoformat(),
+            'level': record.levelname,
+            'logger': record.name,
+            'msg': record.getMessage(),
+            'module': record.module,
+            'func': record.funcName,
+        }, ensure_ascii=False)
+
+
+def setup_json_logging(level=logging.INFO):
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JSONFormatter())
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(level)
+
+
+############################################################
+# FILE: monitor\metrics.py
+############################################################
+
+import threading
+
+
+class MetricsCollector:
+    """Prometheus-style metrics collector with counter/gauge/histogram."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._counters = {}
+        self._gauges = {}
+        self._histograms = {}
+
+    def inc(self, name, value=1, labels=None):
+        key = self._key(name, labels)
+        with self._lock:
+            self._counters[key] = self._counters.get(key, 0) + value
+
+    def set(self, name, value, labels=None):
+        key = self._key(name, labels)
+        with self._lock:
+            self._gauges[key] = value
+
+    def observe(self, name, value, labels=None):
+        key = self._key(name, labels)
+        with self._lock:
+            if key not in self._histograms:
+                self._histograms[key] = []
+            self._histograms[key].append(value)
+
+    def _key(self, name, labels):
+        if labels:
+            return name + '{' + ','.join(f'{k}={v}' for k, v in sorted(labels.items())) + '}'
+        return name
+
+    def dump_prometheus(self):
+        lines = []
+        with self._lock:
+            for key, val in self._counters.items():
+                base = key.split('{')[0]
+                lines.append(f'# TYPE {base} counter')
+                lines.append(f'{key} {val}')
+            for key, val in self._gauges.items():
+                base = key.split('{')[0]
+                lines.append(f'# TYPE {base} gauge')
+                lines.append(f'{key} {val}')
+        return '\n'.join(lines) + '\n'
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                'counters': dict(self._counters),
+                'gauges': dict(self._gauges),
+                'histogram_sizes': {k: len(v) for k, v in self._histograms.items()},
+            }
+
+
+_collector = MetricsCollector()
+
+
+def get_collector():
+    return _collector
+
+
+############################################################
+# FILE: monitor\report.py
+############################################################
+
+import os
+import json
+import logging
+from datetime import datetime
+
+log = logging.getLogger('monitor.report')
+
+try:
+    import duckdb
+    HAS_DUCKDB = True
+except ImportError:
+    HAS_DUCKDB = False
+
+
+def daily_report(db_path='output/crawler.duckdb', output_dir=None):
+    if not HAS_DUCKDB:
+        return {}
+    conn = duckdb.connect(db_path)
+    try:
+        total = conn.execute('SELECT COUNT(*) FROM articles').fetchone()[0]
+        by_site = {r[0]: r[1] for r in conn.execute(
+            'SELECT site, COUNT(*) FROM articles GROUP BY site ORDER BY COUNT(*) DESC').fetchall()}
+        by_keyword = {r[0]: r[1] for r in conn.execute(
+            'SELECT keyword, COUNT(*) FROM articles GROUP BY keyword ORDER BY COUNT(*) DESC').fetchall()}
+        avg_score = conn.execute('SELECT AVG(score) FROM articles').fetchone()[0] or 0
+        recent = conn.execute(
+            'SELECT title, url, site, score FROM articles ORDER BY crawl_time DESC LIMIT 10').fetchall()
+
+        report = {
+            'generated': datetime.now().isoformat(),
+            'total_articles': total,
+            'by_site': by_site,
+            'by_keyword': by_keyword,
+            'avg_score': round(avg_score, 1),
+            'recent_articles': [{'title': r[0], 'url': r[1], 'site': r[2], 'score': r[3]} for r in recent],
+        }
+
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            path = os.path.join(output_dir, f'report_{datetime.now().strftime("%Y%m%d")}.json')
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(report, f, ensure_ascii=False, indent=2)
+            log.info('Daily report saved: %s', path)
+
+        return report
+    finally:
+        conn.close()
+
+
+def trend_summary(db_path='output/crawler.duckdb'):
+    if not HAS_DUCKDB:
+        return {}
+    conn = duckdb.connect(db_path)
+    try:
+        return {
+            'keyword_trends': conn.execute(
+                'SELECT keyword, COUNT(*) as cnt, AVG(score) as avg_score FROM articles GROUP BY keyword ORDER BY cnt DESC LIMIT 10'
+            ).fetchall(),
+            'province_ranking': conn.execute(
+                'SELECT province, COUNT(*) as cnt FROM articles GROUP BY province ORDER BY cnt DESC'
+            ).fetchall(),
+            'daily_stats': conn.execute(
+                'SELECT DATE(crawl_time) as day, COUNT(*) as cnt FROM articles GROUP BY day ORDER BY day DESC LIMIT 7'
+            ).fetchall(),
+        }
+    finally:
+        conn.close()
+
+
+############################################################
+# FILE: monitor\trend.py
+############################################################
+
+import logging
+
+log = logging.getLogger('monitor.trend')
+
+try:
+    import duckdb
+    HAS_DUCKDB = True
+except ImportError:
+    HAS_DUCKDB = False
+
+
+def _connect(db_path='output/crawler.duckdb'):
+    if not HAS_DUCKDB:
+        return None
+    return duckdb.connect(db_path)
+
+
+def keyword_trend(keyword, db_path='output/crawler.duckdb'):
+    conn = _connect(db_path)
+    if not conn:
+        return []
+    try:
+        return conn.execute(
+            'SELECT keyword, COUNT(*) as cnt, AVG(score) as avg_score FROM articles WHERE keyword LIKE ? GROUP BY keyword ORDER BY cnt DESC',
+            ['%' + keyword + '%']).fetchall()
+    finally:
+        conn.close()
+
+
+def province_ranking(db_path='output/crawler.duckdb'):
+    conn = _connect(db_path)
+    if not conn:
+        return []
+    try:
+        return conn.execute(
+            'SELECT province, COUNT(*) as cnt, AVG(score) as avg_score FROM articles GROUP BY province ORDER BY cnt DESC'
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def site_summary(db_path='output/crawler.duckdb'):
+    conn = _connect(db_path)
+    if not conn:
+        return []
+    try:
+        return conn.execute(
+            'SELECT site, COUNT(*) as total, SUM(CASE WHEN detail_fetched THEN 1 ELSE 0 END) as with_detail, AVG(score) as avg_score FROM articles GROUP BY site ORDER BY total DESC'
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def daily_summary(db_path='output/crawler.duckdb'):
+    conn = _connect(db_path)
+    if not conn:
+        return []
+    try:
+        return conn.execute(
+            'SELECT DATE(crawl_time) as day, COUNT(*) as cnt, AVG(score) as avg_score FROM articles GROUP BY day ORDER BY day DESC LIMIT 30'
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+############################################################
+# FILE: parser\__init__.py
+############################################################
+
+
+
+############################################################
+# FILE: parser\ai_parser.py
+############################################################
+
+"""AI Parser 接口模块
+
+当前为占位实现 (返回 None)。
+未来接入 DeepSeek/Qwen/GPT/Claude 时：
+  1. 设置环境变量 AI_API_KEY
+  2. 实现下方的 _call_ai_api() 函数
+  3. 在 sites_config.json 中设置 "ai_enabled": true
+
+接口规范：
+  parse_with_ai(html, site_cfg=None) -> dict or None
+  返回格式: {
+    "title": str,
+    "content": str,
+    "publish_date": str,
+    "source": str,
+  }
+"""
+
+import logging
+log = logging.getLogger('crawler.ai_parser')
+
+
+def _call_ai_api(prompt, html, max_tokens=2000):
+    """调用 AI API 的底层函数 (当前未实现)。
+    接入示例:
+        import openai
+        client = openai.OpenAI(api_key=os.environ["AI_API_KEY"])
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{
+                "role": "system",
+                "content": "你是正文提取助手。从HTML中提取标题和正文。返回JSON格式。"
+            }, {
+                "role": "user",
+                "content": prompt
+            }],
+            max_tokens=max_tokens,
+        )
+        return resp.choices[0].message.content
+    """
+    log.warning("AI API not configured. Set AI_API_KEY env to enable.")
+    return None
+
+
+def parse_with_ai(html, site_cfg=None):
+    """AI 正文提取接口。返回 dict 或 None。
+    
+    当前为占位实现。接入 LLM 后，main.py 与 dispatcher.py 无需任何修改。
+    """
+    if not html or len(html) < 100:
+        return None
+    
+    # 检查是否启用 AI
+    if site_cfg and site_cfg.get('extract', {}).get('ai_enabled'):
+        log.info("AI parser enabled for %s", site_cfg.get('name', 'unknown'))
+        
+        prompt = f"""请从以下HTML中提取正文内容，返回干净的JSON格式:
+{{
+  "title": "文章标题",
+  "content": "正文内容(去除HTML标签)",
+  "publish_date": "发布日期(YYYY-MM-DD格式，如无则为空)"
+}}
+
+HTML内容(前3000字符):
+{html[:3000]}"""
+
+        result = _call_ai_api(prompt, html)
+        if result:
+            import json
+            try:
+                return json.loads(result)
+            except:
+                log.warning("AI response not valid JSON, falling through")
+    
+    return None  # 未启用或未接入，返回 None 让下游 fallback
+
+
+############################################################
+# FILE: parser\api_parser.py
+############################################################
+
+from parser.multi_strategy import clean_text, normalize_date
+
+
+def parse_trs_doc(doc, keyword):
+    """解析TRS API返回的文档"""
+    data = doc.get('data') if isinstance(doc.get('data'), dict) else doc
+    title = clean_text(data.get('titleO') or data.get('title') or '')
+    url = clean_text(data.get('url') or data.get('URL') or '')
+    if not title or not url:
+        return None
+    return {
+        'title': title,
+        'url': url,
+        'publish_date': normalize_date(data.get('docDate') or data.get('publishTime') or ''),
+        'summary': clean_text(data.get('summary', '')),
+        'content': clean_text(data.get('summary', '')),  # TRS summary serves as initial content
+        'source': data.get('siteLabel', [{}])[0].get('value', '') if data.get('siteLabel') else '',
+        'source_keywords': [keyword],
+    }
+# Unified article schema — all plugins must return these fields:
+#   title, url, content, summary, publish_date, source, source_keywords
+
+
+############################################################
+# FILE: parser\cms_rules\government.json
+############################################################
+
+{
+  "name": "Generic Government",
+  "sites": [],
+  "title": [
+    "h1",
+    ".article-title",
+    "title"
+  ],
+  "date": [
+    ".date",
+    ".time",
+    "[name=PubDate]"
+  ],
+  "content": [
+    ".article-content",
+    ".content",
+    ".main-content",
+    ".TRS_Editor",
+    "#mainText"
+  ],
+  "content_markers": [
+    "<!--正文开始-->"
+  ]
+}
+
+############################################################
+# FILE: parser\cms_rules\jpaas.json
+############################################################
+
+{
+  "name": "JPAAS Zhejiang",
+  "sites": [
+    "czj_hangzhou",
+    "sxcs_shaoxing"
+  ],
+  "title": [
+    "h1",
+    ".article-title",
+    "title"
+  ],
+  "date": [
+    ".article-date",
+    ".date"
+  ],
+  "content": [
+    ".article-content",
+    ".content",
+    ".detail-content"
+  ],
+  "content_markers": []
+}
+
+############################################################
+# FILE: parser\cms_rules\shandong.json
+############################################################
+
+{
+  "name": "Shandong Government",
+  "sites": [
+    "sd_czt"
+  ],
+  "title": [
+    "h1",
+    ".article-title",
+    "title"
+  ],
+  "date": [
+    ".article-date",
+    ".date"
+  ],
+  "content": [
+    ".article-content",
+    ".content",
+    "#UCAP-CONTENT"
+  ],
+  "content_markers": []
+}
+
+############################################################
+# FILE: parser\cms_rules\sichuan.json
+############################################################
+
+{
+  "name": "Sichuan Government",
+  "sites": [
+    "sc_czt"
+  ],
+  "title": [
+    "h1",
+    ".xxgk-font",
+    ".article-title",
+    "title"
+  ],
+  "date": [
+    ".xxgk-time",
+    ".article-time"
+  ],
+  "content": [
+    ".article-content",
+    ".content-body",
+    ".con_text"
+  ],
+  "content_markers": []
+}
+
+############################################################
+# FILE: parser\cms_rules\trs.json
+############################################################
+
+{
+  "name": "TRS WCM",
+  "sites": [
+    "czj_beijing",
+    "bj_gov"
+  ],
+  "title": [
+    "h1",
+    "title"
+  ],
+  "date": [
+    "[name=PubDate]",
+    "[name=publishdate]"
+  ],
+  "content": [
+    ".TRS_Editor",
+    "#mainText",
+    "#UCAP-CONTENT"
+  ],
+  "content_markers": [
+    "<!--正文开始-->",
+    "<!--正文内容 begin -->"
+  ]
+}
+
+############################################################
+# FILE: parser\html_parser.py
+############################################################
+
+import re
+from lxml.html import fromstring
+from parser.multi_strategy import clean_text, normalize_date
+from urllib.parse import urljoin
+import json, os
+from parser.ai_parser import parse_with_ai  # 2.4 AI Parser interface
+
+_MODE_MAP = {'trs':'trs','jpaas':'jpaas','sichuan':'sichuan','shandong':'shandong','default':'government'}
+
+_CS_GLOBAL = ['.TRS_Editor','.article-content','.content','#mainText','#UCAP-CONTENT']
+_XP_GLOBAL = ['//div[@class="TRS_Editor"]','//div[@class="article-content"]','//div[@id="mainText"]','//article']
+
+
+def _load_cms_rules(mode):
+    cms_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cms_rules')
+    mode = _MODE_MAP.get(mode, 'government')
+    fp = os.path.join(cms_dir, mode + '.json')
+    try:
+        with open(fp, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        log.warning('_load_cms_rules failed for mode=%s', mode)
+        return None
+
+
+def _get_rules(site_cfg=None):
+    if not site_cfg:
+        return None
+    ext = site_cfg.get('extract', {})
+    mode = ext.get('mode', '')
+    if ext.get('title_selector') or ext.get('content_selector'):
+        return {
+            'title': ext.get('title_selector', '').split(',') if ext.get('title_selector') else [],
+            'content': ext.get('content_selector', '').split(',') if ext.get('content_selector') else [],
+        }
+    loaded = _load_cms_rules(mode)
+    if loaded:
+        return loaded
+    return _load_cms_rules('trs')
+
+
+# ===== 2.3 Density Parser: 正文密度算法 =====
+BLOCK_TAGS = {'div', 'article', 'section', 'main', 'td', 'li'}
+SKIP_TAGS = {'script', 'style', 'noscript', 'nav', 'header', 'footer', 'form', 'iframe', 'aside'}
+
+
+def _calc_density(elem):
+    """计算文本密度: clean_text_len / total_content_len"""
+    raw = elem.text_content() if hasattr(elem, 'text_content') else ''
+    cleaned = clean_text(raw)
+    if len(cleaned) < 80:
+        return 0.0
+    # 链接密度惩罚：链接文字占比 > 30% → 非正文
+    all_text = len(cleaned)
+    link_text = 0
+    try:
+        for a in elem.xpath('.//a'):
+            link_text += len(clean_text(a.text_content() if hasattr(a, 'text_content') else ''))
+    except:
+        pass
+    if all_text > 0 and link_text / all_text > 0.3:
+        return 0.0
+    # 密度 = 干净文字长度 / 原始长度
+    density = len(cleaned) / max(len(raw), 1)
+    # 长文本加分
+    score = density * (1 + min(len(cleaned) / 1000, 1))
+    return score
+
+
+def _density_extract(html, max_chars=3000):
+    """2.3 Density Parser: 正文密度算法 -- 遍历块级元素，计算文本密度，无规则适配。"""
+    try:
+        doc = fromstring(html)
+        candidates = []
+        # 遍历所有块级元素
+        for elem in doc.iter():
+            if elem.tag in SKIP_TAGS:
+                continue
+            if elem.tag in BLOCK_TAGS:
+                score = _calc_density(elem)
+                if score > 0:
+                    text = clean_text(elem.text_content() if hasattr(elem, 'text_content') else '')
+                    candidates.append((score, len(text), text))
+        # 按得分排序，取最高分
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            _, _, best = candidates[0]
+            return best[:max_chars]
+        # 回退到自由文本提取
+        texts = []
+        for p in doc.xpath('//p'):
+            t = clean_text(p.text_content() if hasattr(p, 'text_content') else '')
+            if len(t) >= 30:
+                texts.append(t)
+        if texts:
+            return ' '.join(texts)[:max_chars]
+    except Exception:
+        log.debug('_density_extract fallback triggered')
+    return None
+
+
+def _css_to_xpath(sel):
+    import re as _r
+    sel = sel.strip()
+    if _r.match('^[a-zA-Z][a-zA-Z0-9-]*$', sel): return '//' + sel
+    if sel.startswith('.'): return '//*[contains(concat(" ", normalize-space(@class), " "), " ' + sel[1:] + ' ")]'
+    if sel.startswith('#'): return '//*[@id="' + sel[1:] + '"]'
+    return '//' + sel
+
+
+def _extract_by_selectors(html, selectors, use_lxml=True):
+    if not selectors:
+        return None
+    if use_lxml:
+        try:
+            doc = fromstring(html)
+            for sel in selectors:
+                for el in doc.xpath(_css_to_xpath(sel)):
+                    t = clean_text(el.text_content() if hasattr(el, 'text_content') else '')
+                    if len(t) >= 80:
+                        return t
+        except Exception:
+            pass  # lxml selector failed, try regex fallback
+    for sel in selectors:
+        cname = sel.lstrip('.#')
+        pat = re.compile(r'<div\b[^>]*\bclass\s*=\s*(["\'])' + re.escape(cname) + r'\1[^>]*>(.*?)</div>', re.I|re.S)
+        m = pat.search(html)
+        if m:
+            t = clean_text(m.group(1))
+            if len(t) >= 80:
+                return t
+    return None
+
+
+def _extract_by_markers(html, markers, max_chars=3000):
+    if not markers:
+        return None
+    for mkr in markers:
+        end = mkr.replace('开始', '结束').replace('begin', 'end')
+        pat = re.compile(re.escape(mkr) + r'(.*?)' + re.escape(end), re.I|re.S)
+        m = pat.search(html)
+        if m:
+            t = clean_text(m.group(1))
+            if len(t) >= 40:
+                return t[:max_chars]
+    return None
+
+
+def _regex_fallback(html, max_chars=3000):
+    texts = []
+    for p in re.finditer(r'<p[^>]*>(.*?)</p>', html, re.I|re.S):
+        t = clean_text(p.group(1))
+        if len(t) >= 30:
+            texts.append(t)
+    return ' '.join(texts)[:max_chars] if texts else clean_text(html)[:max_chars]
+
+
+def extract_title(html, site_cfg=None):
+    m = re.search(r'<title[^>]*>(.*?)</title>', html, re.I|re.S)
+    if m:
+        return clean_text(m.group(1))
+    rules = _get_rules(site_cfg)
+    if rules:
+        result = _extract_by_selectors(html, rules.get('title', []))
+        if result:
+            return clean_text(result)[:100]
+    return ''
+
+
+def extract_date(html, site_cfg=None):
+    return normalize_date(html)
+
+
+def extract_content(html, site_cfg=None, max_chars=3000):
+    """四级解析：Site Parser -> CMS Parser -> AI Parser -> Density Parser"""
+    rules = _get_rules(site_cfg)
+    if rules:
+        result = _extract_by_markers(html, rules.get('content_markers', []), max_chars)
+        if result:
+            return result
+        result = _extract_by_selectors(html, rules.get('content', []))
+        if result:
+            return result[:max_chars]
+    result = _extract_by_selectors(html, _CS_GLOBAL)
+    if result:
+        return result[:max_chars]
+    # 2.4 AI Parser: 如果 site_cfg.ai_enabled, 调用 AI 提取
+    if site_cfg and site_cfg.get('extract', {}).get('ai_enabled'):
+        ai_result = parse_with_ai(html, site_cfg)
+        if ai_result:
+            content = ai_result.get('content', '')
+            if content and len(content) >= 80:
+                return content[:max_chars]
+    
+    result = _density_extract(html, max_chars)
+    if result:
+        return result
+    return _regex_fallback(html, max_chars)
+
+
+def extract_links(html, base_url, art_pattern=True):
+    links = []
+    for m in re.finditer(r'<a\b[^>]*\bhref\s*=\s*(["\'])([^"\']+?)\1[^>]*>(.*?)</a>', html, re.I|re.S):
+        url = m.group(2)
+        title = clean_text(m.group(3))
+        if not url or url.startswith(('javascript:', 'mailto:', 'tel:', '#')):
+            continue
+        if art_pattern and 'art_' not in url:
+            continue
+        links.append({'title': title, 'url': urljoin(base_url, url)})
+    return links
+
+
+
+############################################################
+# FILE: parser\multi_strategy.py
+############################################################
+
+import re
+from html import unescape
+
+TAG_RE = re.compile(r'(?is)<(script|style|noscript).*?</\1>|<[^>]+>')
+SPACE_RE = re.compile(r'\s+')
+
+DATE_PATTERNS = (
+    re.compile(r'(?:发布日期|发布时间|日期)[：:]\s*(\d{4}[-/年]\d{1,2}[-/月]\d{1,2}日?)'),
+    re.compile(r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?'),
+    re.compile(r'(\d{4}年\d{1,2}月\d{1,2}日)'),
+)
+
+
+def clean_text(value):
+    if value is None:
+        return ''
+    text = TAG_RE.sub(' ', str(value))
+    text = unescape(text)
+    text = text.replace('\xa0', ' ').replace('\u3000', ' ')
+    return SPACE_RE.sub(' ', text).strip()
+
+
+def normalize_date(value):
+    text = clean_text(value)
+    if not text:
+        return ''
+    for pat in DATE_PATTERNS:
+        m = pat.search(text)
+        if not m:
+            continue
+        parts = re.findall(r'\d+', m.group(1))
+        if len(parts) >= 3:
+            return f'{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}'
+    return ''
+
+
+############################################################
+# FILE: parser\redis_worker.py
+############################################################
+
+import json
+import logging
+import os
+import sys
+import signal
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from parser.html_parser import extract_title, extract_date, extract_content
+from extractor.scorer import filter_by_score
+from dedup.sqlite_cache import DedupDB
+from storage.json_store import save_results
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
+log = logging.getLogger('redis_worker')
+
+try:
+    import redis
+    REDIS_OK = True
+except ImportError:
+    REDIS_OK = False
+
+
+def run_worker(redis_addr='localhost:6379', redis_queue='crawler:html', output_dir='output'):
+    if not REDIS_OK:
+        log.error('redis-py not installed. Run: pip install redis')
+        return
+
+    r = redis.Redis(host=redis_addr.split(':')[0],
+                    port=int(redis_addr.split(':')[1]) if ':' in redis_addr else 6379,
+                    decode_responses=True)
+
+    running = True
+
+    def shutdown(sig, frame):
+        nonlocal running
+        log.info('Received signal, shutting down...')
+        running = False
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    log.info('Redis Worker started: queue=%s output=%s', redis_queue, output_dir)
+
+    while running:
+        try:
+            result = r.brpop(redis_queue, timeout=3)
+            if result is None:
+                continue
+
+            _, data = result
+            payload = json.loads(data)
+
+            url = payload.get('url', '')
+            site_name = payload.get('site', '')
+            keyword = payload.get('keyword', '')
+            level = payload.get('level', 1)
+
+            log.info('[L%d] Fetching: %s (%s)', level, url[:80], site_name)
+
+            html = payload.get('html', '')
+            if not html or len(html) < 100:
+                log.warning('[L%d] Empty HTML: %s', level, url[:80])
+                continue
+
+            parsed_title = extract_title(html) or title
+            parsed_date = extract_date(html)
+            parsed_content = extract_content(html)
+
+            article = {
+                'title': parsed_title,
+                'url': url,
+                'publish_date': parsed_date,
+                'content': parsed_content,
+                'summary': parsed_content[:300] if parsed_content else '',
+                'source': site_name or 'go-spider',
+                'source_keywords': [keyword] if keyword else [],
+            }
+
+            articles = [article]
+            keywords_tuple = (keyword,) if keyword else ()
+            scored = filter_by_score(articles, keywords_tuple, site_cfg=None)
+
+            if scored:
+                save_results(scored, output_dir, 'go-spider')
+                log.info('[L%d] PARSED: %s (%d chars)', level, parsed_title[:50], len(parsed_content or ''))
+
+        except Exception as e:
+            log.error('[L%d] Worker error: %s', level, e)
+            time.sleep(1)
+
+    log.info('Worker stopped. queue=%s', redis_queue)
+
+
+if __name__ == '__main__':
+    run_worker()
+
+
+############################################################
+# FILE: plugins\__init__.py
+############################################################
+
+import logging
+
+log = logging.getLogger('crawler.plugins')
+
+_plugins = {}
+
+
+def register(search_type, search_fn):
+    _plugins[search_type] = search_fn
+
+
+def get(search_type):
+    return _plugins.get(search_type)
+
+
+def search(site_cfg, keyword, max_pages=0):
+    search_type = site_cfg.get('search', {}).get('type', '')
+    fn = get(search_type)
+    if fn:
+        return fn(site_cfg, keyword, max_pages)
+    log.warning('No plugin for search type: %s (site=%s)', search_type, site_cfg.get('name', '?'))
+    return []
+
+
+# Auto-register bundled plugins
+from plugins import trs as _trs
+from plugins import jpaas as _jpaas
+from plugins import html as _html
+
+register('trs_json', _trs.search)
+register('jpaas_jsearch', _jpaas.search)
+register('html', _html.search)
+
+
+############################################################
+# FILE: plugins\html.py
+############################################################
+
+import logging
+
+log = logging.getLogger('crawler.plugins.html')
+
+
+def search(site_cfg, keyword, max_pages=0):
+    log.warning('HTML search plugin (stub) - not yet implemented for %s', site_cfg.get('name', '?'))
+    return []
+
+
+############################################################
+# FILE: plugins\jpaas.py
+############################################################
+
+import logging
+import json
+
+from httpx.fetch import get_json
+from parser.multi_strategy import clean_text, normalize_date
+
+log = logging.getLogger('crawler.plugins.jpaas')
+
+
+def search(site_cfg, keyword, max_pages=0):
+    search = site_cfg.get('search', {})
+    api_url = search.get('api_url')
+    if not api_url:
+        log.warning('JPAAS plugin: no api_url configured for %s', site_cfg.get('name'))
+        return []
+    params = search.get('params', {}).copy()
+    params['q'] = keyword
+    params['p'] = '1'
+    params['pg'] = '10'
+    params['sortType'] = '1'
+    if 'webId' in params:
+        params['_cus_eq_webid'] = params.pop('webId')
+
+    articles = []
+    page = 1
+    while True:
+        params['p'] = str(page)
+        result = get_json(api_url, params, site_cfg)
+        if not result:
+            break
+        if str(result.get('code', '')) != '200':
+            log.warning('JPAAS search error: %s', result)
+            break
+        data = result.get('data', {})
+        docs = data.get('appSearchResultBeanList', [])
+        expanded_docs = []
+        for doc in docs:
+            if 'mapSearchResult' in doc:
+                items = doc.get('mapSearchResult', {}).get('items', [])
+                for item in items:
+                    expanded_docs.append(item.get('data', {}))
+            else:
+                expanded_docs.append(doc)
+        docs = expanded_docs
+        log.info('JPAAS raw result count=%d (after expand)', len(docs))
+        if docs:
+            log.info('JPAAS raw data sample:\n%s', json.dumps(docs[:1], ensure_ascii=False, indent=2)[:3000])
+        if not docs:
+            log.info('  JPAAS returned 0 results (site may not be indexed)')
+            break
+        for doc in docs:
+            title = doc.get('title') or doc.get('title_str') or ''
+            url = doc.get('url') or doc.get('zcywlj_617143') or ''
+            if url and url.startswith('http://'):
+                url = url.replace('http://', 'https://', 1)
+            content = doc.get('content') or doc.get('content_556463') or doc.get('vc_content') or ''
+            if not title:
+                continue
+            articles.append({
+                'title': clean_text(title),
+                'url': url,
+                'content': content,
+                'publish_date': normalize_date(doc.get('date', '')),
+                'summary': clean_text(content),
+                'source': site_cfg.get('name', ''),
+                'site': site_cfg.get('name', ''),
+                'province': site_cfg.get('name', '').replace('财政局','').replace('财政厅',''),
+                'source_keywords': [keyword]
+            })
+        log.info('  Page %d: %d hits', page, len(docs))
+        if len(docs) < int(params.get('pg', 10)):
+            break
+        if max_pages > 0 and page >= max_pages:
+            break
+        page += 1
+    return articles
+
+
+############################################################
+# FILE: plugins\trs.py
+############################################################
+
+import logging
+
+from httpx.fetch import post_json
+from parser.api_parser import parse_trs_doc
+
+log = logging.getLogger('crawler.plugins.trs')
+
+
+def search(site_cfg, keyword, max_pages=0):
+    search = site_cfg.get('search', {})
+    api_url = search.get('api_url')
+    if not api_url:
+        log.warning('TRS plugin: no api_url configured for %s', site_cfg.get('name'))
+        return []
+    params = search.get('params', {}).copy()
+    params['qt'] = keyword
+    params['pageSize'] = params.get('pageSize', 20)
+    articles = []
+    page = 1
+    while True:
+        params['page'] = page
+        result = post_json(api_url, params, site_cfg)
+        if not result:
+            break
+        docs = result.get('resultDocs', [])
+        for doc in docs:
+            a = parse_trs_doc(doc, keyword)
+            if a:
+                articles.append(a)
+        log.info('  Page %d: %d hits', page, len(docs))
+        if len(docs) < params['pageSize'] or (max_pages > 0 and page >= max_pages):
+            break
+        page += 1
+    return articles
+
+
+############################################################
+# FILE: scheduler\__init__.py
+############################################################
+
+
+
+############################################################
+# FILE: scheduler\dispatcher.py
+############################################################
+
+from scheduler.search_scheduler import search_trs, search_jpaas
+from crawler.pipeline import run_pipeline as run_search, process_url as crawl_url
+from crawler.detail_scheduler import need_fetch_detail, _fetch_one_detail
+from storage.manager import StorageManager
+from storage.json_store import save_results
+
+
+############################################################
+# FILE: scheduler\queue.py
+############################################################
+
+from collections import deque
+
+
+class TaskQueue:
+    def __init__(self):
+        self._queue = deque()
+
+    def push(self, task):
+        task.setdefault('retry_count', 0)
+        self._queue.append(task)
+
+    def pop(self):
+        return self._queue.popleft() if self._queue else None
+
+    def size(self):
+        return len(self._queue)
+
+    def empty(self):
+        return len(self._queue) == 0
+
+
+############################################################
+# FILE: scheduler\search_scheduler.py
+############################################################
+
+import logging
+from plugins.trs import search as search_trs
+from plugins.jpaas import search as search_jpaas
+from plugins import search as search_with_plugin
+
+log = logging.getLogger('crawler.search')
+
+
+############################################################
+# FILE: search\__init__.py
+############################################################
+
+from search.keyword_expand import expand_keywords
+from search.query_strategy import QueryStrategy
+from search.result_merge import merge_results, search_hit_rate, content_hit_rate
+
+
+############################################################
+# FILE: search\keyword_expand.py
+############################################################
+
+import logging
+from config.keywords import get_expand_keywords, get_min_results, LOW_ALT_KEYWORDS
+
+log = logging.getLogger('search.expand')
+
+
+def expand_keywords(user_keywords, current_results=0):
+    """Expand user keywords with preset synonyms.
+    If current_results >= min_results, return only user keywords (no expansion needed).
+    Otherwise, merge user keywords with group expand list."""
+    expanded = set(user_keywords)
+    for kw in user_keywords:
+        min_r = get_min_results(kw)
+        if current_results > 0 and current_results >= min_r:
+            log.debug('Keyword %s: %d results >= min_results=%d, skip expand', kw, current_results, min_r)
+            continue
+        group_expand = get_expand_keywords(kw)
+        expanded.update(group_expand)
+        log.info('Keyword %s expanded: %s (min_results=%d, current=%d)', kw, group_expand, min_r, current_results)
+    expanded.update(LOW_ALT_KEYWORDS)
+    result = tuple(expanded)
+    return result
+
+
+############################################################
+# FILE: search\query_strategy.py
+############################################################
+
+import logging
+
+log = logging.getLogger('search.strategy')
+
+
+class QueryStrategy:
+    """Strategy for querying multiple sites with keyword expansion."""
+
+    def __init__(self, site_cfg, keywords):
+        from search.keyword_expand import expand_keywords
+        self.site_cfg = site_cfg
+        self.user_keywords = tuple(keywords) if keywords else ()
+        self.expanded_keywords = expand_keywords(self.user_keywords)
+        self.site_name = site_cfg.get('name', 'unknown')
+
+    def search_type(self):
+        return self.site_cfg.get('search', {}).get('type', '')
+
+    def log_info(self):
+        log.info('QueryStrategy: site=%s type=%s keywords=%d (expanded from %d)',
+                 self.site_name, self.search_type(),
+                 len(self.expanded_keywords), len(self.user_keywords))
+
+
+############################################################
+# FILE: search\result_merge.py
+############################################################
+
+import logging
+
+log = logging.getLogger('search.merge')
+
+
+def semantic_hit_rate(articles, keywords):
+    """Placeholder: AI-based semantic relevance check (future OpenAI/DeepSeek integration).
+    For now, delegates to content_hit_rate."""
+    return content_hit_rate(articles, keywords)
+
+
+def merge_results(article_lists, dedup_by='url'):
+    seen = set()
+    merged = []
+    for articles in article_lists:
+        for a in articles:
+            key = a.get(dedup_by, '')
+            if key and key not in seen:
+                seen.add(key)
+                merged.append(a)
+    log.info('Merge: %d lists -> %d unique articles', len(article_lists), len(merged))
+    return merged
+
+
+def search_hit_rate(articles, keywords):
+    if not articles:
+        return {'found': 0, 'search_hit': 0, 'search_hit_rate': 0.0}
+    search_hit = 0
+    for a in articles:
+        found = False
+        for k, v in a.items():
+            if isinstance(v, str):
+                for kw in keywords:
+                    if kw in v:
+                        search_hit += 1
+                        found = True
+                        break
+            if found:
+                break
+    rate = (search_hit / len(articles) * 100) if articles else 0
+    log.info('SearchHit: %d/%d (%.1f%%)', search_hit, len(articles), rate)
+    return {'found': len(articles), 'search_hit': search_hit, 'search_hit_rate': round(rate, 1)}
+
+
+def content_hit_rate(articles, keywords):
+    if not articles:
+        return {'found': 0, 'content_hit': 0, 'content_hit_rate': 0.0}
+    content_hit = 0
+    for a in articles:
+        title = str(a.get('title', ''))
+        body = str(a.get('content', '') or a.get('summary', ''))
+        for kw in keywords:
+            if kw in title or kw in body:
+                content_hit += 1
+                a['content_hit'] = True
+                break
+        else:
+            a['content_hit'] = False
+    rate = (content_hit / len(articles) * 100) if articles else 0
+    log.info('ContentHit: %d/%d (%.1f%%)', content_hit, len(articles), rate)
+    return {'found': len(articles), 'content_hit': content_hit, 'content_hit_rate': round(rate, 1)}
+
+
+############################################################
+# FILE: storage\__init__.py
+############################################################
+
+
+
+############################################################
+# FILE: storage\duckdb_store.py
+############################################################
+
+# DuckDB optional storage module
+try:
+    import duckdb
+    HAS_DUCKDB = True
+except ImportError:
+    HAS_DUCKDB = False
+
+
+def init_db(db_path='crawler_analytics.duckdb'):
+    if not HAS_DUCKDB:
+        return None
+    conn = duckdb.connect(db_path)
+    conn.execute('CREATE TABLE IF NOT EXISTS articles ('
+                 'id INTEGER PRIMARY KEY, title VARCHAR, url VARCHAR UNIQUE, '
+                 'content TEXT, province VARCHAR, publish_time VARCHAR, score INTEGER)')
+    return conn
+
+
+def save_to_duckdb(conn, articles, province=''):
+    if not HAS_DUCKDB or conn is None:
+        return 0
+    count = 0
+    for a in articles:
+        try:
+            conn.execute(
+                'INSERT OR IGNORE INTO articles (title,url,content,province,publish_time,score) '
+                'VALUES (?,?,?,?,?,?)',
+                [a.get('title', ''), a.get('url', ''),
+                 str(a.get('content', ''))[:1000],
+                 province, a.get('publish_date', ''), a.get('score', 0)])
+            count += 1
+        except Exception:
+            log.debug('save_to_duckdb: skip duplicate url=%s', a.get('url','')[:60])
+    conn.commit()
+    return count
+
+
+############################################################
+# FILE: storage\exporter.py
+############################################################
+
+import csv
+import json
+import logging
+from pathlib import Path
+from datetime import datetime
+
+log = logging.getLogger('storage.exporter')
+
+try:
+    import duckdb
+    HAS_DUCKDB = True
+except ImportError:
+    HAS_DUCKDB = False
+
+
+class DuckDBExporter:
+    def __init__(self, db_path='output/crawler.duckdb'):
+        if not HAS_DUCKDB:
+            raise ImportError('duckdb not installed')
+        self.conn = duckdb.connect(db_path)
+
+    def to_csv(self, output_path=None, keyword=None, site=None, limit=10000):
+        sql = 'SELECT * FROM articles WHERE 1=1'
+        params = []
+        if keyword:
+            sql += ' AND (title LIKE ? OR keyword LIKE ?)'
+            params.extend(['%' + keyword + '%', '%' + keyword + '%'])
+        if site:
+            sql += ' AND site = ?'
+            params.append(site)
+        sql += ' ORDER BY crawl_time DESC LIMIT ?'
+        params.append(limit)
+
+        rows = self.conn.execute(sql, params).fetchall()
+        cols = [d[0] for d in self.conn.execute(sql, params).description]
+
+        if not output_path:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_path = f'export_{ts}.csv'
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+        with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(cols)
+            w.writerows(rows)
+        log.info('Exported %d rows to CSV: %s', len(rows), output_path)
+        return output_path
+
+    def to_json(self, output_path=None, keyword=None, site=None, limit=10000):
+        sql = 'SELECT * FROM articles WHERE 1=1'
+        params = []
+        if keyword:
+            sql += ' AND (title LIKE ? OR keyword LIKE ?)'
+            params.extend(['%' + keyword + '%', '%' + keyword + '%'])
+        if site:
+            sql += ' AND site = ?'
+            params.append(site)
+        sql += ' ORDER BY crawl_time DESC LIMIT ?'
+        params.append(limit)
+
+        result = self.conn.execute(sql, params)
+        cols = [d[0] for d in result.description]
+        rows = [dict(zip(cols, row)) for row in result.fetchall()]
+
+        if not output_path:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_path = f'export_{ts}.json'
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2, default=str)
+        log.info('Exported %d rows to JSON: %s', len(rows), output_path)
+        return output_path
+
+    def to_excel(self, output_path=None, keyword=None, site=None, limit=10000):
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            raise ImportError('openpyxl not installed. Run: pip install openpyxl')
+
+        sql = 'SELECT * FROM articles WHERE 1=1'
+        params = []
+        if keyword:
+            sql += ' AND (title LIKE ? OR keyword LIKE ?)'
+            params.extend(['%' + keyword + '%', '%' + keyword + '%'])
+        if site:
+            sql += ' AND site = ?'
+            params.append(site)
+        sql += ' ORDER BY crawl_time DESC LIMIT ?'
+        params.append(limit)
+
+        result = self.conn.execute(sql, params)
+        cols = [d[0] for d in result.description]
+        rows = result.fetchall()
+
+        if not output_path:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_path = f'export_{ts}.xlsx'
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = 'articles'
+        ws.append(cols)
+        for row in rows:
+            ws.append([str(v) if v is not None else '' for v in row])
+        wb.save(output_path)
+        log.info('Exported %d rows to Excel: %s', len(rows), output_path)
+        return output_path
+
+    def close(self):
+        self.conn.close()
+
+
+############################################################
+# FILE: storage\json_store.py
+############################################################
+
+import json
+from pathlib import Path
+from datetime import datetime
+
+
+def save_json(articles, output_dir, prefix='result'):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    fp = output_dir / f'{prefix}_{ts}.json'
+    with open(fp, 'w', encoding='utf-8') as f:
+        json.dump(articles, f, ensure_ascii=False, indent=2)
+    return fp
+
+
+def save_csv(articles, output_dir, prefix='result'):
+    import csv
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    fp = output_dir / f'{prefix}_{ts}.csv'
+    fields = ['title', 'url', 'publish_date', 'source', 'score', 'matched_keywords', 'summary', 'content']
+    with open(fp, 'w', encoding='utf-8-sig', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+        w.writeheader()
+        for a in articles:
+            row = {k: a.get(k, '') for k in fields}
+            if isinstance(row.get('matched_keywords'), list):
+                row['matched_keywords'] = ';'.join(row['matched_keywords'])
+            w.writerow(row)
+    return fp
+
+
+def save_results(articles, output_dir, prefix='result'):
+    jp = save_json(articles, output_dir, prefix)
+    cp = save_csv(articles, output_dir, prefix)
+    return jp, cp
+
+
+############################################################
+# FILE: storage\manager.py
+############################################################
+
+import logging
+import hashlib
+from pathlib import Path
+from datetime import datetime
+import json, csv
+
+log = logging.getLogger('storage.manager')
+
+try:
+    import duckdb
+    HAS_DUCKDB = True
+except ImportError:
+    HAS_DUCKDB = False
+
+try:
+    from storage.mysql_store import MySQLStore, MYSQL_OK
+except ImportError:
+    MYSQL_OK = False
+
+
+class StorageManager:
+    """Unified storage: DuckDB(primary). Pipeline only calls save()/query()."""
+
+    def __init__(self, output_dir='output', prefix='result', use_mysql=False):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.prefix = prefix
+        self.ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        self.duck_conn = None
+        if HAS_DUCKDB:
+            try:
+                db_path = str(self.output_dir / 'crawler.duckdb')
+                self.duck_conn = duckdb.connect(db_path)
+                self.duck_conn.execute('''CREATE TABLE IF NOT EXISTS articles (
+                    url TEXT PRIMARY KEY,
+                    title TEXT,
+                    summary TEXT,
+                    content TEXT,
+                    province TEXT,
+                    publish_time VARCHAR,
+                    site VARCHAR,
+                    keyword VARCHAR,
+                    crawl_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    score INTEGER DEFAULT 0,
+                    matched_keywords VARCHAR,
+                    detail_fetched BOOLEAN DEFAULT FALSE,
+                    status INTEGER DEFAULT 0
+                )''')
+                self.duck_conn.execute('ALTER TABLE articles ADD COLUMN IF NOT EXISTS url_hash VARCHAR(32)')
+                self.duck_conn.execute('ALTER TABLE articles ADD COLUMN IF NOT EXISTS matched_keyword VARCHAR(200)')
+                self.duck_conn.execute('''CREATE TABLE IF NOT EXISTS crawl_log (
+                    url TEXT,
+                    status INTEGER,
+                    cost_ms INTEGER DEFAULT 0,
+                    retry INTEGER DEFAULT 0,
+                    error TEXT,
+                    crawl_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )''')
+                self.duck_conn.execute('ALTER TABLE crawl_log ADD COLUMN IF NOT EXISTS error_type VARCHAR(20)')
+                self.duck_conn.execute('''CREATE TABLE IF NOT EXISTS statistics (
+                    id INTEGER PRIMARY KEY,
+                    date DATE UNIQUE,
+                    total_articles INTEGER DEFAULT 0,
+                    total_requests INTEGER DEFAULT 0,
+                    success_count INTEGER DEFAULT 0,
+                    fail_count INTEGER DEFAULT 0,
+                    avg_latency_ms REAL DEFAULT 0,
+                    top_keyword VARCHAR,
+                    top_site VARCHAR,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )''')
+                self.duck_conn.execute('''CREATE TABLE IF NOT EXISTS task (
+                    id TEXT PRIMARY KEY,
+                    keyword TEXT,
+                    site TEXT,
+                    status TEXT DEFAULT 'created',
+                    article_count INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )''')
+                self.duck_conn.execute('CREATE INDEX IF NOT EXISTS idx_publish_time ON articles(publish_time)')
+                self.duck_conn.execute('CREATE INDEX IF NOT EXISTS idx_keyword ON articles(keyword)')
+                self.duck_conn.execute('CREATE INDEX IF NOT EXISTS idx_score ON articles(score)')
+                log.info('DuckDB connected: %s', db_path)
+            except Exception as e:
+                log.warning('DuckDB init failed: %s', e)
+                self.duck_conn = None
+
+        self.mysql = None
+        if use_mysql and MYSQL_OK:
+            try:
+                self.mysql = MySQLStore()
+                self.mysql.connect()
+                log.info('MySQL connected')
+            except Exception as e:
+                log.warning('MySQL init failed: %s', e)
+
+    def save(self, articles):
+        """Primary save: DuckDB (unique source of truth)."""
+        count = len(articles) if articles else 0
+        if self.duck_conn and articles:
+            try:
+                before = self.duck_conn.execute('SELECT COUNT(*) FROM articles').fetchone()[0]
+                sql = 'INSERT OR IGNORE INTO articles (url,url_hash,title,summary,content,publish_time,site,keyword,score,matched_keywords,matched_keyword,detail_fetched,source_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)'
+                values = [[a.get('url', ''),
+                           hashlib.md5(a.get('url','').encode()).hexdigest(),
+                           a.get('title', ''),
+                           str(a.get('summary', ''))[:500],
+                           str(a.get('content', ''))[:10000],
+                           a.get('publish_date', ''), a.get('site', a.get('source', '')),
+                           (a.get('source_keywords') or [''])[0],
+                           ';'.join(a.get('matched_keywords', [])),
+                           a.get('matched_keyword', ''),
+                           a.get('score', 0),
+                           bool(a.get('content', '')),
+                           a.get('search_type', '')] for a in articles]
+                self.duck_conn.executemany(sql, values)
+                self.duck_conn.commit()
+                after = self.duck_conn.execute('SELECT COUNT(*) FROM articles').fetchone()[0]
+                count = after - before
+                log.info('DuckDB: saved %d/%d articles', count, len(articles))
+            except Exception as e:
+                log.warning('DuckDB save error: %s', e)
+                count = 0
+
+        if self.mysql and articles:
+            try:
+                self.mysql.insert_articles_batch(articles)
+                log.info('MySQL: saved %d articles', count)
+            except Exception as e:
+                log.warning('MySQL save error: %s', e)
+
+        return count
+
+    def export_json(self, articles=None):
+        """On-demand JSON export."""
+        return self._save_json(articles) if articles else None
+
+    def export_csv(self, articles=None):
+        """On-demand CSV export."""
+        return self._save_csv(articles) if articles else None
+
+    def log_crawl(self, url, http_status, cost_ms=0, retry=0, error=None):
+        error_type = _classify_error(http_status, error)
+        if self.duck_conn:
+            try:
+                self.duck_conn.execute(
+                    'INSERT INTO crawl_log (url,status,cost_ms,retry,error,error_type) VALUES (?,?,?,?,?,?)',
+                    [url, http_status, cost_ms, retry, str(error)[:500] if error else None, error_type])
+            except Exception as e:
+                log.debug('log_crawl: %s', e)
+
+    def save_task(self, task_id, keyword, site, status='created'):
+        if self.duck_conn:
+            try:
+                self.duck_conn.execute(
+                    'INSERT OR REPLACE INTO task (id,keyword,site,status) VALUES (?,?,?,?)',
+                    [task_id, keyword, site, status])
+            except Exception as e:
+                log.warning('save_task: %s', e)
+
+    def query(self, keyword=None, site=None, min_score=0, limit=50):
+        """Query articles from DuckDB."""
+        if not self.duck_conn:
+            return []
+        sql = 'SELECT * FROM articles WHERE score >= ?'
+        params = [min_score]
+        if keyword:
+            sql += ' AND (title LIKE ? OR keyword LIKE ?)'
+            params.extend(['%' + keyword + '%', '%' + keyword + '%'])
+        if site:
+            sql += ' AND site = ?'
+            params.append(site)
+        sql += ' ORDER BY score DESC, crawl_time DESC LIMIT ?'
+        params.append(limit)
+        try:
+            result = self.duck_conn.execute(sql, params)
+            cols = [d[0] for d in result.description]
+            return [dict(zip(cols, row)) for row in result.fetchall()]
+        except Exception as e:
+            log.warning('Query error: %s', e)
+            return []
+
+    def statistics(self):
+        if not self.duck_conn:
+            return {}
+        try:
+            total = self.duck_conn.execute('SELECT COUNT(*) FROM articles').fetchone()[0]
+            by_site = {r[0]: r[1] for r in self.duck_conn.execute('SELECT site, COUNT(*) FROM articles GROUP BY site ORDER BY COUNT(*) DESC').fetchall()}
+            avg_score = self.duck_conn.execute('SELECT AVG(score) FROM articles').fetchone()[0] or 0
+            date_range = self.duck_conn.execute('SELECT MIN(publish_time), MAX(publish_time) FROM articles').fetchone()
+            return {'total_articles': total, 'by_site': by_site, 'avg_score': round(avg_score,1),
+                    'date_range': {'from': date_range[0], 'to': date_range[1]} if date_range else {}}
+        except Exception as e:
+            log.warning('Statistics error: %s', e)
+            return {}
+
+    def query_articles(self, keyword=None, site=None, min_score=0, limit=50):
+        return self.query(keyword=keyword, site=site, min_score=min_score, limit=limit)
+
+    def get_statistics(self):
+        return self.statistics()
+
+    def search_keyword(self, keyword, limit=50):
+        if not self.duck_conn:
+            return []
+        try:
+            result = self.duck_conn.execute(
+                'SELECT url, title, site, keyword, score, publish_time FROM articles WHERE title LIKE ? OR keyword LIKE ? ORDER BY score DESC LIMIT ?',
+                ['%' + keyword + '%', '%' + keyword + '%', limit])
+            cols = [d[0] for d in result.description]
+            return [dict(zip(cols, row)) for row in result.fetchall()]
+        except Exception as e:
+            log.warning('search_keyword error: %s', e)
+            return []
+
+    def statistics(self):
+        """Get storage statistics."""
+        if not self.duck_conn:
+            return {}
+        try:
+            total = self.duck_conn.execute('SELECT COUNT(*) FROM articles').fetchone()[0]
+            by_site = {r[0]: r[1] for r in self.duck_conn.execute(
+                'SELECT site, COUNT(*) FROM articles GROUP BY site ORDER BY COUNT(*) DESC').fetchall()}
+            avg_score = self.duck_conn.execute('SELECT AVG(score) FROM articles').fetchone()[0] or 0
+            date_range = self.duck_conn.execute(
+                'SELECT MIN(publish_time), MAX(publish_time) FROM articles').fetchone()
+            return {
+                'total_articles': total,
+                'by_site': by_site,
+                'avg_score': round(avg_score, 1),
+                'date_range': {'from': date_range[0], 'to': date_range[1]} if date_range else {},
+            }
+        except Exception as e:
+            log.warning('Statistics error: %s', e)
+            return {}
+
+    def _save_json(self, articles):
+        fp = self.output_dir / f'{self.prefix}_{self.ts}.json'
+        log.info('Export JSON: %s', fp)
+        with open(fp, 'w', encoding='utf-8') as f:
+            json.dump(articles or [], f, ensure_ascii=False, indent=2)
+        return fp
+
+    def _save_csv(self, articles):
+        fp = self.output_dir / f'{self.prefix}_{self.ts}.csv'
+        log.info('Export CSV: %s', fp)
+        fields = ['title', 'url', 'publish_date', 'source', 'score', 'matched_keywords', 'summary', 'content']
+        with open(fp, 'w', encoding='utf-8-sig', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+            w.writeheader()
+            for a in (articles or []):
+                row = {k: a.get(k, '') for k in fields}
+                if isinstance(row.get('matched_keywords'), list):
+                    row['matched_keywords'] = ';'.join(row['matched_keywords'])
+                w.writerow(row)
+        return fp
+
+    def close(self):
+        if self.duck_conn:
+            self.duck_conn.close()
+        if self.mysql:
+            self.mysql.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+def _classify_error(http_status, error):
+    if http_status == 429 or (error and 'rate' in str(error).lower()):
+        return 'rate_limit'
+    if http_status in (0, -1) or (error and any(k in str(error).lower() for k in ('timeout','connection','dns','refused'))):
+        return 'network'
+    if http_status == 403:
+        return 'forbidden'
+    if http_status >= 500:
+        return 'server_error'
+    if http_status >= 400:
+        return 'client_error'
+    return 'unknown'
+
+
+############################################################
+# FILE: storage\mysql_store.py
+############################################################
+
+import os
+import logging
+from datetime import datetime
+
+log = logging.getLogger('storage.mysql')
+
+try:
+    import pymysql
+    MYSQL_OK = True
+except ImportError:
+    MYSQL_OK = False
+
+
+class MySQLStore:
+    def __init__(self, host=None, port=3306, user='root', password='', database='crawler_db'):
+        if not MYSQL_OK:
+            raise ImportError('pymysql not installed. Run: pip install pymysql')
+        self.host = host or os.environ.get('MYSQL_HOST', 'localhost')
+        self.port = int(os.environ.get('MYSQL_PORT', port))
+        self.user = os.environ.get('MYSQL_USER', user)
+        self.password = os.environ.get('MYSQL_PASSWORD', password)
+        self.database = os.environ.get('MYSQL_DATABASE', database)
+        self.conn = None
+
+    def connect(self):
+        self.conn = pymysql.connect(
+            host=self.host, port=self.port, user=self.user,
+            password=self.password, database=self.database,
+            charset='utf8mb4', autocommit=True
+        )
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def insert_article(self, article):
+        sql = '''INSERT INTO article (url, title, summary, content, province, site, keyword, publish_time, score, matched_keywords, detail_fetched, status)
+                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 ON DUPLICATE KEY UPDATE score=VALUES(score), crawl_time=CURRENT_TIMESTAMP'''
+        pub_time = article.get('publish_date') or None
+        if pub_time and len(pub_time) == 10:
+            pub_time = pub_time + ' 00:00:00'
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (
+                article.get('url', ''),
+                article.get('title', '')[:500],
+                str(article.get('summary', ''))[:500],
+                article.get('content', ''),
+                article.get('source', ''),
+                article.get('source', ''),
+                (article.get('source_keywords') or [''])[0],
+                pub_time,
+                article.get('score', 0),
+                ';'.join(article.get('matched_keywords', [])),
+                bool(article.get('content', '')),
+                0,
+            ))
+
+    def insert_task(self, task_id, keyword, site, status='created'):
+        sql = '''INSERT INTO task (id, keyword, site, status)
+                 VALUES (%s, %s, %s, %s)
+                 ON DUPLICATE KEY UPDATE status=VALUES(status)'''
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (task_id, keyword, site, status))
+
+    def update_task(self, task_id, status, article_count=0):
+        sql = 'UPDATE task SET status=%s, article_count=%s WHERE id=%s'
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (status, article_count, task_id))
+
+    def insert_crawl_log(self, url, status, cost_ms=0, error=None):
+        sql = 'INSERT INTO crawl_log (url, status, cost_ms, error) VALUES (%s, %s, %s, %s)'
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (url, status, cost_ms, error[:1000] if error else None))
+
+    def insert_articles_batch(self, articles):
+        if not articles:
+            return 0
+        sql = '''INSERT INTO article (url, title, summary, content, province, site, keyword, publish_time, score, matched_keywords, detail_fetched, status)
+                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 ON DUPLICATE KEY UPDATE score=VALUES(score), crawl_time=CURRENT_TIMESTAMP'''
+        values = []
+        for a in articles:
+            pub_time = a.get('publish_date') or None
+            if pub_time and len(pub_time) == 10:
+                pub_time = pub_time + ' 00:00:00'
+            values.append((
+                a.get('url', ''), a.get('title', '')[:500],
+                str(a.get('summary', ''))[:500], str(a.get('content', '')),
+                a.get('source', ''), a.get('source', ''),
+                (a.get('source_keywords') or [''])[0],
+                pub_time, a.get('score', 0),
+                ';'.join(a.get('matched_keywords', [])),
+                bool(a.get('content', '')), 0,
+            ))
+        with self.conn.cursor() as cur:
+            cur.executemany(sql, values)
+        return len(values)
+
+    def query_articles(self, keyword=None, limit=50):
+        if keyword:
+            sql = 'SELECT title, url, source, publish_time, score FROM article WHERE title LIKE %s ORDER BY score DESC LIMIT %s'
+            with self.conn.cursor() as cur:
+                cur.execute(sql, ('%' + keyword + '%', limit))
+                return [dict(zip([d[0] for d in cur.description], row)) for row in cur.fetchall()]
+        sql = 'SELECT title, url, source, publish_time, score FROM article ORDER BY created_at DESC LIMIT %s'
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (limit,))
+            return [dict(zip([d[0] for d in cur.description], row)) for row in cur.fetchall()]
+
+
+############################################################
+# FILE: tests\__init__.py
+############################################################
+
+# Tests package
+
+
+############################################################
+# FILE: tests\test_core.py
+############################################################
+
+import unittest
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+class TestImports(unittest.TestCase):
+    def test_httpx_imports(self):
+        from httpx import fetch, post_json, get_json, rate_limiter_manager, breaker_manager
+        self.assertTrue(True)
+
+    def test_parser_imports(self):
+        from parser.multi_strategy import clean_text, normalize_date
+        from parser.html_parser import extract_title, extract_content
+        self.assertEqual(clean_text('<em>low</em> economy'), 'low economy')
+        self.assertEqual(normalize_date('日期：2025年6月7日'), '2025-06-07')
+
+    def test_scorer(self):
+        from extractor.scorer import score_article
+        r = score_article({'title': '低空经济政策', 'content': '发展低空经济', 'url': 'http://test.com/art_1'}, ('低空经济',))
+        self.assertTrue(r['passed'])
+        self.assertGreater(r['score'], 0)
+
+    def test_plugins_registry(self):
+        from plugins import get
+        self.assertIsNotNone(get('trs_json'))
+        self.assertIsNotNone(get('jpaas_jsearch'))
+
+    def test_metrics_collector(self):
+        from monitor.metrics import get_collector
+        c = get_collector()
+        c.inc('test_counter', 3)
+        snap = c.snapshot()
+        self.assertIn('test_counter', snap['counters'])
+
+    def test_config_loading(self):
+        from main import load_config
+        cfg = load_config('czj_beijing')
+        self.assertEqual(cfg['name'], '北京市财政局')
+        self.assertIn('search', cfg)
+        self.assertIn('score', cfg)
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+
+############################################################
+# FILE: utils\__init__.py
+############################################################
+
+import time
+import uuid
+import logging
+from contextlib import contextmanager
+import json
+import os
+
+log = logging.getLogger('crawler.utils')
+
+
+class ErrorStats:
+    """Error classification counters."""
+    def __init__(self):
+        self.network = 0
+        self.rate_limit = 0
+        self.parse = 0
+        self.config = 0
+        self.unknown = 0
+
+    def record(self, exc):
+        msg = str(exc).lower()
+        if any(k in msg for k in ('timeout', 'connection', 'dns', 'refused')):
+            self.network += 1
+        elif any(k in msg for k in ('429', 'rate', 'too many', 'throttl')):
+            self.rate_limit += 1
+        elif any(k in msg for k in ('parse', 'json', 'syntax', 'decode')):
+            self.parse += 1
+        elif any(k in msg for k in ('config', 'key', 'missing', 'not found')):
+            self.config += 1
+        else:
+            self.unknown += 1
+
+    def summary(self):
+        return 'network=%d rate_limit=%d parse=%d config=%d unknown=%d' % (
+            self.network, self.rate_limit, self.parse, self.config, self.unknown)
+
+    @property
+    def total(self):
+        return self.network + self.rate_limit + self.parse + self.config + self.unknown
+
+
+class Metrics:
+    def __init__(self):
+        self.requests = {'total': 0, 'success': 0, 'failed': 0}
+        self.articles = {'found': 0, 'scored': 0, 'saved': 0, 'detail_fetched': 0, 'detail_skipped': 0}
+        self.error_counts = {'network': 0, 'rate_limit': 0, 'parse': 0, 'config': 0, 'unknown': 0}
+
+    @property
+    def success_rate(self):
+        if self.requests['total'] == 0: return 1.0
+        return self.requests['success'] / self.requests['total']
+
+    @property
+    def score_pass_rate(self):
+        if self.articles['found'] == 0: return 0.0
+        return self.articles['scored'] / self.articles['found']
+
+    @property
+    def detail_hit_rate(self):
+        total = self.articles['detail_fetched'] + self.articles['detail_skipped']
+        if total == 0: return 0.0
+        return self.articles['detail_fetched'] / total
+
+    def summary(self, timings=None):
+        lines = ['  articles: found=%d scored=%d saved=%d' % (
+            self.articles['found'], self.articles['scored'], self.articles['saved'])]
+        lines.append('  rates: score_pass=%.0f%% detail_hit=%.0f%%' % (
+            self.score_pass_rate * 100, self.detail_hit_rate * 100))
+        if self.requests['total'] > 0:
+            lines.append('  http: total=%d success=%d failed=%d (success_rate=%.0f%%)' % (
+                self.requests['total'], self.requests['success'], self.requests['failed'],
+                self.success_rate * 100))
+        total_err = sum(self.error_counts.values())
+        if total_err > 0:
+            err_str = ' '.join('%s=%d' % (k, v) for k, v in self.error_counts.items() if v > 0)
+            lines.append('  errors: %s' % err_str)
+        return '\n'.join(lines)
+
+
+class RequestContext:
+    """Per-request tracing: ID, timing, error stats."""
+
+    def __init__(self, site_name=''):
+        self.request_id = uuid.uuid4().hex[:8]
+        self.site_name = site_name
+        self.start_time = time.time()
+        self.timings = {}
+        self.errors = ErrorStats()
+        self.metrics = Metrics()
+
+    def elapsed(self):
+        return time.time() - self.start_time
+
+    def fmt(self, msg):
+        return '[req:%s] %s' % (self.request_id, msg)
+
+    @contextmanager
+    def timed(self, label):
+        t0 = time.time()
+        try:
+            yield
+        finally:
+            self.timings[label] = time.time() - t0
+            log.info(self.fmt('%s: %.1fs'), label, self.timings[label])
+            if label == 'detail':
+                self.metrics.requests['total'] += 1
+                self.metrics.requests['success'] += 1  # simplified
+
+    def summary(self):
+        lines = [
+            self.fmt('===== STATS ====='),
+            self.metrics.summary(self.timings),
+        ]
+        if self.timings:
+            timing_str = ' | '.join('%s=%.1fs' % (k, v) for k, v in self.timings.items())
+            lines.append(self.fmt('  timing: %s | total=%.1fs' % (timing_str, self.elapsed())))
+        if self.errors.total > 0:
+            lines.append(self.fmt('  errors: %s' % self.errors.summary()))
+        lines.append(self.fmt('===== DONE ====='))
+        return '\n'.join(lines)
+
+
+############################################################
+# FILE: 使用手册.txt
+############################################################
+
+============================================================
+  政府网站政策爬虫 - 小白运行手册 (V3.0)
+============================================================
+
+【一、这是干什么的】
+自动去政府网站搜索关键词（低空经济、低空政策），找到政策文件并保存。
+支持：北京市财政局、杭州市财政局、绍兴市财政局。
+
+【二、安装】
+
+1. 确保电脑安装了 Python 3.9+
+2. 安装依赖（只需一次）：
+   pip install requests lxml selenium
+
+【三、最简单的搜索】
+
+python main.py --site czj_beijing --keywords 低空经济
+
+等待几秒，看到 [OK] 就成功了。结果在 output/ 目录下。
+
+【四、内置站点】
+
+  czj_beijing    北京市财政局（TRS API，最快）
+  czj_hangzhou   杭州市财政局（JPAAS API）
+  sxcs_shaoxing  绍兴市财政局（JPAAS API）
+
+【五、杭州/绍兴搜索（JPAAS平台）】
+
+python main.py --site czj_hangzhou --keywords 低空经济 --max-pages 1
+python main.py --site sxcs_shaoxing --keywords 低空经济 --max-pages 1
+
+这两个站用浙江省统一搜索平台，返回格式含 mapSearchResult 嵌套结构
+和 content_556463 正文字段——程序已自动处理。
+
+【六、常用命令】
+
+  自检:          python main.py --self-test
+  搜索:          python main.py --site czj_beijing --keywords 低空经济
+  多关键词:      python main.py --site czj_beijing --keywords 低空经济 低空政策
+  多页:          python main.py --site czj_beijing --keywords 低空经济 --max-pages 3
+  获取正文:      python main.py --site czj_hangzhou --keywords 低空经济 --with-detail
+  指定输出:      python main.py --site czj_beijing --keywords 低空经济 --output mydir
+  URL列表抓取:   echo URL > urls.txt && python main.py --urls urls.txt
+  探查新站:      python main.py --discover https://xxx.gov.cn
+  查看帮助:      python main.py --help
+
+【七、结果文件】
+
+output/ 目录下生成：
+  *.json  完整数据
+  *.csv   表格格式（Excel可直接打开）
+
+每篇文章包含：标题、网址、发布时间、关键词匹配分数。
+
+【八、如果搜索结果为0】
+
+1. JPAAS站（杭州/绍兴）：暂时加 --max-pages 1 避免超时
+2. 如果曾多次测试同站：删 output\crawler.db（去重数据库）
+3. filter_by_score 按 threshold 过滤，可调 extractor/scorer.py 中 THRESHOLD
+
+【九、添加新网站】
+
+1. 打开 config/sites_config.json
+2. 按已有格式添加新站点（TRS用 trs_json，JPAAS用 jpaas_jsearch）
+3. 直接用 --site 你的站点名 搜索
+
+【十、目录结构】
+
+main.py            入口程序
+anti_crawler/      反爬层（令牌桶/熔断/UA池/延迟）
+fetcher/           请求层（HTTP客户端/Session管理）
+parser/            解析层（CSS->XPath->Regex三层回退）
+extractor/         评分层（threshold评分/清洗）
+dedup/             去重层（MD5 url_hash）
+storage/           存储层（JSON/CSV/DuckDB）
+scheduler/         调度层（队列/搜索+JPAAS）
+analytics/         分析层（趋势/报告）
+config/            配置文件
+output/            输出目录
+
+============================================================
+  遇到问题请截图运行日志
+============================================================
+

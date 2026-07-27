@@ -1,0 +1,132 @@
+[
+  {
+    "id": 1,
+    "text": "下面哪个是 Python 中的可变数据类型？",
+    "options": {
+      "A": "tuple",
+      "B": "str",
+      "C": "list",
+      "D": "int"
+    },
+    "answer": "C",
+    "score": 1,
+    "type": "single"
+  },
+  {
+    "id": 2,
+    "text": "在 Python 中，用于定义函数的保留字是哪个？",
+    "options": {
+      "A": "function",
+      "B": "def",
+      "C": "define",
+      "D": "func"
+    },
+    "answer": "B",
+    "score": 1,
+    "type": "single"
+  },
+  {
+    "id": 3,
+    "text": "执行 \"print(2 ** 3)\" 的输出结果是？",
+    "options": {
+      "A": "5",
+      "B": "6",
+      "C": "8",
+      "D": "9"
+    },
+    "answer": "C",
+    "score": 1,
+    "type": "single"
+  },
+  {
+    "id": 4,
+    "text": "Python 中，以下哪个方法用于向列表末尾添加元素？",
+    "options": {
+      "A": "insert()",
+      "B": "append()",
+      "C": "add()",
+      "D": "push()"
+    },
+    "answer": "B",
+    "score": 1,
+    "type": "single"
+  },
+  {
+    "id": 5,
+    "text": "表达式 \"Hello, World!\"[7:12] 的结果是？",
+    "options": {
+      "A": "World",
+      "B": "World!",
+      "C": "ello,",
+      "D": "o, Wo"
+    },
+    "answer": "A",
+    "score": 1,
+    "type": "single"
+  },
+  {
+    "id": 6,
+    "text": "Python 解释器中，查看变量类型的函数是？",
+    "options": {
+      "A": "typeof()",
+      "B": "type()",
+      "C": "gettype()",
+      "D": "typeofvar()"
+    },
+    "answer": "B",
+    "score": 1,
+    "type": "single"
+  },
+  {
+    "id": 7,
+    "text": "以下哪个不是 Python 的合法标识符？",
+    "options": {
+      "A": "_value",
+      "B": "value2",
+      "C": "2value",
+      "D": "value_2"
+    },
+    "answer": "C",
+    "score": 1,
+    "type": "single"
+  },
+  {
+    "id": 8,
+    "text": "执行 \"list(range(5))\" 的结果是？",
+    "options": {
+      "A": "[1, 2, 3, 4, 5]",
+      "B": "[0, 1, 2, 3, 4]",
+      "C": "[0, 1, 2, 3, 4, 5]",
+      "D": "[1, 2, 3, 4]"
+    },
+    "answer": "B",
+    "score": 1,
+    "type": "single"
+  },
+  {
+    "id": 9,
+    "text": "退出 Python 交互环境的函数是？",
+    "options": {
+      "A": "quit()",
+      "B": "exit()",
+      "C": "close()",
+      "D": "以上都是"
+    },
+    "answer": "D",
+    "score": 1,
+    "type": "single"
+  },
+  {
+    "id": 10,
+    "text": "对于列表 L = [1, 2, 3, 4]，L[-1] 的值是？",
+    "options": {
+      "A": "1",
+      "B": "2",
+      "C": "3",
+      "D": "4"
+    },
+    "answer": "D",
+    "score": 1,
+    "type": "single"
+  }
+]

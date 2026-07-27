@@ -1,0 +1,51 @@
+{
+  "TEST001": {
+    "device_id": "TEST001",
+    "result": 1,
+    "reason": "全部校验通过",
+    "source": "result_engine",
+    "updated_at": 1782437779
+  },
+  "RSL_TEST": {
+    "device_id": "RSL_TEST",
+    "result": 1,
+    "reason": "全部校验通过",
+    "source": "result_engine",
+    "updated_at": 1782450066
+  },
+  "RSL_FAIL": {
+    "device_id": "RSL_FAIL",
+    "result": 0,
+    "reason": "坐标超出中国范围; 精度超阈值: max=9.900m",
+    "source": "result_engine",
+    "updated_at": 1782450066
+  },
+  "VERIFY_TEST": {
+    "device_id": "VERIFY_TEST",
+    "result": 1,
+    "reason": "全部校验通过",
+    "source": "result_engine",
+    "updated_at": 1782450359
+  },
+  "FUNC_R1": {
+    "device_id": "FUNC_R1",
+    "result": 1,
+    "reason": "全部校验通过",
+    "source": "result_engine",
+    "updated_at": 1782450397
+  },
+  "FUNC_R2": {
+    "device_id": "FUNC_R2",
+    "result": 0,
+    "reason": "坐标超出中国范围; 精度超阈值: max=9.000m",
+    "source": "result_engine",
+    "updated_at": 1782450397
+  },
+  "X": {
+    "device_id": "X",
+    "result": 1,
+    "reason": "全部校验通过",
+    "source": "result_engine",
+    "updated_at": 1782605901
+  }
+}

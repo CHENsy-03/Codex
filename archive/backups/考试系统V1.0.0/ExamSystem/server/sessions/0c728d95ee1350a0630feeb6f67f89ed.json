@@ -1,0 +1,15 @@
+{
+  "session_id": "0c728d95ee1350a0630feeb6f67f89ed",
+  "status": "submitted",
+  "created_at": "2026-07-24T14:41:38+08:00",
+  "submitted_at": "2026-07-24T14:41:38+08:00",
+  "answers": {
+    "1": "A"
+  },
+  "result": {
+    "total_score": 300,
+    "earned_score": 1,
+    "correct_count": 1,
+    "total_count": 300
+  }
+}

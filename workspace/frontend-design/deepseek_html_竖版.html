@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, viewport-fit=cover">
+    <title>低空经济基础建设流程与协同机制 · 竖版</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        :root {
+            --blue: #3b5fc9;
+            --blue-light: #e9edff;
+            --amber: #f59e0b;
+            --amber-light: #fef3c7;
+            --green: #22c55e;
+            --green-light: #dcfce7;
+            --purple: #6d28d9;
+            --purple-light: #f3e8ff;
+            --dark-green: #16a34a;
+            --bg: #f4f7fc;
+            --card-bg: #fff;
+            --text: #1e293b;
+            --text-secondary: #475569;
+            --border: #e2e8f0;
+            --safe-top: env(safe-area-inset-top, 0px);
+            --safe-bottom: env(safe-area-inset-bottom, 0px);
+        }
+
+        html, body {
+            height: 100%;
+            overscroll-behavior: none;
+        }
+
+        body {
+            font-family: -apple-system, 'PingFang SC', 'Helvetica Neue', sans-serif;
+            background: #eef2f9;
+            color: var(--text);
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* ---- Scroll-snap container ---- */
+        .snap-container {
+            height: 100vh;
+            height: 100dvh;
+            overflow-y: scroll;
+            scroll-snap-type: y mandatory;
+            scroll-behavior: smooth;
+        }
+        .snap-container::-webkit-scrollbar { display: none; }
+        .snap-container { -ms-overflow-style: none; scrollbar-width: none; }
+
+        /* ---- Pages ---- */
+       .page {
+           height: 100vh;
+           height: 100dvh;
+           scroll-snap-align: start;
+           scroll-snap-stop: always;
+           padding: calc(14px + var(--safe-top)) 14px calc(10px + var(--safe-bottom));
+           display: flex;
+           flex-direction: column;
+            overflow-y: auto;
+       }
+
+        /* ---- Side navigation dots ---- */
+        .nav-dots {
+            position: fixed;
+            right: 6px;
+            top: 50%;
+            transform: translateY(-50%);
+            display: flex;
+            flex-direction: column;
+            gap: 7px;
+            z-index: 100;
+            pointer-events: none;
+        }
+        .nav-dots a {
+            pointer-events: auto;
+            display: block;
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: rgba(59, 95, 201, 0.25);
+            transition: all 0.3s;
+        }
+        .nav-dots a.active {
+            background: var(--blue);
+            transform: scale(1.4);
+        }
+
+        /* ---- Typography ---- */
+        h1 { font-size: 20px; font-weight: 800; color: var(--blue); letter-spacing: 0.4px; }
+        h2 { font-size: 17px; font-weight: 700; color: var(--text); line-height: 1.3; }
+        h3 { font-size: 15px; font-weight: 700; line-height: 1.3; }
+        p, li, .body-text { font-size: 13px; line-height: 1.5; color: var(--text-secondary); }
+        .text-sm { font-size: 12px; }
+
+        /* ---- Badges & Tags ---- */
+        .badge-group { display: flex; gap: 5px; flex-wrap: wrap; }
+        .badge {
+            display: inline-flex; align-items: center;
+            font-size: 10px; font-weight: 600;
+            padding: 2px 8px; border-radius: 20px;
+            background: var(--blue-light); color: var(--blue);
+        }
+        .badge.gold { background: var(--amber-light); color: #b45309; }
+        .badge.green { background: var(--green-light); color: #15803d; }
+        .badge.outline { background: transparent; border: 1px solid var(--border); color: var(--text-secondary); font-size: 10px; }
+
+        .tag {
+            display: inline-flex; align-items: center;
+            font-size: 10px; font-weight: 600;
+            padding: 1px 7px; border-radius: 10px;
+            margin: 1px 3px 1px 0;
+        }
+        .tag.national { background: #dbeafe; color: #1d4ed8; }
+        .tag.local { background: #fef3c7; color: #b45309; }
+        .tag.purple { background: #f3e8ff; color: #6d28d9; }
+        .tag.orange { background: #ffedd5; color: #c2410c; }
+        .tag.pink { background: #fce7f3; color: #9d174d; }
+        .tag.green { background: #dcfce7; color: #166534; }
+
+        /* ---- Cards ---- */
+        .card {
+            background: var(--card-bg);
+            border-radius: 10px;
+            padding: 10px 12px;
+            border: 1px solid var(--border);
+        }
+
+        /* ---- Title section (page 1 top) ---- */
+        .title-section {
+            flex-shrink: 0;
+        }
+        .title-section h1 { line-height: 1.3; }
+
+        /* ---- Stage overview list (page 1) ---- */
+        .stage-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .stage-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 10px;
+            background: var(--card-bg);
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            border-left: 3px solid var(--blue);
+        }
+        .stage-item .num {
+            width: 24px; height: 24px;
+            border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-weight: 800; font-size: 12px;
+            color: #fff; flex-shrink: 0;
+        }
+        .stage-item .text {
+            flex: 1;
+            font-size: 13px; font-weight: 600;
+            line-height: 1.3;
+        }
+        .stage-item .sub {
+            font-size: 10px; color: var(--text-secondary); font-weight: 400;
+            margin-top: 1px;
+        }
+
+        /* ---- Detail flow items (pages 2-3) ---- */
+        .flow-item {
+            display: flex;
+            gap: 8px;
+            padding: 8px 10px;
+            background: var(--card-bg);
+            border-radius: 8px;
+            border: 1px solid var(--border);
+        }
+        .flow-item .num {
+            width: 28px; height: 28px;
+            border-radius: 6px;
+            display: flex; align-items: center; justify-content: center;
+            font-weight: 800; font-size: 14px;
+            color: #fff; flex-shrink: 0;
+        }
+        .flow-item .num.blue { background: var(--blue); }
+        .flow-item .num.amber { background: var(--amber); }
+        .flow-item .num.green { background: var(--green); }
+        .flow-item .content { flex: 1; min-width: 0; }
+        .flow-item .content .flow-title { font-weight: 700; font-size: 14px; margin-bottom: 2px; }
+        .flow-item .content .flow-desc { font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+        .flow-item .content ul { list-style: none; padding: 0; margin-top: 3px; }
+        .flow-item .content ul li {
+            font-size: 12px; color: var(--text-secondary);
+            padding-left: 12px; position: relative; margin-bottom: 1px;
+            line-height: 1.5;
+        }
+        .flow-item .content ul li::before {
+            content: "";
+            position: absolute; left: 0; top: 7px;
+            width: 4px; height: 4px;
+            border-radius: 50%;
+            background: var(--text-secondary);
+        }
+        .flow-item .tags-row { margin-top: 3px; }
+
+        /* ---- Detail card (stages 4-5) ---- */
+        .detail-card {
+            border-radius: 8px;
+            padding: 8px 10px;
+            border: 1px solid var(--border);
+            background: var(--card-bg);
+            border-left: 4px solid var(--blue);
+        }
+        .detail-card h3 { margin-bottom: 3px; }
+        .detail-card .card-body { font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+        .detail-card .card-body p { font-size: 12px; margin-bottom: 3px; }
+
+       /* ---- Department list (page 4) ---- */
+        .dept-list { display: flex; flex-direction: column; gap: 4px; }
+        .dept-item {
+            background: var(--card-bg);
+            border-radius: 6px;
+            padding: 5px 8px;
+            border: 1px solid var(--border);
+        }
+        .dept-item .dept-header {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 3px;
+            margin-bottom: 2px;
+        }
+        .dept-item .dept-label { font-weight: 700; font-size: 12px; }
+        .dept-item .dept-detail {
+            font-size: 11px; color: var(--text-secondary); line-height: 1.4;
+        }
+
+        /* ---- Highlight box ---- */
+        .highlight-box {
+            background: var(--blue-light);
+            border-left: 3px solid var(--blue);
+            padding: 6px 10px;
+            border-radius: 6px;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        .highlight-box.amber {
+            background: #fff3e0;
+            border-color: var(--amber);
+        }
+
+       /* ---- Bottom note (page 4 footer) ---- */
+        .footnote {
+            margin-top: 3px;
+            padding: 4px 8px;
+            background: var(--blue-light);
+            border-radius: 6px;
+            font-size: 11px;
+            line-height: 1.35;
+            color: var(--text-secondary);
+        }
+
+        /* ---- Page number ---- */
+        .page-num {
+            text-align: center;
+            font-size: 10px;
+            color: #94a3b8;
+            margin-top: 6px;
+            flex-shrink: 0;
+        }
+
+        /* ---- Utility ---- */
+        .flex-fill { flex: 1; display: flex; flex-direction: column; }
+        .mt-a { margin-top: auto; }
+        .gap-6 { gap: 6px; }
+        .gap-8 { gap: 8px; }
+        .gap-10 { gap: 10px; }
+
+        /* ---- Landscape fallback ---- */
+        @media (orientation: landscape) and (max-height: 500px) {
+            .page { padding: 8px 14px; }
+            h1 { font-size: 17px; }
+            h2 { font-size: 14px; }
+            .stage-item { padding: 5px 8px; }
+            .stage-item .text { font-size: 11px; }
+            .flow-item { padding: 6px 8px; }
+            .flow-item .content .flow-title { font-size: 12px; }
+            .flow-item .content .flow-desc { font-size: 11px; }
+            .dept-item { padding: 5px 8px; }
+            .dept-item .dept-label { font-size: 12px; }
+            .dept-item .dept-detail { font-size: 11px; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="snap-container" id="snapContainer">
+
+    <!-- ====================== Page 1 ====================== -->
+    <section class="page" id="p1">
+        <div class="title-section">
+            <h1>国家低空经济基础建设流程与协同机制</h1>
+            <div class="badge-group" style="margin-top: 5px;">
+                <span class="badge">标准体系 A-E</span>
+                <span class="badge gold">全国一盘棋</span>
+                <span class="badge green">安全为基</span>
+            </div>
+        </div>
+
+        <div class="flex-fill" style="justify-content: center; gap: 8px; margin-top: 8px;">
+            <p class="body-text" style="font-size: 12px;">完整流程涵盖规划、网络、物理设施和数字底座，结合文档标准体系（A-E），分为以下5个阶段：</p>
+            
+            <div class="stage-list">
+                <div class="stage-item" style="border-left-color: var(--blue);">
+                    <div class="num" style="background: var(--blue);">一</div>
+                    <div class="text">
+                        空域规划与数字底座绘制
+                        <div class="sub">标准体系 C、B</div>
+                    </div>
+                </div>
+                <div class="stage-item" style="border-left-color: var(--amber);">
+                    <div class="num" style="background: var(--amber);">二</div>
+                    <div class="text">
+                        物理基础设施与感知网络建设
+                        <div class="sub">标准体系 B</div>
+                    </div>
+                </div>
+                <div class="stage-item" style="border-left-color: var(--green);">
+                    <div class="num" style="background: var(--green);">三</div>
+                    <div class="text">
+                        数字化飞行管理服务平台建设
+                        <div class="sub">标准体系 C、B</div>
+                    </div>
+                </div>
+                <div class="stage-item" style="border-left-color: var(--purple);">
+                    <div class="num" style="background: var(--purple);">四</div>
+                    <div class="text">
+                        安全监管与防护体系构建
+                        <div class="sub">标准体系 D、BE</div>
+                    </div>
+                </div>
+                <div class="stage-item" style="border-left-color: var(--dark-green);">
+                    <div class="num" style="background: var(--dark-green);">五</div>
+                    <div class="text">
+                        应用场景的标准化接入
+                        <div class="sub">标准体系 E</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="highlight-box amber">
+                <strong>注</strong>："机位勘测"属于后续"起降点/机巢"选址的一部分，与空域规划同步配合完成，不单独作为初始阶段。
+            </div>
+        </div>
+
+        <div class="page-num">1 / 4</div>
+    </section>
+
+    <!-- ====================== Page 2 ====================== -->
+    <section class="page" id="p2">
+        <h2>阶段一：空域规划与数字底座绘制</h2>
+        <div class="badge-group" style="margin: 3px 0 7px;">
+            <span class="badge">标准体系 C、B</span>
+        </div>
+
+        <div class="flow-item" style="margin-bottom: 8px;">
+            <div class="num amber">1</div>
+            <div class="content">
+                <div class="flow-title">空域规划与数字底座绘制</div>
+                <div class="flow-desc">开展"空域分类与划设"、"航路网络分类与划设"（C级）。同步进行城市低空数字地图测绘、三维导航地图数据模型建设、地理要素分类编码（BA级）。</div>
+                <div class="tags-row">
+                    <span class="tag national">C级</span>
+                    <span class="tag orange">BA级</span>
+                </div>
+            </div>
+        </div>
+
+        <h2 style="border-top: 1px solid var(--border); padding-top: 8px; margin-bottom: 3px;">阶段二：低空物理基础设施与感知网络建设</h2>
+        <div class="badge-group" style="margin-bottom: 7px;">
+            <span class="badge gold">标准体系 B</span>
+        </div>
+
+        <div class="flow-item" style="flex: 1;">
+            <div class="num blue">2</div>
+            <div class="content">
+                <div class="flow-title">低空物理基础设施与感知网络建设</div>
+                <div class="flow-desc">包括以下三个主要方面：</div>
+                <ul>
+                    <li><strong>起降基础设施</strong>：建设低空起降场、机巢、消防设施、地面接驳设施（BB级）。</li>
+                    <li><strong>通信与感知网络</strong>：部署5G-A基站、低空导航/监视设备设施及预警识别设备设施（BC级、BE级）。</li>
+                    <li><strong>气象支撑设施</strong>：建设低空气象设备设施（BC级），提供精准低空气象数据。</li>
+                </ul>
+                <div class="tags-row">
+                    <span class="tag purple">BB级</span>
+                    <span class="tag orange">BC级</span>
+                    <span class="tag pink">BE级</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="page-num">2 / 4</div>
+    </section>
+
+    <!-- ====================== Page 3 ====================== -->
+    <section class="page" id="p3">
+        <h2>阶段三 · 阶段四 · 阶段五详解</h2>
+        <div class="badge-group" style="margin: 3px 0 7px;">
+            <span class="badge green">标准体系 C、B、D、E</span>
+        </div>
+
+        <div class="flex-fill" style="gap: 7px;">
+            <div class="flow-item">
+                <div class="num green">3</div>
+                <div class="content">
+                    <div class="flow-title">数字化飞行管理服务平台建设</div>
+                    <div class="flow-desc">搭建"低空智能网联系统"（BA级），包含数据底座和应用平台。完善"空管保障"系统（CD级），实现空域资源高效利用和飞行活动安全有序运行。</div>
+                    <div class="tags-row">
+                        <span class="tag national">BA级</span>
+                        <span class="tag purple">CD级</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="detail-card" style="border-left-color: var(--purple);">
+                <h3 style="color: var(--purple);">第四阶段：安全监管与防护体系构建</h3>
+                <div class="card-body">
+                    <p>同步建设"低空安全防护基础设施"（BE级），主要包括预警识别、无线电干扰防御、拦截设备设施等。</p>
+                    <p>落实"安全监管标准"（D级），进行无线电管理、人员管理、运营与应急管理的制度化建设。</p>
+                </div>
+                <div style="margin-top: 2px;">
+                    <span class="tag purple">BE级标准</span>
+                    <span class="tag national">D级标准</span>
+                </div>
+            </div>
+
+            <div class="detail-card" style="border-left-color: var(--dark-green);">
+                <h3 style="color: var(--dark-green);">第五阶段：应用场景的标准化接入</h3>
+                <div class="card-body">
+                    <p>基础建设基本完备后，依据应用场景标准（农业、交通、物流、能源巡检等E级标准），让各类低空飞行器接入现有的基础服务体系，实现规模化、规范化运行。</p>
+                </div>
+                <div style="margin-top: 2px;">
+                    <span class="tag orange">E级标准</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="page-num">3 / 4</div>
+    </section>
+
+    <!-- ====================== Page 4 ====================== -->
+    <section class="page" id="p4">
+       <h2>各阶段需对接的部门及上报流程</h2>
+       <div class="badge-group" style="margin: 3px 0 4px;">
+           <span class="badge outline">央地协同 条块结合</span>
+       </div>
+
+        <p class="body-text" style="font-size: 11px; margin-bottom: 4px;">根据《指南》第四章"组织实施"的界定，各流程对接及上报关系如下：</p>
+
+        <div class="dept-list">
+            <div class="dept-item">
+                <div class="dept-header">
+                    <span class="dept-label">空域规划与航线</span>
+                    <span class="tag national">中央空管办</span>
+                    <span class="tag local">民航地区管理局</span>
+                    <span class="tag local">军地空管</span>
+                </div>
+                <div class="dept-detail">空域资源由国家统一管理。地方提出需求后，需上报中央空管办和民航局，经审批划设。</div>
+            </div>
+            <div class="dept-item">
+                <div class="dept-header">
+                    <span class="dept-label">测绘与三维地图</span>
+                    <span class="tag national">自然资源部</span>
+                    <span class="tag local">地方规自局</span>
+                </div>
+                <div class="dept-detail">需对接自然资源部门获取基础地理数据，按测绘标准将空域地图数据上报备案。</div>
+            </div>
+            <div class="dept-item">
+                <div class="dept-header">
+                    <span class="dept-label">通信与感知网络</span>
+                    <span class="tag purple">工信部</span>
+                    <span class="tag local">地方通管办</span>
+                </div>
+                <div class="dept-detail">部署基站和雷达占用无线电频率资源，需向工信部无线电管理局申请频率许可。</div>
+            </div>
+            <div class="dept-item">
+                <div class="dept-header">
+                    <span class="dept-label">低空气象设施</span>
+                    <span class="tag green">中国气象局</span>
+                    <span class="tag local">地方气象局</span>
+                </div>
+                <div class="dept-detail">专业级气象监测设备需对接气象局，按标准建设并接入国家气象信息网络。</div>
+            </div>
+            <div class="dept-item">
+                <div class="dept-header">
+                    <span class="dept-label">起降场与机巢</span>
+                    <span class="tag orange">民航局</span>
+                    <span class="tag national">自然资源部</span>
+                    <span class="tag local">住建部门</span>
+                </div>
+                <div class="dept-detail">需向民航局报备。选址符合国土空间规划，向自然资源和住建部门履行用地及工程报建手续。</div>
+            </div>
+            <div class="dept-item">
+                <div class="dept-header">
+                    <span class="dept-label">安全监管与反制</span>
+                    <span class="tag purple">工信部</span>
+                    <span class="tag green">公安部</span>
+                    <span class="tag orange">民航局</span>
+                </div>
+                <div class="dept-detail">反制设备使用需向工信部备案。安全监管标准由民航局主管。</div>
+            </div>
+        </div>
+
+        <div class="footnote">
+            <strong>顶层统筹与标准制定</strong>：市场监管总局统一管理标准化工作。跨部门协调重大问题汇总至市场监管总局和国务院有关行政主管部门解决。
+        </div>
+
+        <div class="page-num">4 / 4</div>
+    </section>
+</div>
+
+<!-- Side navigation dots -->
+<nav class="nav-dots" aria-label="页面导航">
+    <a href="#p1" class="active" aria-label="第1页"></a>
+    <a href="#p2" aria-label="第2页"></a>
+    <a href="#p3" aria-label="第3页"></a>
+    <a href="#p4" aria-label="第4页"></a>
+</nav>
+
+<script>
+    // IntersectionObserver — 高亮当前页导航点
+    const pages = document.querySelectorAll('.page');
+    const dots = document.querySelectorAll('.nav-dots a');
+
+    const observer = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                const id = entry.target.id;
+                dots.forEach(dot => {
+                    dot.classList.toggle('active', dot.getAttribute('href') === '#' + id);
+                });
+            }
+        });
+    }, { threshold: 0.4 });
+
+    pages.forEach(page => observer.observe(page));
+</script>
+</body>
+</html>

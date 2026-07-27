@@ -1,0 +1,5 @@
+duckdb>=1.0.0
+protobuf>=4.21.0
+pyyaml>=6.0
+# Optional: protobuf C extension for performance
+# pip install protobuf --no-binary protobuf

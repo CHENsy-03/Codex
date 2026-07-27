@@ -1,0 +1,1302 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0" />
+    <title>日常收益</title>
+    <style>
+        /* ===== 全局重置 & 主题 ===== */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-primary: #0a0e17;
+            --bg-card: #111926;
+            --bg-card-hover: #172132;
+            --bg-input: #1a2538;
+            --gold: #d4a855;
+            --gold-light: #f0d080;
+            --gold-glow: rgba(212, 168, 85, 0.15);
+            --text-primary: #f0ece4;
+            --text-secondary: #9aa8b9;
+            --text-muted: #5a6a7a;
+            --border-gold: rgba(212, 168, 85, 0.25);
+            --radius: 16px;
+            --shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+            --transition: 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 12px;
+        }
+
+        /* ===== 手机容器 ===== */
+        .phone {
+            width: 100%;
+            max-width: 420px;
+            height: 780px;
+            background: var(--bg-primary);
+            border-radius: 36px;
+            overflow: hidden;
+            position: relative;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.8), inset 0 0 0 1px rgba(212, 168, 85, 0.08);
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* ===== 状态栏 ===== */
+        .status-bar {
+            padding: 14px 24px 6px;
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            flex-shrink: 0;
+            letter-spacing: 0.3px;
+        }
+        .status-bar .time {
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+        .status-bar .icons {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+        }
+        .status-bar .icons span {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            background: var(--text-secondary);
+            border-radius: 4px;
+            opacity: 0.5;
+        }
+        .status-bar .icons span:nth-child(2) {
+            width: 22px;
+            border-radius: 10px;
+        }
+
+        /* ===== 页面容器 ===== */
+        .page-container {
+            flex: 1;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .page {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            padding: 0 20px 20px;
+            overflow-y: auto;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.4s ease, transform 0.4s ease;
+            transform: translateY(12px);
+            -webkit-overflow-scrolling: touch;
+        }
+        .page.active {
+            opacity: 1;
+            pointer-events: auto;
+            transform: translateY(0);
+        }
+        .page::-webkit-scrollbar {
+            width: 3px;
+        }
+        .page::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        .page::-webkit-scrollbar-thumb {
+            background: var(--gold);
+            border-radius: 10px;
+        }
+
+        /* ===== 首页 (一级页面) ===== */
+        #page-home {
+            padding-top: 4px;
+        }
+        .home-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 4px 0 16px;
+        }
+        .home-header h1 {
+            font-size: 22px;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--gold-light), var(--gold));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: 0.5px;
+        }
+        .home-header .sub {
+            font-size: 13px;
+            color: var(--text-secondary);
+            font-weight: 400;
+            -webkit-text-fill-color: var(--text-secondary);
+            background: none;
+        }
+        .home-header .badge {
+            background: var(--gold-glow);
+            border: 1px solid var(--border-gold);
+            border-radius: 20px;
+            padding: 4px 14px;
+            font-size: 11px;
+            color: var(--gold);
+            font-weight: 500;
+        }
+
+        /* 收益卡片列表 */
+        .card-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            padding-bottom: 20px;
+        }
+
+       .card-item {
+           background: var(--bg-card);
+           border-radius: var(--radius);
+           padding: 16px 18px;
+           display: flex;
+           align-items: center;
+           gap: 14px;
+           cursor: pointer;
+           transition: background var(--transition), transform 0.2s, box-shadow 0.3s;
+           border: 1px solid transparent;
+           position: relative;
+           overflow: hidden;
+           -webkit-tap-highlight-color: transparent;
+            touch-action: manipulation;
+            user-select: none;
+       }
+        .card-item::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            border-radius: var(--radius);
+            border: 1px solid transparent;
+            transition: border-color 0.3s;
+            pointer-events: none;
+        }
+       .card-item:hover {
+           background: var(--bg-card-hover);
+           transform: scale(1.01);
+       }
+       .card-item:active {
+           transform: scale(0.97);
+       }
+       .card-item .icon-wrap {
+            width: 44px;
+            height: 44px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            flex-shrink: 0;
+            background: var(--gold-glow);
+            color: var(--gold);
+            border: 1px solid var(--border-gold);
+        }
+        .card-item .info {
+            flex: 1;
+            min-width: 0;
+        }
+        .card-item .info .name {
+            font-size: 15px;
+            font-weight: 600;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+        .card-item .info .name .tag {
+            font-size: 9px;
+            font-weight: 500;
+            background: rgba(212, 168, 85, 0.18);
+            color: var(--gold);
+            padding: 1px 8px;
+            border-radius: 10px;
+            letter-spacing: 0.3px;
+        }
+        .card-item .info .desc {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-top: 2px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .card-item .arrow {
+            color: var(--text-muted);
+            font-size: 16px;
+            flex-shrink: 0;
+            transition: transform 0.3s, color 0.3s;
+        }
+        .card-item:hover .arrow {
+            color: var(--gold);
+            transform: translateX(2px);
+        }
+        .card-item .value-preview {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--gold);
+            margin-right: 6px;
+            flex-shrink: 0;
+        }
+
+        /* 特殊卡片颜色点缀 */
+        .card-item.gold-border {
+            border-color: var(--border-gold);
+        }
+        .card-item .icon-wrap.gold-bg {
+            background: linear-gradient(135deg, rgba(212, 168, 85, 0.25), rgba(212, 168, 85, 0.08));
+        }
+
+        /* ===== 二级页面通用 ===== */
+        .detail-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 8px 0 16px;
+            border-bottom: 1px solid rgba(212, 168, 85, 0.08);
+            margin-bottom: 18px;
+            flex-shrink: 0;
+            position: sticky;
+            top: 0;
+            background: var(--bg-primary);
+            z-index: 5;
+            padding-top: 4px;
+        }
+       .detail-header .back {
+           width: 36px;
+           height: 36px;
+           border-radius: 50%;
+           display: flex;
+           align-items: center;
+           justify-content: center;
+           background: var(--bg-card);
+           border: 1px solid rgba(255, 255, 255, 0.06);
+           cursor: pointer;
+           font-size: 18px;
+           color: var(--text-secondary);
+           transition: all 0.3s;
+           flex-shrink: 0;
+            touch-action: manipulation;
+       }
+        .detail-header .back:hover {
+            background: var(--bg-card-hover);
+            color: var(--gold);
+            border-color: var(--border-gold);
+        }
+        .detail-header .back:active {
+            transform: scale(0.92);
+        }
+        .detail-header .title {
+            font-size: 18px;
+            font-weight: 700;
+            color: var(--text-primary);
+            flex: 1;
+        }
+        .detail-header .title .sub-tag {
+            font-size: 11px;
+            font-weight: 400;
+            color: var(--text-secondary);
+            margin-left: 6px;
+        }
+
+        /* ===== 统计卡片 ===== */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .stats-grid .stat-item {
+            background: var(--bg-card);
+            border-radius: 12px;
+            padding: 14px 10px;
+            text-align: center;
+            border: 1px solid rgba(255, 255, 255, 0.04);
+        }
+        .stats-grid .stat-item .num {
+            font-size: 20px;
+            font-weight: 700;
+            color: var(--gold);
+            line-height: 1.2;
+        }
+        .stats-grid .stat-item .num.green {
+            color: #4ecdc4;
+        }
+        .stats-grid .stat-item .num.blue {
+            color: #6ab0f7;
+        }
+        .stats-grid .stat-item .num.pink {
+            color: #f7a1c4;
+        }
+        .stats-grid .stat-item .label {
+            font-size: 11px;
+            color: var(--text-secondary);
+            margin-top: 4px;
+            letter-spacing: 0.2px;
+        }
+
+        .stats-grid.col-2 {
+            grid-template-columns: 1fr 1fr;
+        }
+        .stats-grid.col-2 .stat-item {
+            padding: 16px 10px;
+        }
+        .stats-grid.col-2 .stat-item .num {
+            font-size: 22px;
+        }
+
+        /* ===== 明细列表 ===== */
+        .detail-section {
+            margin-top: 6px;
+        }
+        .detail-section .section-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .detail-section .section-title .more {
+            font-size: 11px;
+            font-weight: 400;
+            color: var(--text-muted);
+        }
+
+        .list-item {
+            background: var(--bg-card);
+            border-radius: 12px;
+            padding: 12px 14px;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border: 1px solid rgba(255, 255, 255, 0.03);
+            transition: background 0.2s;
+        }
+        .list-item:hover {
+            background: var(--bg-card-hover);
+        }
+        .list-item .left .main {
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+        .list-item .left .sub {
+            font-size: 11px;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+        .list-item .right {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--gold);
+            text-align: right;
+        }
+        .list-item .right .sub {
+            font-size: 10px;
+            font-weight: 400;
+            color: var(--text-muted);
+        }
+        .list-item .right.positive {
+            color: #4ecdc4;
+        }
+        .list-item .right.negative {
+            color: #f7a1a1;
+        }
+
+        /* ===== 进度条 ===== */
+        .progress-wrap {
+            background: var(--bg-card);
+            border-radius: 12px;
+            padding: 16px 18px;
+            margin-bottom: 16px;
+            border: 1px solid rgba(255, 255, 255, 0.04);
+        }
+        .progress-wrap .progress-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .progress-wrap .progress-header .label {
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+        .progress-wrap .progress-header .value {
+            font-size: 16px;
+            font-weight: 700;
+            color: var(--gold);
+        }
+        .progress-bar {
+            width: 100%;
+            height: 6px;
+            background: rgba(255, 255, 255, 0.06);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        .progress-bar .fill {
+            height: 100%;
+            border-radius: 10px;
+            background: linear-gradient(90deg, var(--gold), var(--gold-light));
+            width: 0%;
+            transition: width 0.8s ease;
+        }
+
+        /* ===== 奖励卡片 ===== */
+        .reward-card {
+            background: linear-gradient(135deg, rgba(212, 168, 85, 0.12), rgba(212, 168, 85, 0.03));
+            border: 1px solid var(--border-gold);
+            border-radius: var(--radius);
+            padding: 18px 20px;
+            margin-bottom: 16px;
+            position: relative;
+            overflow: hidden;
+        }
+        .reward-card::before {
+            content: '✦';
+            position: absolute;
+            top: -10px;
+            right: -6px;
+            font-size: 60px;
+            color: rgba(212, 168, 85, 0.06);
+        }
+        .reward-card .reward-amount {
+            font-size: 32px;
+            font-weight: 700;
+            color: var(--gold);
+            line-height: 1.2;
+        }
+        .reward-card .reward-label {
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin-top: 4px;
+        }
+        .reward-card .reward-desc {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid rgba(212, 168, 85, 0.1);
+            line-height: 1.6;
+        }
+        .reward-card .reward-desc strong {
+            color: var(--gold);
+            font-weight: 600;
+        }
+
+        /* ===== 特殊: 排名 ===== */
+        .rank-display {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 20px;
+            background: var(--bg-card);
+            border-radius: var(--radius);
+            padding: 20px;
+            margin-bottom: 16px;
+            border: 1px solid rgba(255, 255, 255, 0.04);
+        }
+        .rank-display .rank-num {
+            font-size: 36px;
+            font-weight: 700;
+            color: var(--gold);
+            line-height: 1;
+        }
+        .rank-display .rank-label {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+        .rank-display .divider {
+            width: 1px;
+            height: 40px;
+            background: rgba(255, 255, 255, 0.06);
+        }
+
+        /* ===== 欢迎/空状态 ===== */
+        .empty-state {
+            text-align: center;
+            padding: 30px 0;
+            color: var(--text-muted);
+            font-size: 13px;
+        }
+
+        /* ===== 响应式微调 ===== */
+        @media (max-width: 460px) {
+            .phone {
+                height: 100vh;
+                max-height: 820px;
+                border-radius: 0;
+                padding: 0;
+            }
+            .page {
+                padding: 0 16px 16px;
+            }
+            .stats-grid .stat-item .num {
+                font-size: 17px;
+            }
+            .card-item {
+                padding: 14px 14px;
+            }
+            .reward-card .reward-amount {
+                font-size: 26px;
+            }
+        }
+        @media (min-width: 600px) {
+            .phone {
+                height: 820px;
+            }
+        }
+
+        /* ===== 动画辅助 ===== */
+        .fade-in {
+            animation: fadeIn 0.5s ease forwards;
+        }
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* 金色装饰线 */
+        .gold-line {
+            width: 40px;
+            height: 2px;
+            background: linear-gradient(90deg, var(--gold), transparent);
+            border-radius: 4px;
+            margin: 2px 0 12px;
+        }
+
+        /* 无数据提示 */
+        .no-data {
+            text-align: center;
+            padding: 20px;
+            color: var(--text-muted);
+            font-size: 12px;
+        }
+
+        /* 徽标小点 */
+        .dot {
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            margin-right: 4px;
+        }
+        .dot.gold {
+            background: var(--gold);
+        }
+        .dot.green {
+            background: #4ecdc4;
+        }
+        .dot.blue {
+            background: #6ab0f7;
+        }
+        .dot.pink {
+            background: #f7a1c4;
+        }
+
+        /* 标签组 */
+        .tag-group {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            margin: 6px 0 2px;
+        }
+        .tag-group .tag-sm {
+            font-size: 10px;
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--text-secondary);
+            padding: 2px 10px;
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.04);
+        }
+        .tag-group .tag-sm.gold {
+            background: var(--gold-glow);
+            color: var(--gold);
+            border-color: var(--border-gold);
+        }
+    </style>
+</head>
+<body>
+
+    <div class="phone" id="app">
+        <!-- ===== 状态栏 ===== -->
+        <div class="status-bar">
+            <span class="time">4:20</span>
+            <div class="icons">
+                <span></span>
+                <span></span>
+                <span></span>
+            </div>
+        </div>
+
+        <!-- ===== 页面容器 ===== -->
+        <div class="page-container">
+
+            <!-- ============================== -->
+            <!-- 首页 (一级页面) -->
+            <!-- ============================== -->
+            <div class="page active" id="page-home">
+                <div class="home-header">
+                    <div>
+                        <h1>日常收益</h1>
+                        <div style="font-size:12px; color:var(--text-secondary); margin-top:2px;">共享停机坪 · 全球会员</div>
+                    </div>
+                    <div class="badge">✦ 今日已更新</div>
+                </div>
+                <div class="gold-line"></div>
+
+                <div class="card-list">
+
+                    <!-- 1. 共享停机坪收益 -->
+                    <div class="card-item" data-page="shared">
+                        <div class="icon-wrap gold-bg">🛩️</div>
+                        <div class="info">
+                            <div class="name">共享停机坪收益 <span class="tag">联网即享</span></div>
+                            <div class="desc">机位联网越多，收益越高</div>
+                        </div>
+                        <span class="value-preview">+¥12,580</span>
+                        <span class="arrow">›</span>
+                    </div>
+
+                    <!-- 2. 区域分成收益 -->
+                    <div class="card-item" data-page="region">
+                        <div class="icon-wrap gold-bg">📍</div>
+                        <div class="info">
+                            <div class="name">区域分成收益 <span class="tag">达标分成</span></div>
+                            <div class="desc">联网机位数量达标即享区域分成</div>
+                        </div>
+                        <span class="value-preview">+¥8,920</span>
+                        <span class="arrow">›</span>
+                    </div>
+
+                    <!-- 3. 推广提成 -->
+                    <div class="card-item" data-page="promote">
+                        <div class="icon-wrap gold-bg">📣</div>
+                        <div class="info">
+                            <div class="name">推广提成 <span class="tag">推广收益</span></div>
+                            <div class="desc">推广「机位勘测员」产品得提成</div>
+                        </div>
+                        <span class="value-preview">+¥6,400</span>
+                        <span class="arrow">›</span>
+                    </div>
+
+                    <!-- 4. 销售提成 -->
+                    <div class="card-item" data-page="sales">
+                        <div class="icon-wrap gold-bg">🛒</div>
+                        <div class="info">
+                            <div class="name">销售提成 <span class="tag">直接促成</span></div>
+                            <div class="desc">直接促成购买获得提成</div>
+                        </div>
+                        <span class="value-preview">+¥2,850</span>
+                        <span class="arrow">›</span>
+                    </div>
+
+                    <!-- 5. 勘测提成 -->
+                    <div class="card-item" data-page="survey">
+                        <div class="icon-wrap gold-bg">📐</div>
+                        <div class="info">
+                            <div class="name">勘测提成 <span class="tag">勘测员专属</span></div>
+                            <div class="desc">完成1/2/3星会员机位勘测</div>
+                        </div>
+                        <span class="value-preview">+¥1,200</span>
+                        <span class="arrow">›</span>
+                    </div>
+
+                    <!-- 6. 创始收益·普惠奖励 -->
+                    <div class="card-item gold-border" data-page="welfare">
+                        <div class="icon-wrap" style="background:linear-gradient(135deg,rgba(212,168,85,0.3),rgba(212,168,85,0.06)); border-color:var(--border-gold);">🎁</div>
+                        <div class="info">
+                            <div class="name">创始收益 · 普惠奖励 <span class="tag" style="background:rgba(212,168,85,0.3);">前100万会员</span></div>
+                            <div class="desc">达标即享的一次性大礼</div>
+                        </div>
+                        <span class="value-preview" style="color:#f0d080;">¥5,000</span>
+                        <span class="arrow">›</span>
+                    </div>
+
+                    <!-- 7. 创始收益·排名奖励 -->
+                    <div class="card-item gold-border" data-page="ranking">
+                        <div class="icon-wrap" style="background:linear-gradient(135deg,rgba(212,168,85,0.3),rgba(212,168,85,0.06)); border-color:var(--border-gold);">🏆</div>
+                        <div class="info">
+                            <div class="name">创始收益 · 排名奖励 <span class="tag" style="background:rgba(212,168,85,0.3);">全球会员</span></div>
+                            <div class="desc">排名越高，奖励越丰厚</div>
+                        </div>
+                        <span class="value-preview" style="color:#f0d080;">¥3,000</span>
+                        <span class="arrow">›</span>
+                    </div>
+
+                </div>
+                <div style="text-align:center; padding:10px 0 6px; font-size:11px; color:var(--text-muted);">
+                    <span>✦ 数据实时更新 · 收益记录可查</span>
+                </div>
+            </div>
+
+            <!-- ============================== -->
+            <!-- 二级页面：共享停机坪收益 -->
+            <!-- ============================== -->
+            <div class="page" id="page-shared">
+                <div class="detail-header">
+                    <div class="back" data-back>‹</div>
+                    <div class="title">共享停机坪收益 <span class="sub-tag">联网即享</span></div>
+                </div>
+
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <div class="num">¥12,580</div>
+                        <div class="label">总收益</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="num green">328</div>
+                        <div class="label">联网机位</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="num blue">+¥86.5</div>
+                        <div class="label">今日收益</div>
+                    </div>
+                </div>
+
+                <div class="detail-section">
+                    <div class="section-title">
+                        <span>📋 收益明细</span>
+                        <span class="more">近7天</span>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">机位 #A0231 · 北京</div><div class="sub">2026-07-21 14:32</div></div>
+                        <div class="right positive">+¥12.50</div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">机位 #B1147 · 上海</div><div class="sub">2026-07-21 11:08</div></div>
+                        <div class="right positive">+¥8.20</div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">机位 #C2056 · 深圳</div><div class="sub">2026-07-20 22:15</div></div>
+                        <div class="right positive">+¥15.80</div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">机位 #D3092 · 杭州</div><div class="sub">2026-07-20 16:40</div></div>
+                        <div class="right positive">+¥6.30</div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">机位 #E4128 · 成都</div><div class="sub">2026-07-19 09:20</div></div>
+                        <div class="right positive">+¥10.90</div>
+                    </div>
+                </div>
+                <div style="text-align:center; padding:10px 0 4px; font-size:11px; color:var(--text-muted);">
+                    机位联网越多，共享收益越高
+                </div>
+            </div>
+
+            <!-- ============================== -->
+            <!-- 二级页面：区域分成收益 -->
+            <!-- ============================== -->
+            <div class="page" id="page-region">
+                <div class="detail-header">
+                    <div class="back" data-back>‹</div>
+                    <div class="title">区域分成收益 <span class="sub-tag">达标分成</span></div>
+                </div>
+
+                <div class="stats-grid col-2">
+                    <div class="stat-item">
+                        <div class="num">¥8,920</div>
+                        <div class="label">总收益</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="num green">156</div>
+                        <div class="label">达标机位</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="num blue">2.5%</div>
+                        <div class="label">当前分成比例</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="num pink">+¥42.8</div>
+                        <div class="label">今日分成</div>
+                    </div>
+                </div>
+
+                <div class="detail-section">
+                    <div class="section-title">
+                        <span>📍 区域分布</span>
+                        <span class="more">按机位数量</span>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">华东地区</div><div class="sub">52 个联网机位</div></div>
+                        <div class="right">¥3,240 <span class="sub">/ 38%</span></div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">华南地区</div><div class="sub">41 个联网机位</div></div>
+                        <div class="right">¥2,560 <span class="sub">/ 30%</span></div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">华北地区</div><div class="sub">33 个联网机位</div></div>
+                        <div class="right">¥1,980 <span class="sub">/ 23%</span></div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">西南地区</div><div class="sub">18 个联网机位</div></div>
+                        <div class="right">¥760 <span class="sub">/ 9%</span></div>
+                    </div>
+                </div>
+                <div style="text-align:center; padding:10px 0 4px; font-size:11px; color:var(--text-muted);">
+                    达标机位数量越多，区域分成比例越高
+                </div>
+            </div>
+
+            <!-- ============================== -->
+            <!-- 二级页面：推广提成 -->
+            <!-- ============================== -->
+            <div class="page" id="page-promote">
+                <div class="detail-header">
+                    <div class="back" data-back>‹</div>
+                    <div class="title">推广提成 <span class="sub-tag">推广收益</span></div>
+                </div>
+
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <div class="num">¥6,400</div>
+                        <div class="label">总提成</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="num green">32</div>
+                        <div class="label">推广人数</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="num blue">12 / 20</div>
+                        <div class="label">勘测员 / 其他</div>
+                    </div>
+                </div>
+
+                <div class="detail-section">
+                    <div class="section-title">
+                        <span>📣 推广明细</span>
+                        <span class="more">按时间排序</span>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">张明 · 机位勘测员 <span style="font-size:10px;color:var(--gold);margin-left:4px;">200元/单</span></div><div class="sub">2026-07-21 10:20</div></div>
+                        <div class="right positive">+¥200</div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">李华 · 普通会员 <span style="font-size:10px;color:var(--text-muted);margin-left:4px;">50元/单</span></div><div class="sub">2026-07-21 09:15</div></div>
+                        <div class="right positive">+¥50</div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">王芳 · 机位勘测员 <span style="font-size:10px;color:var(--gold);margin-left:4px;">200元/单</span></div><div class="sub">2026-07-20 16:45</div></div>
+                        <div class="right positive">+¥200</div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">赵岩 · 普通会员 <span style="font-size:10px;color:var(--text-muted);margin-left:4px;">50元/单</span></div><div class="sub">2026-07-20 14:00</div></div>
+                        <div class="right positive">+¥50</div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">陈雪 · 机位勘测员 <span style="font-size:10px;color:var(--gold);margin-left:4px;">200元/单</span></div><div class="sub">2026-07-19 11:30</div></div>
+                        <div class="right positive">+¥200</div>
+                    </div>
+                </div>
+                <div style="text-align:center; padding:10px 0 4px; font-size:11px; color:var(--text-muted);">
+                    推广「机位勘测员」产品，每单200元提成
+                </div>
+            </div>
+
+            <!-- ============================== -->
+            <!-- 二级页面：销售提成 -->
+            <!-- ============================== -->
+            <div class="page" id="page-sales">
+                <div class="detail-header">
+                    <div class="back" data-back>‹</div>
+                    <div class="title">销售提成 <span class="sub-tag">直接促成</span></div>
+                </div>
+
+                <div class="stats-grid col-2">
+                    <div class="stat-item">
+                        <div class="num">¥2,850</div>
+                        <div class="label">总提成</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="num green">45</div>
+                        <div class="label">销售订单</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="num blue">8 / 37</div>
+                        <div class="label">勘测员 / 其他</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="num pink">¥63.3</div>
+                        <div class="label">平均每单</div>
+                    </div>
+                </div>
+
+                <div class="detail-section">
+                    <div class="section-title">
+                        <span>🛒 销售明细</span>
+                        <span class="more">近10单</span>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">订单 #S2026072101 · 机位勘测员</div><div class="sub">2026-07-21 13:20</div></div>
+                        <div class="right positive">+¥200</div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">订单 #S2026072102 · 普通会员</div><div class="sub">2026-07-21 11:05</div></div>
+                        <div class="right positive">+¥10</div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">订单 #S2026072008 · 机位勘测员</div><div class="sub">2026-07-20 17:30</div></div>
+                        <div class="right positive">+¥200</div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">订单 #S2026072012 · 普通会员</div><div class="sub">2026-07-20 15:10</div></div>
+                        <div class="right positive">+¥10</div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">订单 #S2026071905 · 普通会员</div><div class="sub">2026-07-19 09:40</div></div>
+                        <div class="right positive">+¥10</div>
+                    </div>
+                </div>
+                <div style="text-align:center; padding:10px 0 4px; font-size:11px; color:var(--text-muted);">
+                    直接促成购买，机位勘测员200元/单，其他10元/单
+                </div>
+            </div>
+
+            <!-- ============================== -->
+            <!-- 二级页面：勘测提成 -->
+            <!-- ============================== -->
+            <div class="page" id="page-survey">
+                <div class="detail-header">
+                    <div class="back" data-back>‹</div>
+                    <div class="title">勘测提成 <span class="sub-tag">勘测员专属</span></div>
+                </div>
+
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <div class="num">¥1,200</div>
+                        <div class="label">总提成</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="num green">60</div>
+                        <div class="label">完成勘测</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="num blue">¥20/单</div>
+                        <div class="label">每单固定</div>
+                    </div>
+                </div>
+
+                <div class="detail-section">
+                    <div class="section-title">
+                        <span>⭐ 星级分布</span>
+                        <span class="more">全部完成</span>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">⭐ 1星会员勘测</div><div class="sub">已完成 20 单</div></div>
+                        <div class="right">¥400</div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">⭐⭐ 2星会员勘测</div><div class="sub">已完成 25 单</div></div>
+                        <div class="right">¥500</div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">⭐⭐⭐ 3星会员勘测</div><div class="sub">已完成 15 单</div></div>
+                        <div class="right">¥300</div>
+                    </div>
+                </div>
+
+                <div class="detail-section" style="margin-top:12px;">
+                    <div class="section-title">
+                        <span>📐 最近勘测</span>
+                        <span class="more">最新3单</span>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">机位 #B1147 · 2星会员</div><div class="sub">2026-07-21 10:15</div></div>
+                        <div class="right positive">+¥20</div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">机位 #C2056 · 1星会员</div><div class="sub">2026-07-20 16:30</div></div>
+                        <div class="right positive">+¥20</div>
+                    </div>
+                    <div class="list-item">
+                        <div class="left"><div class="main">机位 #E4128 · 3星会员</div><div class="sub">2026-07-20 09:20</div></div>
+                        <div class="right positive">+¥20</div>
+                    </div>
+                </div>
+                <div style="text-align:center; padding:10px 0 4px; font-size:11px; color:var(--text-muted);">
+                    完成1/2/3星会员机位勘测，每单20元提成
+                </div>
+            </div>
+
+            <!-- ============================== -->
+            <!-- 二级页面：创始收益·普惠奖励 -->
+            <!-- ============================== -->
+            <div class="page" id="page-welfare">
+                <div class="detail-header">
+                    <div class="back" data-back>‹</div>
+                    <div class="title">创始收益 · 普惠奖励 <span class="sub-tag">前100万会员</span></div>
+                </div>
+
+                <div class="reward-card">
+                    <div class="reward-amount">¥5,000</div>
+                    <div class="reward-label">🎁 达标即享 · 一次性大礼</div>
+                    <div class="reward-desc">
+                        <strong>前100万会员</strong> 专属普惠奖励，全体会员人人有机会。<br />
+                        <span style="color:var(--gold);">机位勘测员</span> 更享高比例加成！
+                    </div>
+                </div>
+
+                <div class="progress-wrap">
+                    <div class="progress-header">
+                        <span class="label">📊 达标进度</span>
+                        <span class="value">78%</span>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="fill" style="width:78%;"></div>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text-muted);margin-top:6px;">
+                        <span>已达标 78 万人</span>
+                        <span>目标 100 万人</span>
+                    </div>
+                </div>
+
+                <div class="detail-section">
+                    <div class="section-title">
+                        <span>📋 奖励规则</span>
+                    </div>
+                    <div style="background:var(--bg-card);border-radius:12px;padding:14px 16px;border:1px solid rgba(255,255,255,0.04);font-size:12px;color:var(--text-secondary);line-height:1.8;">
+                        <div>• 前100万注册会员均可参与普惠奖励</div>
+                        <div>• 达标条件：完成机位联网 ≥ 1 个</div>
+                        <div>• <span style="color:var(--gold);">机位勘测员</span> 奖励比例为普通会员的 <strong style="color:var(--gold);">2倍</strong></div>
+                        <div>• 奖励一次性发放至收益账户</div>
+                        <div style="margin-top:6px;color:var(--text-muted);font-size:11px;">⏱ 活动截止至前100万会员达标即止</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ============================== -->
+            <!-- 二级页面：创始收益·排名奖励 -->
+            <!-- ============================== -->
+            <div class="page" id="page-ranking">
+                <div class="detail-header">
+                    <div class="back" data-back>‹</div>
+                    <div class="title">创始收益 · 排名奖励 <span class="sub-tag">全球会员</span></div>
+                </div>
+
+                <div class="rank-display">
+                    <div>
+                        <div class="rank-num">#1,284</div>
+                        <div class="rank-label">🏆 当前全球排名</div>
+                    </div>
+                    <div class="divider"></div>
+                    <div>
+                        <div style="font-size:28px;font-weight:700;color:var(--gold-light);">¥3,000</div>
+                        <div class="rank-label">🎯 预估奖励</div>
+                    </div>
+                </div>
+
+                <div class="progress-wrap" style="border-color:var(--border-gold);">
+                    <div class="progress-header">
+                        <span class="label">📈 排名冲刺</span>
+                        <span class="value" style="font-size:14px;">TOP 0.13%</span>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="fill" style="width:87%;"></div>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text-muted);margin-top:6px;">
+                        <span>当前排名 1,284</span>
+                        <span>全球会员 1,000,000+</span>
+                    </div>
+                </div>
+
+                <div class="detail-section">
+                    <div class="section-title">
+                        <span>📋 排名奖励规则</span>
+                    </div>
+                    <div style="background:var(--bg-card);border-radius:12px;padding:14px 16px;border:1px solid rgba(255,255,255,0.04);font-size:12px;color:var(--text-secondary);line-height:1.8;">
+                        <div>• 全球会员均可参与排名奖励</div>
+                        <div>• 排名基于 <span style="color:var(--gold);">联网机位数量 + 推广贡献</span> 综合计算</div>
+                        <div>• 排名前 <strong style="color:var(--gold);">10,000</strong> 名可获得排名奖励</div>
+                        <div>• 奖励金额随排名提升而递增</div>
+                        <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;">
+                            <span class="tag-sm gold">🏅 前10名 ¥50,000</span>
+                            <span class="tag-sm gold">🥇 前100名 ¥20,000</span>
+                            <span class="tag-sm gold">🥈 前1000名 ¥8,000</span>
+                            <span class="tag-sm gold">🥉 前10000名 ¥2,000</span>
+                        </div>
+                        <div style="margin-top:6px;color:var(--text-muted);font-size:11px;">⏱ 每月1日更新排名</div>
+                    </div>
+                </div>
+
+                <div style="margin-top:12px;background:var(--bg-card);border-radius:12px;padding:12px 16px;border:1px solid rgba(255,255,255,0.04);">
+                    <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-secondary);">
+                        <span>📊 排名变化</span>
+                        <span style="color:var(--gold);">↑ 较上月提升 312 名</span>
+                    </div>
+                    <div style="display:flex;gap:6px;margin-top:8px;align-items:center;">
+                        <span style="font-size:10px;color:var(--text-muted);">上月</span>
+                        <div style="flex:1;height:4px;background:rgba(255,255,255,0.06);border-radius:4px;position:relative;">
+                            <div style="width:72%;height:100%;background:var(--text-muted);border-radius:4px;"></div>
+                        </div>
+                        <span style="font-size:10px;color:var(--text-muted);">1,596</span>
+                    </div>
+                    <div style="display:flex;gap:6px;margin-top:4px;align-items:center;">
+                        <span style="font-size:10px;color:var(--gold);">本月</span>
+                        <div style="flex:1;height:4px;background:rgba(255,255,255,0.06);border-radius:4px;position:relative;">
+                            <div style="width:87%;height:100%;background:var(--gold);border-radius:4px;"></div>
+                        </div>
+                        <span style="font-size:10px;color:var(--gold);">1,284</span>
+                    </div>
+                </div>
+            </div>
+
+        </div><!-- /page-container -->
+    </div><!-- /phone -->
+
+    <script>
+        // 确保DOM完全加载后再执行
+        document.addEventListener('DOMContentLoaded', function() {
+            'use strict';
+
+            // 所有页面
+            const pages = {
+                home: document.getElementById('page-home'),
+                shared: document.getElementById('page-shared'),
+                region: document.getElementById('page-region'),
+                promote: document.getElementById('page-promote'),
+                sales: document.getElementById('page-sales'),
+                survey: document.getElementById('page-survey'),
+                welfare: document.getElementById('page-welfare'),
+                ranking: document.getElementById('page-ranking'),
+            };
+
+            // 当前页面
+            let currentPage = 'home';
+
+            // 切换页面
+            function switchPage(pageId) {
+                // 隐藏所有页面
+                Object.keys(pages).forEach(key => {
+                    pages[key].classList.remove('active');
+                });
+
+                // 显示目标页面
+                const target = pages[pageId];
+                if (target) {
+                    target.classList.add('active');
+                    // 滚动到顶部
+                    target.scrollTop = 0;
+                }
+                currentPage = pageId;
+                // 更新URL hash (便于返回)
+                if (pageId !== 'home') {
+                    window.location.hash = pageId;
+                } else {
+                    window.location.hash = '';
+                }
+            }
+
+            // 返回首页
+            function goHome() {
+                switchPage('home');
+            }
+
+            // 绑定卡片点击事件
+            document.querySelectorAll('.card-item[data-page]').forEach(card => {
+                card.addEventListener('click', function(e) {
+                    const pageId = this.dataset.page;
+                    if (pageId && pages[pageId]) {
+                        switchPage(pageId);
+                    }
+                });
+                // 添加触摸反馈（移动端）
+                card.addEventListener('touchstart', function() {
+                    // 仅用于视觉反馈，无实际逻辑
+                }, { passive: true });
+            });
+
+            // 绑定返回按钮点击
+            document.querySelectorAll('[data-back]').forEach(btn => {
+                btn.addEventListener('click', function(e) {
+                    e.stopPropagation();
+                    goHome();
+                });
+            });
+
+            // 手势返回：右滑返回首页（移动端）
+            let touchStartX = 0;
+            let touchStartY = 0;
+            const container = document.querySelector('.page-container');
+
+            container.addEventListener('touchstart', function(e) {
+                const touch = e.touches[0];
+                touchStartX = touch.clientX;
+                touchStartY = touch.clientY;
+            }, { passive: true });
+
+            container.addEventListener('touchend', function(e) {
+                if (currentPage === 'home') return;
+                const touch = e.changedTouches[0];
+                const deltaX = touch.clientX - touchStartX;
+                const deltaY = touch.clientY - touchStartY;
+                // 右滑 > 50px 且 竖直方向移动小于水平方向
+                if (deltaX > 50 && Math.abs(deltaY) < Math.abs(deltaX) * 0.5) {
+                    goHome();
+                }
+            }, { passive: true });
+
+            // 键盘返回键 (ESC)
+            document.addEventListener('keydown', function(e) {
+                if (e.key === 'Escape' && currentPage !== 'home') {
+                    goHome();
+                }
+            });
+
+            // 浏览器历史记录支持 (hashchange)
+            window.addEventListener('hashchange', function() {
+                const hash = window.location.hash.replace('#', '');
+                if (hash && pages[hash]) {
+                    switchPage(hash);
+                } else {
+                    goHome();
+                }
+            });
+
+            // 初始化：如果URL有hash则跳转
+            const initHash = window.location.hash.replace('#', '');
+            if (initHash && pages[initHash]) {
+                switchPage(initHash);
+            }
+
+            // 控制台辅助
+            window.__switchPage = switchPage;
+            window.__goHome = goHome;
+
+            console.log('✅ 日常收益系统已启动，点击卡片即可查看详情。');
+        });
+    </script>
+
+</body>
+</html>

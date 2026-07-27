@@ -1,0 +1,31 @@
+# 杭州市服务器
+server:
+  id: "ZJ-HZ-001"
+  name: "杭州市服务器"
+  level: "city"
+  host: "0.0.0.0"
+  port: 9000
+database:
+  path: "data/gnss_data.duckdb"
+  memory_limit: "4GB"
+  temp_directory: "data/temp"
+  scanner_threshold_gb: 1.0
+network:
+  priority: ["4g", "5g", "wifi"]
+  heartbeat_interval: 30
+  session_timeout: 120
+protocol:
+  supported: ["GPGGA", "BESTPOS"]
+  version: "2.0"
+  crc_enabled: true
+  encrypt: false
+sync:
+  upstream_id: "SURVEY-SRV-001"
+  sync_interval: 60
+  batch_size: 1000
+  retry_max: 3
+logging:
+  level: "INFO"
+  file: "data/server.log"
+  max_size_mb: 100
+  backup_count: 5
