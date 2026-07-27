@@ -28,3 +28,4 @@ git.txt
 
 # Output data
 workspace/crawler/output/
+node_modules/
