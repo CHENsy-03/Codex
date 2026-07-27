@@ -1,6 +1,0 @@
-# 模拟GPS定位脚本 - 依赖
-# 本脚本仅使用Python标准库，无需额外依赖
-# asyncio, argparse, zlib, struct, logging, math, random, time
-#
-# 如需通过TCP发送报文，需要目标主机上运行的TCP服务器
-# 如需串口发送，需要 pyserial: pip install pyserial

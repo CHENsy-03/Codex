@@ -1,6 +1,0 @@
-字段 | 说明
-device_id | 设备
-sequence | 序号
-payload | 数据
-retry | 次数
-status | 状态
