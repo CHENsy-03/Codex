@@ -1,0 +1,30 @@
+# Python cache
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Go build
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Project-specific
+workspace/crawler/task-001-go-deps.patch
+git.txt
+
+# Output data
+workspace/crawler/output/
