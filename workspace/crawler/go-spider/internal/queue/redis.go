@@ -5,20 +5,28 @@ import (
 	"encoding/json"
 	"time"
 
+	"crawler-platform/internal/protocol"
+
 	"github.com/redis/go-redis/v9"
 )
 
 type HTMLPayload struct {
+	TaskID  string `json:"task_id"`
 	URL     string `json:"url"`
 	Site    string `json:"site"`
 	Keyword string `json:"keyword"`
 	Level   int    `json:"level"`
 	HTML    string `json:"html,omitempty"`
 	Time    string `json:"time"`
+	Title   string `json:"title,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Score   int    `json:"score"`
 }
 
 type RedisQueue struct {
 	client    *redis.Client
+	searchQueue string
+	eventQueue string
 	urlQueue  string
 	htmlQueue string
 	errQueue  string
@@ -34,6 +42,8 @@ func NewRedisQueue(addr string) *RedisQueue {
 	})
 	return &RedisQueue{
 		client:    client,
+		eventQueue: "crawler:event",
+		searchQueue: "crawler:search",
 		urlQueue:  "crawler:url",
 		htmlQueue: "crawler:html",
 		errQueue:  "crawler:error",
@@ -47,22 +57,24 @@ func (rq *RedisQueue) Ping() error {
 	return rq.client.Ping(ctx).Err()
 }
 
-func (rq *RedisQueue) PushURLTask(url, site, keyword string, level int) error {
+func (rq *RedisQueue) PushURLTask(url, site, keyword string, level int, title, taskID string) error {
 	payload := HTMLPayload{
-		URL: url, Site: site, Keyword: keyword, Level: level,
+		TaskID: taskID, URL: url, Site: site, Keyword: keyword, Level: level, Title: title,
 		Time: time.Now().Format(time.RFC3339),
 	}
 	return rq.push(rq.urlQueue, payload)
 }
 
-func (rq *RedisQueue) PushHTML(url, title, html string) error {
+func (rq *RedisQueue) PushHTML(url, title, html, site, keyword string, level int, taskID string) error {
 	payload := HTMLPayload{
-		URL: url, Title: title, HTML: html,
+		TaskID: taskID, URL: url, Title: title, HTML: html,
+		Site: site, Keyword: keyword, Level: level,
 		Time: time.Now().Format(time.RFC3339),
 	}
 	return rq.push(rq.htmlQueue, payload)
 }
 
+// Deprecated: Use PushErrorMessage instead. This function uses the old HTMLPayload format.
 func (rq *RedisQueue) PushError(url, errMsg string) error {
 	payload := HTMLPayload{
 		URL: url, Error: errMsg,
@@ -105,4 +117,99 @@ func (rq *RedisQueue) pop(queue string) (*HTMLPayload, error) {
 		return nil, err
 	}
 	return &payload, nil
+}
+func (rq *RedisQueue) PushSearch(taskID, site, keyword string, level, maxPages int) error {
+	msg := protocol.SearchMessage{
+		Envelope: protocol.Envelope{
+			ProtocolVersion: protocol.Version,
+			TaskID:          taskID,
+			MessageID:       protocol.NewMessageID(),
+			Timestamp:       time.Now().Format(time.RFC3339),
+		},
+		Type:     "search",
+		Site:     site,
+		Keyword:  keyword,
+		Level:    level,
+		MaxPages: maxPages,
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return rq.client.LPush(ctx, rq.searchQueue, data).Err()
+}
+
+func (rq *RedisQueue) PopSearch() (*protocol.SearchMessage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := rq.client.BRPop(ctx, 3*time.Second, rq.searchQueue).Result()
+	if err != nil {
+		return nil, err
+	}
+	var msg protocol.SearchMessage
+	if err := json.Unmarshal([]byte(result[1]), &msg); err != nil {
+		return nil, err
+	}
+	return &msg, nil
+}
+func (rq *RedisQueue) PushResultMessage(msg *protocol.ResultMessage) error {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return rq.client.LPush(ctx, rq.resQueue, data).Err()
+}
+
+func (rq *RedisQueue) PopResultMessage() (*protocol.ResultMessage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := rq.client.BRPop(ctx, 3*time.Second, rq.resQueue).Result()
+	if err != nil {
+		return nil, err
+	}
+	var msg protocol.ResultMessage
+	if err := json.Unmarshal([]byte(result[1]), &msg); err != nil {
+		return nil, err
+	}
+	return &msg, nil
+}
+func (rq *RedisQueue) PopSearchDone() (*protocol.SearchDoneMessage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := rq.client.BRPop(ctx, 3*time.Second, rq.eventQueue).Result()
+	if err != nil {
+		return nil, err
+	}
+	var msg protocol.SearchDoneMessage
+	if err := json.Unmarshal([]byte(result[1]), &msg); err != nil {
+		return nil, err
+	}
+	return &msg, nil
+}
+func (rq *RedisQueue) PushErrorMessage(msg *protocol.ErrorMessage) error {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return rq.client.LPush(ctx, rq.errQueue, data).Err()
+}
+
+func (rq *RedisQueue) PopErrorMessage(timeout time.Duration) (*protocol.ErrorMessage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := rq.client.BRPop(ctx, timeout, rq.errQueue).Result()
+	if err != nil {
+		return nil, err
+	}
+	var msg protocol.ErrorMessage
+	if err := json.Unmarshal([]byte(result[1]), &msg); err != nil {
+		return nil, err
+	}
+	return &msg, nil
 }

@@ -1,15 +1,10 @@
 package api
 
 import (
-	"encoding/json"
-	"fmt"
 	"log"
-	"net/http"
 	"sync"
 	"time"
 
-	"crawler-platform/internal/client"
-	"crawler-platform/internal/config"
 	"crawler-platform/internal/worker"
 
 	"github.com/gin-gonic/gin"
@@ -87,6 +82,10 @@ func (s *Server) createTask(c *gin.Context) {
 	if req.Workers == 0 {
 		req.Workers = 4
 	}
+	if req.MaxPages < 0 {
+		c.JSON(400, gin.H{"error": "max_pages must be >= 0"})
+		return
+	}
 	if req.MaxPages == 0 {
 		req.MaxPages = 1
 	}
@@ -94,19 +93,13 @@ func (s *Server) createTask(c *gin.Context) {
 	task := s.store.Create(req.Site, req.Keywords)
 
 	go func() {
-		cfg, err := config.Load(req.Site, "../config")
-		if err != nil {
-			log.Printf("[task:%s] config error: %v", task.ID, err)
+		if err := s.redis.PushSearch(task.ID, req.Site, req.Keywords, 1, req.MaxPages); err != nil {
+			log.Printf("[task:%s] PushSearch error: %v", task.ID, err)
 			s.store.Update(task.ID, "failed", worker.Stats{})
 			return
 		}
-
-		articles := client.SearchArticles(cfg, req.Keywords)
-		log.Printf("[task:%s] found %d articles", task.ID, len(articles))
-
-		for _, a := range articles {
-			s.manager.Submit(worker.Task{URL: a.URL, Title: a.Title, SiteCfg: cfg})
-		}
+		log.Printf("[task:%s] pushed search: site=%s keyword=%s max_pages=%d", task.ID, req.Site, req.Keywords, req.MaxPages)
+		s.store.Update(task.ID, "searching", worker.Stats{})
 
 		for {
 			stats := s.manager.Stats()
@@ -138,25 +131,9 @@ func (s *Server) taskStatus(c *gin.Context) {
 }
 
 func (s *Server) listArticles(c *gin.Context) {
-	if s.redis == nil {
-		c.JSON(503, gin.H{"error": "redis not available"})
-		return
-	}
-
-	var articles []map[string]interface{}
-	for i := 0; i < 50; i++ {
-		payload, err := s.redis.PopResult()
-		if err != nil || payload == nil {
-			break
-		}
-		articles = append(articles, map[string]interface{}{
-			"url": payload.URL, "title": payload.Title,
-			"score": payload.Score,
-		})
-	}
-
-	c.JSON(200, gin.H{"count": len(articles), "articles": articles})
-	_ = fmt.Sprintf
+	// Result consumption moved to WorkerManager.StartResultConsumer.
+	// TODO: query articles from MySQL for this endpoint.
+	c.JSON(200, gin.H{"count": 0, "articles": []interface{}{}})
 }
 
 func (s *Server) metrics(c *gin.Context) {
@@ -168,9 +145,4 @@ func (s *Server) listSites(c *gin.Context) {
 		{"key": "czj_beijing", "name": "北京市财政局"},
 		{"key": "czj_hangzhou", "name": "杭州市财政局"},
 	})
-}
-
-func init() {
-	_ = json.Marshal
-	_ = http.StatusOK
 }
