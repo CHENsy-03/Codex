@@ -29,3 +29,13 @@ git.txt
 # Output data
 workspace/crawler/output/
 node_modules/
+
+# Go binary build output
+bin/
+
+# Go runtime logs
+go-server*.log
+
+# One-time fix/generation scripts
+_fix*.py
+_gen*.py
