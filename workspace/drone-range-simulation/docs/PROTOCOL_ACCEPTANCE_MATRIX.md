@@ -409,4 +409,21 @@ MAP-017 保持“非有限仿射参数”语义（现以真实 NaN GeoTIFF 验�
 
 ## 13. 声明
 
-本矩阵是协议验收与追踪记录，**不是发布完成证明**；Java 示例、Nuitka 构建、交付包均未完成。
+本矩阵是协议验收与追踪记录，**不是发布完成证明**；TASK-011 的 Java 外部客户端及 ProcessBuilderDemo 已实现并通过内部自动化验收，但 Nuitka standalone 和正式交付目录仍未实现，Windows 10 实机验收与首次使用者两分钟验收仍为 PENDING-EXTERNAL。
+
+## 14. Java 外部客户端验证补充（TASK-011）
+
+本节仅记录 Java 客户端对既有 Python worker 协议的验证证据；
+Python worker 协议仍由现有协议实现（app/worker_protocol.py、app/worker_engine.py）与本矩阵上述章节定义。
+本任务未增加消息字段、操作类型、状态码或错误语义；Java 验证总计 30 个测试（Maven 30/0/0/0）。
+
+- WorkerCommandLineTest（4）：java/src/test/java/com/drone/worker/WorkerCommandLineTest.java
+  - pythonFactoryUsesAbsoluteCommandListAndCwd(:17)、relativePathsRejected(:37)、emptyCommandRejected(:45)、commandAndEnvironmentAreDefensivelyCopied(:53)；
+- NdjsonCodecTest（13）：java/src/test/java/com/drone/worker/NdjsonCodecTest.java
+  - encodeHelloFields(:19)、encodeLoadMapFieldsAndChinesePath(:28)、encodeCalculateThreePointTypes(:37)、encodeShutdownFields(:65)、encodedLinesAreSingleLineWithoutCrLf(:71)、decodeSuccessEnvelope(:78)、decodeBusinessFailureEnvelope(:88)、decodeAllowsUnknownExtraFields(:99)、decodeRejectsNonJson(:107)、decodeRejectsArrayRoot(:114)、decodeRejectsMissingIdAndMismatch(:120)、decodeRejectsBadSuccessType(:130)、decodeRejectsDataAndErrorTogetherOrMissing(:136)；
+- DroneWorkerClientIntegrationTest（1）：java/src/test/java/com/drone/worker/DroneWorkerClientIntegrationTest.java
+  - realWorkerEndToEnd(:72)；
+- DroneWorkerClientProcessTest（12）：java/src/test/java/com/drone/worker/DroneWorkerClientProcessTest.java
+  - residentProcessMultipleRequestsNoCrossTalk(:291)、concurrentThreadsAreSerializedAndCounted(:311)、businessErrorKeepsSameProcessUsable(:347)、stderrSpamAndJsonShapeDoesNotBecomeResponse(:366)、stdoutNonJsonMarksBrokenAndDestroys(:384)、idMismatchMarksBrokenAndDestroys(:396)、requestTimeoutDestroysWithoutAutoReplay(:408)、workerAbnormalExitYieldsTransportError(:422)、restartReEstablishesHello(:432)、restartReloadsLastSuccessfulMap(:450)、stdoutQueueOverflowIsTerminalWithoutReaderDeadlock(:503)、stdoutEofRemainsObservableWhenQueueIsExactlyFull(:534)。
+
+覆盖：命令行解析、NDJSON 编解码、请求关联、真实进程往返、超时、异常分类、队列溢出、EOF、恢复、shutdown/close 与 PID 回收。

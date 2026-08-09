@@ -130,3 +130,19 @@
 - 未修改任何逻辑、断言或运行行为；正式源项目保持只读且哈希未变；
 - 最终目标与源项目关系：36 项逐字节一致；3 项仅删除末尾 1 个冗余 LF；2 项文档仅有末尾追加；
 - 本处理不改变 TASK-010 已正式验收通过的结论；TASK-011 尚未开始。
+
+## 2026-08-09：TASK-011 Java 21 常驻客户端与真实 Python Worker 集成
+
+- 增加 Java 外部 Worker 客户端适配层（java/，com.drone.worker，17 个文件）；
+- 增加命令行解析（WorkerCommandLine）、NDJSON 编解码（NdjsonCodec）、进程管理（WorkerProcessHandle）、超时与异常映射（WorkerTimeouts、三类异常）、restart/shutdown/close/PID 回收（DroneWorkerClient）；
+- 增加 ProcessBuilderDemo（已实现）；
+- 增加四个 Java 测试类（WorkerCommandLineTest、NdjsonCodecTest、DroneWorkerClientIntegrationTest、DroneWorkerClientProcessTest）；
+- 验收基线：Maven 30/0/0/0，Python 459 passed，1 个既有 rasterio warning；
+- Nuitka standalone、正式交付目录仍未实现；Windows 10 与首次使用者两分钟验收仍为 PENDING-EXTERNAL；未推送远端。
+
+## 2026-08-09：TASK-012 Java Worker 外部集成基线与项目文档收口（已完成）
+
+- 同步项目治理说明和当前状态文档（AGENTS.md、README.md、docs/TASK.md、docs/CHANGELOG.md、docs/ACCEPTANCE_RECORD.md、docs/PROTOCOL_ACCEPTANCE_MATRIX.md）；
+- 明确 Python GUI、Python worker、Java 外部客户端三者边界；记录 Java 协议与进程验证证据；
+- 保留 Nuitka、正式交付目录和外部验收为未完成状态；
+- 本任务为纯文档收口，不涉及功能开发；FINAL RE-REVIEW PASSED，随本提交归档。

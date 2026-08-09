@@ -7,8 +7,8 @@
 - Windows 11 本机技术验收已经完成；
 - Windows 10 验收仍为 PENDING-EXTERNAL；
 - 首次使用者两分钟验收仍为 PENDING-EXTERNAL；
-- TASK-008 整体仍为 IN PROGRESS；
-- Git 尚未提交；
+- TASK-008 文档收口：已完成（TASK-008-A..D 均 PASS）；TASK-010 验收归档：CLOSED；TASK-011 Java 外部客户端：CLOSED；
+- Git：本项目独立 worktree 已建立基线提交（b045d19、8ffdc47），尚未推送远端；
 - 创建本验收摘要不代表两个外部验收已经通过。
 
 任务演进与证据边界详见 [TASK.md](TASK.md)。
@@ -110,8 +110,17 @@
 - Windows 11 本机技术验收：PASS；
 - Windows 10 验收：PENDING-EXTERNAL；
 - 首次使用者两分钟验收：PENDING-EXTERNAL；
-- TASK-008-B（最终验收摘要创建）：完成后可判定 PASS；
-- TASK-008 整体实施：IN PROGRESS；
-- Git：尚未提交。
+- TASK-008-B（最终验收摘要创建）：PASS；
+- TASK-008 文档收口：已完成（TASK-008-A..D 均 PASS）；TASK-010 验收归档：CLOSED；TASK-011 Java 外部客户端：CLOSED；
+- Git：本项目独立 worktree 已建立基线提交（b045d19、8ffdc47），尚未推送远端；
 
 不使用“项目全部验收完成”“正式交付完成”“所有平台均通过”等超出证据范围的表述。
+
+## 九、TASK-011 内部自动化验收记录
+
+- 验收提交：8ffdc47edbad2f003bfc12456ff9df88fa7279af；
+- Java：Tests run: 30, Failures: 0, Errors: 0, Skipped: 0；
+- Python：459 passed，1 个既有 rasterio NotGeoreferencedWarning；
+- Java 测试组成：WorkerCommandLineTest 4、NdjsonCodecTest 13、DroneWorkerClientIntegrationTest 1、DroneWorkerClientProcessTest 12；
+- 覆盖范围：命令行、NDJSON、真实 worker 往返、超时、业务异常、协议错误、传输错误、队列溢出、EOF、restart、shutdown、close、PID 回收；
+- 结论仅限内部自动化验收通过；不改变以下外部验收状态：Windows 10 实机验收 PENDING-EXTERNAL、首次使用者两分钟验收 PENDING-EXTERNAL。

@@ -27,12 +27,23 @@
 
 禁止在本项目中加入：
 
-- Go、FastAPI、Java 接口、HTTP 通信、API Key、局域网访问；
+- Go、FastAPI、Java 接口（仅第 3.1 节所述 TASK-011 外部适配层除外）、HTTP 通信、API Key、局域网访问；
 - 数据库（含 SQLite）、Launcher、后台服务、进程守护、日志平台、性能监控平台；
 - Leaflet、QWebEngine、QWebChannel、XYZ 瓦片、在线底图、多地图管理；
 - DEM、高程采样、三维距离、坡度、障碍物、路径规划；
 - 飞行动画、开始/暂停/恢复/停止、任务状态机、运行策略；
 - 完整分辨率金字塔浏览、分块加载、遥感专业影像处理。
+
+## 3.1 Java 外部适配例外（TASK-011 已提交事实）
+
+`java/` 目录仅作为外部系统调用 Python Worker 的独立适配层。
+Java 客户端可以通过本地 ProcessBuilder 启动 `worker_main.py`，
+并仅通过 stdin/stdout NDJSON 与 Python Worker 交换消息。
+该例外不构成 Python GUI 的 Java 接入：Python GUI 不导入、
+不启动且不依赖 Java；Java 客户端也不是 GUI 后端或嵌入式接口。
+除 TASK-011 已冻结并提交的范围外，任何 Java 扩展必须由新的独立
+任务明确授权。HTTP、FastAPI、gRPC、数据库、Go 以及其他既有
+禁止范围继续有效。
 
 # 4. 任务流程
 

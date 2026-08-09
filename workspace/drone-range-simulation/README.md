@@ -25,10 +25,12 @@
 
 - TASK-007D-R1：PASS；
 - Windows 11 本机技术验收：PASS；
+- TASK-010 验收归档：CLOSED（形成 Python worker 协议与验收基线）；
+- TASK-011 Java 21 常驻客户端：CLOSED（提交 8ffdc47edbad2f003bfc12456ff9df88fa7279af；Maven 30 passed）；
+- TASK-012 文档收口：CLOSED（FINAL RE-REVIEW PASSED；随本提交归档）；
 - Windows 10 实机验收：PENDING-EXTERNAL；
 - 首次使用者两分钟验收：PENDING-EXTERNAL；
-- TASK-008 整体实施：IN PROGRESS；
-- Git：尚未提交。
+- Git：本项目独立 worktree 已建立基线提交（b045d19、8ffdc47），尚未推送远端。
 
 ## 外部验收边界
 
@@ -37,6 +39,19 @@
 - Windows 11 的历史技术验收不能替代 Windows 10 实机验收；
 - 开发者或历史演示不能替代首次使用者验收；
 - 后续实际执行时必须填写真实记录，不能预填或补造证据。
+
+## 组件关系
+
+外部 Java 系统 → Java Worker 客户端（java/，com.drone.worker）→ 本地 ProcessBuilder → worker_main.py → stdin/stdout NDJSON → Python worker engine
+
+- Python GUI（main.py）：独立桌面样品，不导入、不启动、不依赖 Java，不经过上述调用链；
+- Python Worker（worker_main.py）：无 GUI 常驻进程，通过 stdin/stdout NDJSON 提供 hello / load_map / calculate / shutdown；
+- Java Worker 客户端：外部系统调用 Python Worker 的本地适配层，通过 ProcessBuilder 启动子进程并按 NDJSON 通信；不是 GUI 后端，也不是嵌入式 Java 接口；
+- 不存在 HTTP、FastAPI 或 gRPC 通道；
+- ProcessBuilderDemo.java 已实现（TASK-011）；
+- Nuitka standalone 与正式交付目录仍未实现；
+- Windows 10 实机验收与首次使用者两分钟验收仍为 PENDING-EXTERNAL。
+
 ## 支持的输入格式
 
 - `.zip`：BIGEMAP 式地图数据包（演示主格式）；
@@ -160,7 +175,9 @@ drone-range-simulation/
 
 ## 当前尚未实现（明确排除）
 
-- 飞行动画、三维距离、DEM、航线规划、多地图、FastAPI、数据库、后台线程、状态机、Launcher。
+- 飞行动画、三维距离、DEM、航线规划、多地图、FastAPI、数据库、Python GUI 后台仿真线程、状态机、Launcher。
+- Nuitka standalone、正式交付目录（仍未实现）；
+- Windows 10 实机验收与首次使用者两分钟验收（仍为 PENDING-EXTERNAL）。
 
 ## 已知限制
 

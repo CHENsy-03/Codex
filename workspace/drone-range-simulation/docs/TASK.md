@@ -954,6 +954,7 @@ TASK-008：PASS，文档与验收记录已收口；Windows 10 和首次使用者
 - python -m compileall -q main.py worker_main.py app tests：通过；
 - git diff --check：仓库级仅命中 crawler/全部代码.txt 的既有无关问题；项目未进入 Git 索引，以文件清单与 SHA256 快照补足；
 - 未实现 load_map、calculate、完整状态机、Java 示例、Nuitka、交付目录；未提交 Git。
+- TASK-012 注记：上述为 TASK-008 当时的真实范围；ProcessBuilderDemo.java 已于 TASK-011 实现，Nuitka 与正式交付目录仍未实现。
 
 ## 7. 遗留问题
 
@@ -1016,6 +1017,7 @@ TASK-008：PASS，文档与验收记录已收口；Windows 10 和首次使用者
 - python -m compileall -q main.py worker_main.py app tests：通过；
 - git diff --check：仓库级仅命中 crawler/全部代码.txt 的既有无关问题；项目未进入 Git 索引，以文件清单与 SHA256 快照补足；
 - 未实现 Java 示例、Nuitka、交付目录；未提交 Git。
+- TASK-012 注记：上述为 TASK-009 当时的真实范围；ProcessBuilderDemo.java 已于 TASK-011 实现，Nuitka 与正式交付目录仍未实现。
 
 ## 7. 遗留问题
 
@@ -1212,3 +1214,46 @@ PNT-028、029、033、041 原为空缺，本轮补入冻结规则用例可保留
   - 2 项文档仅有末尾追加；
 - 本处理不改变 TASK-010 已正式验收通过的结论；
 - TASK-011 尚未开始。
+
+# TASK-011：Java 21 ProcessBuilder 常驻客户端与真实 Python Worker 集成
+
+## 1. 任务基本信息
+
+- 状态：已完成（POST-COMMIT REVIEW PASSED；提交 8ffdc47edbad2f003bfc12456ff9df88fa7279af，父提交 b045d1900b896d30b28416a0b699f61d929065aa）
+- 类型：Java 编码 + 真实 Python Worker 集成测试 + 定点修复
+- 验收：Maven Tests run 30, Failures 0, Errors 0, Skipped 0；Python 459 passed，1 个既有 rasterio NotGeoreferencedWarning
+- 未推送远端。
+
+## 2. 交付内容
+
+- 新增 java/ 17 个文件：pom.xml、.gitignore、11 个生产类、4 个测试类；
+- 生产类：WorkerCommandLine、WorkerTimeouts、WorkerPoint、WorkerResults、WorkerBusinessException、WorkerProtocolException、WorkerTransportException、NdjsonCodec、WorkerProcessHandle、DroneWorkerClient、ProcessBuilderDemo；
+- 能力：start 握手、hello、loadMap、calculate（三类坐标）、restart（自动重载最后成功地图）、shutdown/close/PID 回收、超时（15/60/10/5/2/2 s 默认，可注入）、三类异常分离、单在途串行、id 精确关联、stdout 有界队列溢出终止与 EOF 独立传达；
+- Java 是外部适配层，不接入 Python GUI；ProcessBuilderDemo.java 已实现；Nuitka standalone 与正式交付目录仍未实现；Windows 10 与首次使用者两分钟验收仍为 PENDING-EXTERNAL。
+
+## 3. 历史状态注记
+
+- docs/TASK.md 中 TASK-008/009 执行结果所写“未实现 Java 示例”仅描述当时状态；自 TASK-011 起 ProcessBuilderDemo.java 已实现，历史原文保留；Nuitka 与正式交付目录仍未实现。
+
+# TASK-012：Java Worker 外部集成基线与项目文档收口
+
+## 1. 任务基本信息
+
+- 状态：已完成（FINAL RE-REVIEW PASSED；随本提交归档）
+- 类型：纯文档及项目治理同步
+- 分支：docs/drone-task-012-java-baseline-sync（基于 8ffdc47…）
+- 精确范围：本轮六个文档文件（AGENTS.md、README.md、docs/TASK.md、docs/CHANGELOG.md、docs/ACCEPTANCE_RECORD.md、docs/PROTOCOL_ACCEPTANCE_MATRIX.md）
+
+## 2. 冻结架构事实
+
+- Python GUI 仍为独立桌面样品，不导入、不启动、不依赖 Java；
+- Java 客户端是外部系统调用 Python worker 的适配层（本地子进程 stdin/stdout NDJSON 调用 worker_main.py）；
+- Java 客户端不是 GUI 后端，也不是嵌入式 Java 接口；
+- 不引入 HTTP、FastAPI、gRPC、数据库或 Go；
+- ProcessBuilderDemo.java 已实现；Nuitka standalone、正式交付目录仍未实现；
+- Windows 10 实机验收与首次使用者两分钟验收仍为 PENDING-EXTERNAL；
+- 不新增“导出”需求，不修改 V1.2 PRD。
+
+## 3. 明确排除
+
+- 无代码、测试、构建配置和 PRD 修改；不做 GUI↔Java 连接；不新增导出；不实施 Nuitka/交付目录/外部验收；不进入 HTTP/FastAPI/gRPC/数据库/Go。
