@@ -30,7 +30,7 @@
 - TASK-012 文档收口：CLOSED（FINAL RE-REVIEW PASSED；随本提交归档）；
 - Windows 10 实机验收：PENDING-EXTERNAL；
 - 首次使用者两分钟验收：PENDING-EXTERNAL；
-- Git：本项目独立 worktree 已建立基线提交（b045d19、8ffdc47），尚未推送远端。
+- Git：本项目已推送 GitHub 并合并至 main（TASK-012 提交 6ebd2ec；PR #13；合并提交 1d54d13）。
 
 ## 外部验收边界
 

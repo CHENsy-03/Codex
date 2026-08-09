@@ -28,7 +28,7 @@ E:\AI_Projects\Codex\ 是你所有项目的根目录。
 
 | 特性 | 说明 |
 |---|---|
-| 多项目 | 9 个在研项目统一管理 |
+| 多项目 | 10 个在研项目统一管理 |
 | 统一规范 | AGENTS.md 约束所有项目 |
 | 统一架构 | Python + Go 双语言 |
 | AI 协作 | GPT / Codex / DeepSeek 分工明确 |
@@ -58,6 +58,7 @@ Codex/
 │   ├── chaincode-drone/        无人机区块链
 │   ├── exam-system/            考试系统（Python+Go）
 │   ├── crawler/                采集平台
+│   ├── drone-range-simulation/   无人机二维航程计算样品
 │   ├── drone-survey-server/    无人机勘测服务器
 │   ├── gps-simulator/          GPS 定位模拟
 │   ├── frontend-design/        前端网页设计
