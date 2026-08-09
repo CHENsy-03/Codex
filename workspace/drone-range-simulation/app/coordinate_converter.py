@@ -51,6 +51,9 @@ class CoordinateConverter:
             self._transformer = Transformer.from_crs(
                 self._crs, "EPSG:4326", always_xy=True
             )
+            self._inverse_transformer = Transformer.from_crs(
+                "EPSG:4326", self._crs, always_xy=True
+            )
         except Exception as exc:
             raise CoordinateConversionError(
                 "无法建立坐标转换：源 CRS 无效。"
@@ -119,3 +122,41 @@ class CoordinateConverter:
             longitude=float(longitude),
             latitude=float(latitude),
         )
+    def wgs84_to_map(self, longitude: float, latitude: float) -> tuple[float, float]:
+        """WGS84 经纬度 → 当前地图 CRS 地图坐标（always_xy=True）。"""
+        if not (math.isfinite(longitude) and math.isfinite(latitude)):
+            raise CoordinateConversionError("点位经纬度无效（非有限数值）。")
+        if not (-180.0 <= longitude <= 180.0):
+            raise CoordinateConversionError("经度超出有效范围 [-180, 180]。")
+        if not (-90.0 <= latitude <= 90.0):
+            raise CoordinateConversionError("纬度超出有效范围 [-90, 90]。")
+        try:
+            map_x, map_y = self._inverse_transformer.transform(
+                longitude, latitude, errcheck=True
+            )
+        except Exception as exc:
+            raise CoordinateConversionError(
+                "WGS84 坐标转换到地图 CRS 失败，请重新选择或更换地图。"
+            ) from exc
+        if not (math.isfinite(map_x) and math.isfinite(map_y)):
+            raise CoordinateConversionError("地图坐标转换结果不是有限数值。")
+        return float(map_x), float(map_y)
+
+    def map_to_pixel(self, map_x: float, map_y: float) -> tuple[float, float]:
+        """地图坐标 → 连续零基 column/row（逆仿射，不取整、不自动增加 0.5）。"""
+        if not (math.isfinite(map_x) and math.isfinite(map_y)):
+            raise CoordinateConversionError("地图坐标无效（非有限数值）。")
+        try:
+            col, row = ~self._transform * (map_x, map_y)
+        except Exception as exc:
+            raise CoordinateConversionError(
+                "地图坐标转换到像素坐标失败。"
+            ) from exc
+        if not (math.isfinite(col) and math.isfinite(row)):
+            raise CoordinateConversionError("像素坐标转换结果不是有限数值。")
+        return float(col), float(row)
+
+    def wgs84_to_pixel(self, longitude: float, latitude: float) -> tuple[float, float]:
+        """WGS84 经纬度 → 连续零基 column/row（先转地图 CRS，再逆仿射）。"""
+        map_x, map_y = self.wgs84_to_map(longitude, latitude)
+        return self.map_to_pixel(map_x, map_y)

@@ -33,6 +33,18 @@ class GeoTiffLoadError(Exception):
     """地图数据加载失败；message 为可直接展示给用户的中文错误。"""
 
 
+class GeoTiffOpenError(GeoTiffLoadError):
+    """文件存在但无法打开、不是有效 GeoTIFF 或尺寸/波段/范围非法。"""
+
+
+class GeoTiffCrsMissingError(GeoTiffLoadError):
+    """GeoTIFF 缺少有效坐标参考系（CRS）。"""
+
+
+class GeoTiffTransformInvalidError(GeoTiffLoadError):
+    """GeoTIFF 仿射变换缺失、非有限或不可逆。"""
+
+
 @dataclasses.dataclass(frozen=True)
 class GeoTiffPreview:
     """一次成功加载的地图数据结果。
@@ -308,3 +320,77 @@ def _band_to_uint8(band: np.ndarray) -> np.ndarray:
     out = np.zeros(arr.shape, dtype=np.uint8)
     out[valid] = np.clip(scaled[valid], 0, 255).astype(np.uint8)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# 无 GUI 元数据读取（TASK-007）
+# --------------------------------------------------------------------------- #
+@dataclasses.dataclass(frozen=True)
+class GeoTiffMetadata:
+    """无 GUI 计算核心使用的 GeoTIFF 元数据（不含预览像素）。"""
+
+    external_path: Path
+    source_width: int
+    source_height: int
+    band_count: int
+    dtype: str
+    crs: CRS
+    crs_string: str
+    transform: Affine
+    bounds: BoundingBox
+
+
+def load_geotiff_metadata(path: str | Path) -> GeoTiffMetadata:
+    """仅读取并校验直接 GeoTIFF（.tif/.tiff）元数据，不生成预览。
+
+    TASK-007：供无 GUI 计算核心使用；不处理 ZIP（ZIP 由 Java 解压）。
+    校验项：文件存在、扩展名、CRS、完整六参数仿射变换、宽高、波段数与范围。
+    """
+    input_path = Path(path)
+    if not input_path.exists() or not input_path.is_file():
+        raise GeoTiffLoadError(f"文件不存在：{input_path.name}")
+    ext = input_path.suffix.lower()
+    if ext not in SUPPORTED_TIFF_EXTENSIONS:
+        raise GeoTiffOpenError("仅支持直接 GeoTIFF（.tif/.tiff）文件。")
+    try:
+        with rasterio.open(input_path) as ds:
+            width, height = ds.width, ds.height
+            if width <= 0 or height <= 0:
+                raise GeoTiffOpenError("地图影像尺寸无效。")
+            if ds.crs is None:
+                raise GeoTiffCrsMissingError(
+                    "无法计算：该 GeoTIFF 未包含有效坐标参考系。"
+                )
+            transform = ds.transform
+            if not _is_valid_transform(transform):
+                raise GeoTiffTransformInvalidError(
+                    "无法计算：地图缺少有效地理变换信息。"
+                )
+            bounds = ds.bounds
+            if not all(math.isfinite(float(v)) for v in bounds):
+                raise GeoTiffOpenError("地图地理范围无效。")
+
+            band_count = ds.count
+            if band_count not in (1, 3, 4):
+                raise GeoTiffOpenError(
+                    "当前影像波段组合暂不支持（仅支持 1/3/4 波段）。"
+                )
+            dtype = ds.dtypes[0] if ds.dtypes else "unknown"
+
+            return GeoTiffMetadata(
+                external_path=input_path,
+                source_width=width,
+                source_height=height,
+                band_count=band_count,
+                dtype=dtype,
+                crs=ds.crs,
+                crs_string=_crs_display_string(ds.crs),
+                transform=transform,
+                bounds=bounds,
+            )
+    except GeoTiffLoadError:
+        raise
+    except Exception as exc:
+        raise GeoTiffOpenError(
+            "无法读取地图数据，请选择有效的 .tif 或 .tiff 文件。"
+        ) from exc

@@ -28,7 +28,7 @@
 - Windows 10 实机验收：PENDING-EXTERNAL；
 - 首次使用者两分钟验收：PENDING-EXTERNAL；
 - TASK-008 整体实施：IN PROGRESS；
-- Git：TASK-008 文档收口时尚未提交；当前入库状态以本仓库 Git 历史为准。
+- Git：尚未提交。
 
 ## 外部验收边界
 

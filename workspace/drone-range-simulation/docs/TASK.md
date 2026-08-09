@@ -834,3 +834,381 @@ TASK-008 文档验收全部通过后，状态写为：
 TASK-008：PASS，文档与验收记录已收口；Windows 10 和首次使用者两分钟验收仍为 PENDING-EXTERNAL，尚未提交。
 
 在实际完成上述文档工作以前，不得提前写成 PASS。
+
+
+# TASK-007：无 GUI 计算核心抽取与基线验证
+
+## 1. 任务基本信息
+
+- 状态：COMPLETED（本轮实施完成，未提交 Git）
+- 类型：代码抽取 + 测试 + 文档记录
+- 冻结基线：《无人机二维航程计算引擎_Java21常驻子进程集成技术设计 V1.0 冻结版》第 10.1 节第一项、《无人机二维航程计算样品_产品需求文档 V1.2 业务规则冻结》
+- 工作目录：workspace/drone-range-simulation
+
+## 2. 任务范围
+
+- 新增 `app/geotiff_loader.py` 中的 `GeoTiffMetadata` 与 `load_geotiff_metadata()`：仅读取并校验直接 GeoTIFF 元数据，不生成预览、不处理 ZIP；
+- 新增 `app/headless_core.py`：无 GUI 门面（`HeadlessMap`、`load_map`、`geotiff_to_wgs84`），复用现有四个计算模块的唯一实现；
+- 新增 `tests/test_headless_core.py`：8 项无 GUI 核心测试；
+- 更新 `docs/TASK.md` 与 `docs/CHANGELOG.md`。
+
+## 3. 明确不做（本任务）
+
+- 不创建 worker_main.py；
+- 不实现 stdin/stdout 或 NDJSON；
+- 不实现 hello、load_map、calculate、shutdown 操作；
+- 不实现协议状态机或冻结错误码映射；
+- 不编写 Java 示例；
+- 不安装或配置 Nuitka；
+- 不构建 Windows/Linux 软件包；
+- 不创建 delivery 交付目录。
+
+## 4. 关键实现规则
+
+- 复用现有唯一实现：`CoordinateConverter`（always_xy=True）、`pyproj.Geod(ellps="WGS84").inv`、`flight_time_calculator` 的 `parse_speed_m_s`/`calculate_flight_time`；
+- 像素坐标为零基连续 column/row，不取整、不自动增加 0.5；
+- 只处理直接 GeoTIFF（.tif/.tiff）路径，ZIP 由 Java 解压；
+- 无全局可变状态，不连接数据库，不联网，不写业务数据。
+
+## 5. 验收项
+
+- 无 QApplication、无窗口时可导入和调用核心（子进程验证）；
+- 导入无 GUI 核心不会间接导入 PySide6（子进程验证）；
+- 合法临时 GeoTIFF 元数据正确（CRS、尺寸、波段、transform）；
+- 完整链路：GeoTIFF → A/B 连续像素坐标 → WGS84 → 距离 → 飞行时间；
+- 结果与独立 pyproj.Geod 基准一致；
+- 不增加 0.5、不交换 column/row、不交换 longitude/latitude；
+- 原有 GUI 与 TASK-001—TASK-006 测试继续通过。
+
+## 6. 执行结果
+
+- 修改前基线完整测试：169 passed, 1 warning；
+- 新增定向测试 tests/test_headless_core.py：8 passed；
+- 修改后完整测试：177 passed, 1 warning（警告为既有 rasterio NotGeoreferencedWarning，未新增）；
+- python -m compileall main.py app tests：通过；
+- git diff --check：通过（项目未进入 Git 索引，以文件清单与哈希快照补足）；
+- 未执行 worker_main.py、NDJSON、Java、Nuitka、Git 提交。
+
+## 7. 遗留问题
+
+- 无阻断项；项目整体仍未进入 Git 索引，所有改动未提交。
+
+
+# TASK-008：常驻 Worker 入口与严格 NDJSON 传输循环
+
+## 1. 任务基本信息
+
+- 状态：COMPLETED（本轮实施完成，未提交 Git）
+- 类型：代码新增 + 测试 + 文档记录
+- 冻结基线：《无人机二维航程计算引擎_Java21常驻子进程集成技术设计 V1.0 冻结版》第 10.1 节第 2 项、《无人机二维航程计算样品_产品需求文档 V1.2 业务规则冻结》
+- 前置任务：TASK-007（无 GUI 计算核心抽取与基线验证，基线 177 passed, 1 warning）
+- 工作目录：workspace/drone-range-simulation
+
+## 2. 任务范围
+
+- 新增 `app/worker_protocol.py`：协议常量、请求校验、响应构造与严格串行 NDJSON 循环（`run_worker`/`main`）；
+- 新增 `worker_main.py`：极薄进程入口，仅导入并执行 `app.worker_protocol.main`；
+- 新增 `tests/test_worker_protocol.py`：37 项纯函数与真实子进程测试；
+- 更新 `docs/TASK.md` 与 `docs/CHANGELOG.md`。
+
+## 3. 明确不做（本任务）
+
+- 不实现 load_map 成功逻辑、calculate 成功逻辑、地图缓存或地图状态机；
+- 不实现 WGS84/map_crs/pixel JSON 坐标解析、点位范围校验、速度解析、距离或飞行时间协议响应；
+- 不实现 READY 与 MAP_LOADED 完整状态切换或原子地图替换；
+- 不编写 Java ProcessBuilderDemo.java、不生成 requests.ndjson/responses.ndjson 外发示例；
+- 不安装或配置 Nuitka、不构建 Windows/Linux 软件包、不创建 delivery 目录；
+- 不连接数据库、不开放 HTTP/gRPC/WebSocket；
+- 不新增第三方依赖。
+
+## 4. 协议实现
+
+- 通道：stdin 请求 / stdout 协议响应 / stderr 日志；UTF-8；每行一个 JSON 对象；响应以 LF 结束并立即 flush；使用二进制流 `sys.stdin.buffer/stdout.buffer/stderr.buffer`。
+- 常量：`PROTOCOL_VERSION = 1`、`ENGINE_VERSION = "1.0.0"`。
+- 通用请求字段：id（非空字符串）、protocolVersion（JSON 整数 1，拒绝 bool/浮点/字符串/非 1）、operation（字符串）。
+- hello：`{"protocolVersion":1,"engineVersion":"1.0.0","state":"READY","coordinateTypes":["wgs84","map_crs","pixel"]}`；可重复调用，id 回显。
+- shutdown：`{"state":"TERMINATING"}`；先写响应并 flush，再结束循环，进程以退出码 0 退出；响应后不再处理后续输入。
+- 传输层错误码（仅本阶段）：E_PROTOCOL_INVALID_JSON、E_PROTOCOL_VERSION、E_OPERATION_UNKNOWN、E_REQUEST_INVALID、E_INTERNAL。
+- 无效请求不导致退出，返回错误后可继续处理下一条合法请求；stdin EOF 以 0 退出且 stdout 无额外输出；stdout 管道关闭时安全退出。
+- JSON 输出：ensure_ascii=False、allow_nan=False、紧凑单行、无 BOM、无多行格式化。
+
+## 5. 验收项
+
+- 导入 worker_main / app.worker_protocol 不导入 PySide6、不创建 QApplication/窗口；
+- 真实子进程 hello 立即返回单行响应（flush 生效）；
+- 同一子进程连续 hello 不重启、不串线、每请求仅一个响应；
+- 非法 JSON、空行、顶层数组/null/数字/字符串、NaN、Infinity、非法 UTF-8 → E_PROTOCOL_INVALID_JSON；
+- 缺失或非法 id → E_REQUEST_INVALID（id=null）；
+- protocolVersion 为 2、1.0、true、"1" → E_PROTOCOL_VERSION；
+- 未知 operation → E_OPERATION_UNKNOWN；
+- stdout 每行均为协议 JSON，无日志、提示、BOM、空白行或 traceback；
+- shutdown 先返回 TERMINATING，退出码 0；stdin EOF 退出码 0 且无额外响应；
+- 错误响应仅含 id/success/error，成功响应仅含 id/success/data。
+
+## 6. 执行结果
+
+- 修改前基线完整测试：177 passed, 1 warning；
+- 定向测试 tests/test_worker_protocol.py：37 passed；
+- TASK-007 与 TASK-008 联合定向：45 passed；
+- 修改后完整测试：214 passed, 1 warning（警告为既有 rasterio NotGeoreferencedWarning，未新增）；
+- python -m compileall -q main.py worker_main.py app tests：通过；
+- git diff --check：仓库级仅命中 crawler/全部代码.txt 的既有无关问题；项目未进入 Git 索引，以文件清单与 SHA256 快照补足；
+- 未实现 load_map、calculate、完整状态机、Java 示例、Nuitka、交付目录；未提交 Git。
+
+## 7. 遗留问题
+
+- 无阻断项；load_map/calculate 等业务操作将在 TASK-009 接入；
+- 项目整体仍未进入 Git 索引，所有改动未提交。
+
+
+# TASK-009：状态机、原子 load_map、三类坐标与完整 calculate 协议
+
+## 1. 任务基本信息
+
+- 状态：COMPLETED（本轮实施完成，未提交 Git）
+- 类型：代码新增 + 协议扩展 + 测试 + 文档记录
+- 冻结基线：《无人机二维航程计算引擎_Java21常驻子进程集成技术设计 V1.0 冻结版》第 10.1 节第 3 项、《无人机二维航程计算样品_产品需求文档 V1.2 业务规则冻结》
+- 前置任务：TASK-007（无 GUI 计算核心）、TASK-008（NDJSON 传输循环），基线 214 passed, 1 warning
+- 工作目录：workspace/drone-range-simulation
+
+## 2. 任务范围
+
+- 新增 `app/worker_engine.py`：WorkerEngine（状态机、原子 load_map、hello/calculate/shutdown、操作级字段校验与冻结错误映射）；
+- 新增 `tests/test_worker_engine.py`：49 项状态机/地图/原子替换/坐标/计算/子进程测试；
+- 修改 `app/worker_protocol.py`：接入 WorkerEngine 分发，新增 12 个地图/坐标/计算错误码；
+- 最小修改 `app/geotiff_loader.py`（稳定异常分类：GeoTiffOpenError/GeoTiffCrsMissingError/GeoTiffTransformInvalidError）、`app/coordinate_converter.py`（逆方向转换 wgs84_to_map/map_to_pixel/wgs84_to_pixel）、`app/headless_core.py`（wgs84_to_pixel/map_crs_to_pixel）；
+- 更新 `docs/TASK.md` 与 `docs/CHANGELOG.md`。
+
+## 3. 明确不做（本任务）
+
+- 不处理 ZIP、不生成地图预览、不创建 QApplication、不启动 GUI/HTTP/gRPC/WebSocket/数据库；
+- 不使用线程池、asyncio 或多进程处理请求，不实现多地图并发；
+- 不缓存 A/B 或计算结果；不新增第三方依赖；
+- 不编写 Java ProcessBuilderDemo.java、不生成 requests.ndjson/responses.ndjson、不安装或配置 Nuitka、不构建软件目录、不创建 delivery 目录；
+- 不修改 V1.0 冻结设计或 V1.2 PRD；不提交 Git。
+
+## 4. 实现要点
+
+- 状态机：READY / MAP_LOADED / TERMINATING；启动 READY；calculate 在无地图时返回 E_MAP_NOT_LOADED；load_map 成功进入/保持 MAP_LOADED，失败原子保留旧状态；shutdown 返回 TERMINATING 后释放地图并以 0 退出。
+- hello：state 动态返回 READY 或 MAP_LOADED；字段固定为 protocolVersion/engineVersion/state/coordinateTypes。
+- load_map：path 非空字符串且为绝对路径，否则 E_REQUEST_INVALID；不存在/非普通文件/不可读 → E_MAP_NOT_FOUND；损坏/伪 TIFF/ZIP/非 TIFF → E_MAP_OPEN_FAILED；无 CRS → E_MAP_CRS_MISSING；仿射缺失/非有限/不可逆 → E_MAP_TRANSFORM_INVALID；候选地图全部校验成功后一次性替换 current_map；成功响应仅含 state/crs/width/height/bands，crs 为 EPSG 或规范化 WKT2。
+- 三类坐标：wgs84（lon/lat，[-180,180]/[-90,90]，响应保留原始值）、map_crs（x/y，逆仿射转 pixel 并范围校验）、pixel（零基连续 col/row，半开区间，不加 0.5、不交换）；统一经正向链路归一化为 WGS84。
+- calculate：无地图优先 E_MAP_NOT_LOADED；pointA/pointB/speedMps 缺失 → E_REQUEST_INVALID；类型/字段/范围错误 → E_POINT_TYPE/E_POINT_INVALID/E_POINT_OUT_OF_BOUNDS/E_CRS_TRANSFORM；速度仅接受 JSON 整数 1–99，否则 E_SPEED_INVALID；距离复用 pyproj.Geod WGS84 测地线；时间复用 TASK-007 唯一实现；roundedSeconds ≥ 360000 → E_TIME_LIMIT（不返回部分 data）；同一点返回 0/00:00:00；可分类失败 → E_CALCULATION。
+- 错误码：保留 TASK-008 五个传输错误码，新增 E_MAP_NOT_LOADED/E_MAP_NOT_FOUND/E_MAP_OPEN_FAILED/E_MAP_CRS_MISSING/E_MAP_TRANSFORM_INVALID/E_POINT_TYPE/E_POINT_INVALID/E_POINT_OUT_OF_BOUNDS/E_CRS_TRANSFORM/E_SPEED_INVALID/E_TIME_LIMIT/E_CALCULATION；E_INTERNAL 仅为最后保护；不按异常 message 匹配错误码。
+
+## 5. 验收项
+
+- 状态机、原子替换（失败保留旧地图与 MAP_LOADED）、切换后使用新地图；
+- 三类坐标及混合组合、旋转/剪切仿射、无 0.5/无交换断言；
+- 越界、类型、字段、CRS 转换失败映射；
+- 独立 pyproj.Geod 基准差异 ≤ 0.5 m；速度 1/99；同一点 0；359999 成功 / 360000 E_TIME_LIMIT；真实远距离 E_TIME_LIMIT；
+- 同一子进程 hello→load_map→多次 calculate→hello→shutdown；同一地图连续 100 次 calculate 顺序一致、不串线；
+- stdout 仅单行协议 JSON；stderr 无请求原文/路径/坐标/结果/traceback；
+- TASK-008 37 项、TASK-007 8 项、GUI 与 TASK-001—TASK-006 全部继续通过。
+
+## 6. 执行结果
+
+- 修改前基线完整测试：214 passed, 1 warning；
+- TASK-009 定向 tests/test_worker_engine.py：49 passed；
+- Worker 联合（protocol + engine）：86 passed；
+- 无 GUI 核心联合（headless + engine + protocol）：94 passed；
+- 修改后完整测试：263 passed, 1 warning（警告为既有 rasterio NotGeoreferencedWarning，未新增）；
+- python -m compileall -q main.py worker_main.py app tests：通过；
+- git diff --check：仓库级仅命中 crawler/全部代码.txt 的既有无关问题；项目未进入 Git 索引，以文件清单与 SHA256 快照补足；
+- 未实现 Java 示例、Nuitka、交付目录；未提交 Git。
+
+## 7. 遗留问题
+
+- 无阻断项；协议级验收矩阵与 V1.2 交叉基准归档属 TASK-010；
+- 项目整体仍未进入 Git 索引，所有改动未提交。
+
+
+# TASK-010：系统化协议验收矩阵与 V1.2 业务基准交叉验证
+
+## 1. 任务基本信息
+
+- 状态：COMPLETED（本轮实施完成，未提交 Git）
+- 类型：测试、审计、追踪与归档（不新增业务能力，不修改生产代码）
+- 冻结基线：《无人机二维航程计算样品_产品需求文档_V1.2_业务规则冻结》、《无人机二维航程计算引擎_Java21常驻子进程集成技术设计_V1.0_冻结版》
+- 前置任务：TASK-007 / TASK-008 / TASK-009，基线 263 passed, 1 warning
+- 工作目录：workspace/drone-range-simulation
+
+## 2. 实际新增文件
+
+- `tests/protocol_acceptance_helpers.py`：临时 GeoTIFF 生成、子进程安全读写清理、独立数学基准辅助、响应结构断言；
+- `tests/test_protocol_acceptance_matrix.py`：协议验收矩阵（TRN/ENV/STA/MAP/PNT/CAL/ERR/LIF，171 项）；
+- `tests/test_v12_cross_validation.py`：V1.2 独立交叉验证（V12-001..013，13 项）；
+- `docs/PROTOCOL_ACCEPTANCE_MATRIX.md`：184 个 Case ID 完整矩阵、错误码/状态/响应字段总表、stdout/stderr 审计、TASK-009 账目勘误；
+- `docs/V1_2_CROSS_VALIDATION.md`：V1.2 独立 oracle 方法与可复核数值；
+- 追加 `docs/TASK.md`、`docs/CHANGELOG.md`。
+
+## 3. 矩阵数量
+
+- Case ID 总数：184（TRN 19、ENV 11、STA 13、MAP 28、PNT 46、CAL 32、ERR 18、LIF 4、V12 13）；
+- 17 个冻结错误码全部经公共协议入口触发；
+- READY/MAP_LOADED/TERMINATING 状态转换全覆盖；
+- 真实子进程完整序列 + 连续 100 次 calculate 通过。
+
+## 4. V1.2 基准数量
+
+- V12-001..013 共 13 项；每项比较独立 oracle / WorkerEngine / NDJSON 三条链，条件允许时增加既有领域函数第四条链；
+- 独立期望值与实际值距离绝对误差为 0 m（远小于 ≤0.5 m 冻结阈值）；
+- 359999 秒成功（99:59:59）、360000 秒 E_TIME_LIMIT、真实远距离 E_TIME_LIMIT 均通过。
+
+## 5. 测试结果
+
+- 修改前基线：263 passed, 1 warning；
+- TASK-007~009 联合回归：94 passed；
+- 协议矩阵：171 passed；V12 交叉验证：13 passed；TASK-010 联合：184 passed；
+- Worker 全部相关（headless+protocol+engine+matrix+V12）：278 passed；
+- 完整测试：447 passed, 1 warning（仅既有 rasterio NotGeoreferencedWarning，无新增；无 skip、无 xfail）；
+- compileall：通过；git diff --check：仓库级仅命中 crawler/全部代码.txt 的既有无关问题（未修改 crawler）。
+
+## 6. TASK-009 账目勘误
+
+TASK-009 回执第 14 节文字误将 app/headless_core.py、app/worker_protocol.py 列入“28 个未修改文件”。
+经 TASK-009 修改前后快照重新核验：修改前 34 项；修改 6 项（geotiff_loader、coordinate_converter、headless_core、worker_protocol、TASK.md、CHANGELOG.md）；新增 2 项（worker_engine.py、test_worker_engine.py）；未修改 28 项；完成后 36 项；用户文档哈希未变。
+该勘误仅涉及回执文字，实际变更集合与正确账目一致；未改写 docs/TASK.md 与 docs/CHANGELOG.md 中 TASK-009 原始记录。
+
+## 7. 明确未进入阶段
+
+- 未进入 Java 示例、Nuitka 构建或交付包阶段；
+- 未修改任何生产代码、现有测试、冻结文档或使用手册；
+- 未执行 Git add、commit、push。
+
+
+# TASK-010 验收补正 R1
+
+## 1. 任务基本信息
+
+- 状态：COMPLETED（本轮补正完成，未提交 Git）
+- 类型：测试、文档与账目补正（不修改任何生产代码）
+- 环境变化：用户已更新 Python，.venv 当前为 Python 3.14.7；既有 263 项基线在 3.14.7 下仍为 263 passed, 1 warning
+- 工作目录：workspace/drone-range-simulation
+
+## 2. Case ID 数量矛盾核清
+
+- 补正前实际测试编号：PNT 46（缺口 PNT-028/029/033/041）、CAL 32（缺口 024/026/027，且 025/026/027 曾合并为一个测试）、MAP 28、LIF 4（编号 001/005/006/011 不连续）；
+- 原回执“PNT-001..044 共 44 项 + PNT-045..050 共 6 项 = 50 项”与分类统计“PNT 46”的矛盾原因：实际只写了 46 个测试且存在 4 个编号缺口，并非存在 50 项；
+- 补正方式：按冻结覆盖补齐缺失用例并重编号，不删除测试、不合并覆盖、不凑数；
+- 补正后：TRN 19、ENV 11、STA 13、MAP 33、PNT 50、CAL 35、ERR 18、LIF 4、V12 13，总计 **196**，全部连续唯一。
+
+## 3. CRS 存在但转换器建立失败
+
+- 新增 MAP-032（READY）与 MAP-033（MAP_LOADED 原子保留）：临时 GeoTIFF 自身 CRS 合法（EPSG:3857），仅在 `CoordinateConverter` 建立边界注入确定性异常（monkeypatch `app.headless_core.CoordinateConverter` 构造抛 CoordinateConversionError）；
+- 断言：E_MAP_CRS_MISSING、固定 message、无 data/路径/异常原文/traceback、READY 失败后仍 READY、已加载地图 A 时失败后仍 MAP_LOADED 且 calculate 结果与失败前一致、Worker 可继续处理下一条合法请求；
+- 未直接 monkeypatch 错误码映射，未让 load_map 直接返回错误码。
+
+## 4. 非有限仿射经真实生产校验器
+
+- 使用 rasterio 以 r+ 模式向真实临时 GeoTIFF 写入 NaN / +Infinity / −Infinity 仿射参数并持久化；
+- 生产 `_is_valid_transform` 直接接收非有限参数并拒绝（未替换、未绕过该校验器）；
+- MAP-017（NaN）、MAP-018（+Infinity）、MAP-019（−Infinity）→ E_MAP_TRANSFORM_INVALID，固定 message、无泄漏、READY 保持；MAP-020 验证已加载地图 A 时原子保留；
+- 原“monkeypatch _is_valid_transform 返回 False”的弱测试已移除。
+
+## 5. 文档哈希与 V1.2 误差表述
+
+- 统一为“3 份逻辑文档；4 个物理文件”，4 个物理文件修改前后大小与 SHA256 完全一致（V1.2 PRD `8294…`、V1.0 冻结设计 `460C…`、使用手册 DOCX `F284…`、PDF `63F3…`）；
+- V1.2 最大误差表述纠正：参与“返回距离最大误差”统计的用例为 V12-001..010、V12-013 共 11 项，最大绝对误差 0 m；V12-011/012 为 E_TIME_LIMIT 失败边界（无 data），分别记录 oracle 距离/roundedSeconds 与两条协议实际错误码，不纳入距离误差统计。
+
+## 6. 补正结果
+
+- 修改前基线（排除 TASK-010 新测试）：263 passed, 1 warning；
+- TASK-007~009 联合回归：94 passed；
+- 协议矩阵：183 passed；V12：13 passed；TASK-010 联合：196 passed；
+- 完整测试：459 passed, 1 warning（仅既有 rasterio NotGeoreferencedWarning，无新增；无 skip、无 xfail）；
+- compileall：通过；文档归档后完整测试仍为 459 passed, 1 warning；
+- 未修改生产代码、未修改 TASK-010 之前已有测试、未修改冻结文档/使用手册；
+- 未执行 Git add、commit、push。
+
+
+# TASK-010 验收补正 R1-A：Case ID 稳定性修复
+
+## 1. 任务基本信息
+
+- 状态：COMPLETED（本轮修复完成，未提交 Git）
+- 类型：测试标识与归档追溯关系修复（不修改生产代码、不改变任何测试断言/输入/预期结果/覆盖范围）
+- 原则：Case ID 是稳定审计标识，**不要求连续，稳定语义优先**；编号空档合法
+- 工作目录：workspace/drone-range-simulation
+
+## 2. MAP 编号修复
+
+恢复 MAP-001..028 在 TASK-010 原报告中的原有语义；新增用例改为 MAP-029..033：
+
+| 旧 ID（R1 阶段） | 最终 ID | 语义 | 说明 |
+| --- | --- | --- | --- |
+| MAP-018（+Infinity） | MAP-029 | +Infinity 仿射 → E_MAP_TRANSFORM_INVALID | 新增 |
+| MAP-019（−Infinity） | MAP-030 | −Infinity 仿射 → E_MAP_TRANSFORM_INVALID | 新增 |
+| MAP-020（非有限原子保留） | MAP-031 | 已加载 A 时非有限 B 失败且原子保留 A | 新增 |
+| MAP-021（非法波段） | MAP-018 | 非法波段 → E_MAP_OPEN_FAILED | 恢复原语义 |
+| MAP-022（EPSG CRS） | MAP-019 | EPSG CRS 输出 | 恢复原语义 |
+| MAP-023（WKT2） | MAP-020 | 无 EPSG 返回规范化 WKT2 | 恢复原语义 |
+| MAP-024（无 preview） | MAP-021 | 不生成 preview | 恢复原语义 |
+| MAP-025（无 QApplication） | MAP-022 | 不创建 QApplication | 恢复原语义 |
+| MAP-026（无 PySide6） | MAP-023 | 导入链无 PySide6 | 恢复原语义 |
+| MAP-027（data 键集合） | MAP-024 | 成功 data 键集合精确 | 恢复原语义 |
+| MAP-028（原子失败保留） | MAP-025 | 失败加载保留旧地图与结果 | 恢复原语义 |
+| MAP-029（原子切换） | MAP-026 | 成功切换使用新地图 | 恢复原语义 |
+| MAP-030（多次失败保持） | MAP-027 | 多次失败不降级 | 恢复原语义 |
+| MAP-031（释放无异常） | MAP-028 | 替换/释放旧地图无异常 | 恢复原语义 |
+| MAP-032 | MAP-032 | CRS 存在但转换器建立失败，READY 保持 | 保持不变 |
+| MAP-033 | MAP-033 | CRS 存在但转换器建立失败，MAP_LOADED 原子保留 | 保持不变 |
+
+MAP-017 保持“非有限仿射参数”语义（现以真实 NaN GeoTIFF 验证）。最终 MAP 集合：MAP-001..033。
+
+## 3. LIF 编号修复
+
+恢复既有稳定 ID：**LIF-001、LIF-005、LIF-006、LIF-011**（编号存在空档合法，不要求连续）。
+
+## 4. CAL 核账（32 → 35）
+
+| R1 前 Case ID | R1 后最终 ID | 测试语义 | 是否既有 | 是否新增/拆分 | 既有 ID 含义是否变化 |
+| --- | --- | --- | --- | --- | --- |
+| CAL-001..023 | CAL-001..023 | 速度/距离/时间/响应既有用例 | 是 | 否 | 否 |
+| CAL-024（空缺） | CAL-024 | 独立 Geod 基准差异 ≤0.5 m | 否 | 新增 | 不适用 |
+| CAL-025（合并时间公式） | CAL-025 | exact/rounded/duration 三个时间公式（合并） | 是 | 否（恢复原合并语义） | 否 |
+| CAL-026（空缺） | CAL-026 | roundedSeconds=ceil(exactSeconds)（拆分自 CAL-025） | 否 | 拆分新增 | 不适用 |
+| CAL-027（空缺） | CAL-027 | duration 由同一 roundedSeconds 经 divmod 生成（拆分自 CAL-025） | 否 | 拆分新增 | 不适用 |
+| CAL-028..035 | CAL-028..035 | 边界与响应既有用例 | 是 | 否 | 否 |
+
+## 5. PNT
+
+PNT-028、029、033、041 原为空缺，本轮补入冻结规则用例可保留，无需改动；PNT 最终为 PNT-001..050。
+
+## 6. 验证结果
+
+- collect-only：196 个 nodeid，全部唯一、无 NOID；TRN 19、ENV 11、STA 13、MAP 33、PNT 50、CAL 35、ERR 18、LIF 4、V12 13；
+- 协议矩阵 183 passed；V12 13 passed；联合 196 passed；TASK-007~009 回归 94 passed；compileall 通过；完整测试 459 passed, 1 warning（既有，无新增；0 skip、0 xfail）；
+- 修改文件：tests/test_protocol_acceptance_matrix.py、docs/PROTOCOL_ACCEPTANCE_MATRIX.md、docs/TASK.md、docs/CHANGELOG.md；
+- 未修改生产代码、V12 测试、共享辅助、既有测试逻辑、冻结文档或目标项目外文件；
+- 未执行 Git add、commit、push。
+
+
+# TASK-010 正式验收关闭与 Git 基线固化
+
+- 日期：2026-08-09
+- TASK-010 状态：CLOSED / 正式验收通过。
+- 协议矩阵：183 passed；V1.2 交叉验证：13 passed；TASK-010 联合：196 passed。
+- 全量测试：459 passed，1 条既有 rasterio NotGeoreferencedWarning；skip=0，xfail=0。
+- collect-only：196，全部唯一，无 NOID。
+- MAP-001..028 已恢复历史语义；新增 MAP-029..033。
+- PNT-001..050；CAL 共 35 项；LIF 最终 ID：001、005、006、011。
+- Case ID 允许存在空档，以历史语义稳定为优先。
+- 未发现生产缺陷；TASK-010 的 R1/R1-A 验收补正未修改生产代码。
+- 本 Git 提交只是固化此前已完成并验收的 TASK-007..010 内容，不新增生产逻辑。
+- 下一阶段为 TASK-011 Java 21 ProcessBuilder 集成，但本次尚未开始。
+## 空白规范化补充说明（TASK-010-GIT-BASELINE-CONTINUE）
+
+- 日期：2026-08-09；
+- 为满足 Git whitespace 质量门槛，仅在独立基线 worktree 删除 3 个文件末尾各 1 个冗余 LF：
+  - app/coordinate_converter.py
+  - app/headless_core.py
+  - tests/test_protocol_acceptance_matrix.py
+- 未修改任何逻辑、断言或运行行为；
+- 正式源项目保持只读且哈希未变；
+- 最终目标与源项目的关系调整为：
+  - 36 项逐字节一致；
+  - 3 项仅删除末尾 1 个冗余 LF；
+  - 2 项文档仅有末尾追加；
+- 本处理不改变 TASK-010 已正式验收通过的结论；
+- TASK-011 尚未开始。
