@@ -39,3 +39,8 @@ go-server*.log
 # One-time fix/generation scripts
 _fix*.py
 _gen*.py
+# TASK-014 local build storage and sealed evidence
+/archive/drone-task-014-evidence/
+/archive/drone-task-014-builds/
+/archive/drone-task-014-migration/
+/drone-task-014-toolchain/

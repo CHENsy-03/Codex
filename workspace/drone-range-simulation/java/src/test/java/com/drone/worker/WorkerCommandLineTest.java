@@ -64,4 +64,52 @@ class WorkerCommandLineTest {
         assertThrows(UnsupportedOperationException.class, () -> cl.environment().put("x", "y"));
         assertEquals("V", cl.environment().get("K"));
     }
+    @Test
+    void standaloneFactoryUsesSingleExecutableCommandAndCwd() {
+        Path exe = Path.of("C:/Tools/drone-range-worker.exe");
+        Path workDir = Path.of("D:/软件 目录/worker");
+        WorkerCommandLine cl = WorkerCommandLine.forStandaloneWorker(exe, workDir);
+
+        assertEquals(1, cl.command().size());
+        assertEquals(exe.toString(), cl.command().get(0));
+        assertEquals(workDir.toAbsolutePath().normalize(), cl.workingDirectory());
+        assertTrue(cl.environment().isEmpty(), "standalone 工厂不得设置 Python 解释器专用环境变量");
+    }
+
+    @Test
+    void standaloneFactoryRejectsRelativeExecutable() {
+        assertThrows(IllegalArgumentException.class,
+                () -> WorkerCommandLine.forStandaloneWorker(Path.of("drone-range-worker.exe"),
+                        Path.of("C:/work")));
+    }
+
+    @Test
+    void standaloneFactoryRejectsRelativeWorkingDirectory() {
+        assertThrows(IllegalArgumentException.class,
+                () -> WorkerCommandLine.forStandaloneWorker(Path.of("C:/drone-range-worker.exe"),
+                        Path.of("work")));
+    }
+
+    @Test
+    void standaloneFactoryRejectsNullExecutable() {
+        assertThrows(NullPointerException.class,
+                () -> WorkerCommandLine.forStandaloneWorker(null, Path.of("C:/work")));
+    }
+
+    @Test
+    void standaloneFactoryRejectsNullWorkingDirectory() {
+        assertThrows(NullPointerException.class,
+                () -> WorkerCommandLine.forStandaloneWorker(Path.of("C:/drone-range-worker.exe"), null));
+    }
+
+    @Test
+    void pythonFactoryKeepsUtf8EnvironmentRegression() {
+        WorkerCommandLine cl = WorkerCommandLine.forPythonWorker(
+                Path.of("C:/Python 3.14/python.exe"), Path.of("C:/proj"));
+
+        assertEquals(2, cl.environment().size());
+        assertEquals("1", cl.environment().get("PYTHONUTF8"));
+        assertEquals("utf-8", cl.environment().get("PYTHONIOENCODING"));
+        assertEquals(3, cl.command().size());
+    }
 }
