@@ -33,6 +33,8 @@ class DroneWorkerClientProcessTest {
 
     private static final String PYTHON = System.getProperty("drone.python.executable");
 
+    private static final String STANDALONE = System.getProperty("drone.worker.executable");
+
     private final List<Long> pids = new ArrayList<>();
 
     @TempDir
@@ -55,15 +57,7 @@ class DroneWorkerClientProcessTest {
 
     private DroneWorkerClient clientFor(Path script, WorkerTimeouts timeouts,
                                         Consumer<String> stderr, Map<String, String> extraEnv) {
-        java.util.Objects.requireNonNull(PYTHON, "缺少系统属性 drone.python.executable");
-        Map<String, String> env = new LinkedHashMap<>();
-        env.put("PYTHONUTF8", "1");
-        env.put("PYTHONIOENCODING", "utf-8");
-        if (extraEnv != null) {
-            env.putAll(extraEnv);
-        }
-        WorkerCommandLine cl = new WorkerCommandLine(
-                List.of(PYTHON, "-u", script.toString()), script.getParent(), env);
+        WorkerCommandLine cl = commandLineFor(script, extraEnv);
         return new DroneWorkerClient(cl, timeouts, stderr);
     }
 
@@ -81,6 +75,22 @@ class DroneWorkerClientProcessTest {
         return client;
     }
 
+    private WorkerCommandLine commandLineFor(Path script, Map<String, String> extraEnv) {
+        if (STANDALONE != null) {
+            // B3 对真实 standalone EXE 重跑同一组 12 项进程测试：
+            // 忽略 fixture 脚本与 Python 解释器专用环境变量。
+            return WorkerCommandLine.forStandaloneWorker(Path.of(STANDALONE), script.getParent());
+        }
+        java.util.Objects.requireNonNull(PYTHON, "缺少系统属性 drone.python.executable");
+        Map<String, String> env = new LinkedHashMap<>();
+        env.put("PYTHONUTF8", "1");
+        env.put("PYTHONIOENCODING", "utf-8");
+        if (extraEnv != null) {
+            env.putAll(extraEnv);
+        }
+        return new WorkerCommandLine(
+                List.of(PYTHON, "-u", script.toString()), script.getParent(), env);
+    }
     private static WorkerTimeouts normal() {
         return new WorkerTimeouts(Duration.ofSeconds(3), Duration.ofSeconds(5),
                 Duration.ofSeconds(5), Duration.ofSeconds(2), Duration.ofSeconds(1),
@@ -468,14 +478,7 @@ class DroneWorkerClientProcessTest {
     private WorkerProcessHandle handleFor(Path script, WorkerTimeouts timeouts, int capacity,
                                           Consumer<String> stderr, Map<String, String> extraEnv)
             throws Exception {
-        Map<String, String> env = new LinkedHashMap<>();
-        env.put("PYTHONUTF8", "1");
-        env.put("PYTHONIOENCODING", "utf-8");
-        if (extraEnv != null) {
-            env.putAll(extraEnv);
-        }
-        WorkerCommandLine cl = new WorkerCommandLine(
-                List.of(PYTHON, "-u", script.toString()), script.getParent(), env);
+        WorkerCommandLine cl = commandLineFor(script, extraEnv);
         return new WorkerProcessHandle(cl, stderr, capacity);
     }
 

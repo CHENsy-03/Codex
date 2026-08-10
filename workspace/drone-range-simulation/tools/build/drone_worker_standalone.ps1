@@ -25,11 +25,20 @@ param(
 
     [int]$BuildTimeoutMinutes = 60,
 
-    [string]$RunId
+    [string]$RunId,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('R5E-clean')]
+    [string]$PipControllerProfile
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# R5F: 固定 R5E-clean profile 门禁（大小写敏感；任何 RunId/构建副作用之前）
+if ($PipControllerProfile -cne 'R5E-clean') {
+    throw "FAILED: PipControllerProfile 必须严格等于 R5E-clean（收到: $PipControllerProfile）"
+}
 
 # ---------------------------------------------------------------------------
 # RunId 契约（R4B）：区分未提供与显式提供；纯函数，可被 AST 单独提取测试
@@ -52,6 +61,176 @@ function Resolve-RunId {
 }
 
 # ---------------------------------------------------------------------------
+# R5F: 固定 R5E-clean 控制器身份验证（只读；失败时 throw，且失败前无任何构建侧写入）
+# ---------------------------------------------------------------------------
+function Assert-PipControllerProfile {
+    $profileValue = $PipControllerProfile
+    if ($null -eq $profileValue -or $profileValue -cne 'R5E-clean') {
+        throw 'FAILED: PipControllerProfile 必须严格等于 R5E-clean'
+    }
+    $sealedRoot = 'E:\AI_Projects\Codex-drone-range-simulation\drone-task-014-toolchain\pip-controller-py3144-clean-r5e'
+    $sealedBase = 'C:\Users\35594\AppData\Local\CodexToolchains\drone-task-014\python-3.14.4-x64\python.exe'
+    $sealedPythonSha = '4B8C3912806B3C1591BA3CB403BFF77AD309C3FE5756F87C20B7A6F8F0174262'
+    $sealedPipSha = '0BA71F0CB7AA7E240F05E4C370910D029FED9CC1D411BF9B5D133FEBC7A64FDE'
+    $sealedLockNames = @('nuitka','affine','attrs','certifi','click','cligj','colorama','numpy','pyparsing','pyproj','rasterio','setuptools','wheel')
+
+    $resolved = [System.IO.Path]::GetFullPath($sealedRoot).TrimEnd('\')
+    if (-not $resolved.Equals($sealedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "FAILED: R5E-clean 控制器真实路径与封存路径不一致: $resolved"
+    }
+
+    foreach ($p in @($sealedRoot,
+                     (Join-Path $sealedRoot 'Scripts'),
+                     (Join-Path $sealedRoot 'Lib'),
+                     (Join-Path $sealedRoot 'Lib\site-packages'),
+                     (Join-Path $sealedRoot 'pyvenv.cfg'),
+                     (Join-Path $sealedRoot 'Scripts\python.exe'),
+                     (Join-Path $sealedRoot 'Scripts\pip.exe'))) {
+        if (-not (Test-Path -LiteralPath $p)) { throw "FAILED: R5E-clean 控制器路径缺失: $p" }
+        $item = Get-Item -LiteralPath $p -Force
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw "FAILED: R5E-clean 控制器路径是 reparse point: $p" }
+        if ($null -ne $item.LinkType) { throw "FAILED: R5E-clean 控制器路径是链接: $p" }
+    }
+
+    $pythonExe = Join-Path $sealedRoot 'Scripts\python.exe'
+    $pipExe = Join-Path $sealedRoot 'Scripts\pip.exe'
+    $pythonSha = (Get-FileHash -LiteralPath $pythonExe -Algorithm SHA256).Hash.ToUpperInvariant()
+    if ($pythonSha -ne $sealedPythonSha) { throw "FAILED: R5E-clean 控制器 python.exe SHA 不匹配: $pythonSha" }
+    $pipSha = (Get-FileHash -LiteralPath $pipExe -Algorithm SHA256).Hash.ToUpperInvariant()
+    if ($pipSha -ne $sealedPipSha) { throw "FAILED: R5E-clean 控制器 pip.exe SHA 不匹配: $pipSha" }
+
+    $cfgText = Get-Content -LiteralPath (Join-Path $sealedRoot 'pyvenv.cfg') -Raw
+    if ($cfgText -notmatch '(?im)^\s*include-system-site-packages\s*=\s*false\s*$') { throw 'FAILED: R5E-clean pyvenv.cfg include-system-site-packages 不是 false' }
+    if ($cfgText -notmatch '(?im)^\s*version\s*=\s*3\.14\.4\s*$') { throw 'FAILED: R5E-clean pyvenv.cfg version 不是 3.14.4' }
+    if ($cfgText -notmatch '(?im)^\s*home\s*=\s*C:\\Users\\35594\\AppData\\Local\\CodexToolchains\\drone-task-014\\python-3\.14\.4-x64\s*$') { throw 'FAILED: R5E-clean pyvenv.cfg home 与封存基础 Python 不一致' }
+    if ($cfgText -notmatch '(?im)^\s*executable\s*=\s*C:\\Users\\35594\\AppData\\Local\\CodexToolchains\\drone-task-014\\python-3\.14\.4-x64\\python\.exe\s*$') { throw 'FAILED: R5E-clean pyvenv.cfg executable 与封存基础 Python 不一致' }
+
+    $sp = Join-Path $sealedRoot 'Lib\site-packages'
+    $forbiddenArtifacts = @(Get-ChildItem -LiteralPath $sp -Force | Where-Object {
+        $_.Name -like '*.egg-info' -or $_.Name -like '*.pth' -or $_.Name -eq 'sitecustomize.py' -or $_.Name -eq 'usercustomize.py'
+    })
+    if ($forbiddenArtifacts.Count -gt 0) { throw "FAILED: R5E-clean site-packages 含禁止条目: $($forbiddenArtifacts.Name -join ', ')" }
+
+    $distInfos = @(Get-ChildItem -LiteralPath $sp -Directory -Filter '*.dist-info' -Force)
+    if ($distInfos.Count -ne 1) { throw "FAILED: R5E-clean site-packages dist-info 数量不是 1: $($distInfos.Count)" }
+    $metaPath = Join-Path $distInfos[0].FullName 'METADATA'
+    $metaName = $null
+    $metaVersion = $null
+    if (Test-Path -LiteralPath $metaPath) {
+        foreach ($line in (Get-Content -LiteralPath $metaPath)) {
+            if ($line -like 'Name:*' -and $null -eq $metaName) { $metaName = $line.Substring(5).Trim() }
+            if ($line -like 'Version:*' -and $null -eq $metaVersion) { $metaVersion = $line.Substring(8).Trim() }
+            if ($null -ne $metaName -and $null -ne $metaVersion) { break }
+        }
+    }
+    if ($metaName -ne 'pip' -or $metaVersion -ne '26.0.1') {
+        throw "FAILED: R5E-clean 唯一发行包不是 pip 26.0.1: $metaName $metaVersion"
+    }
+    $normalized = (($metaName -replace '[-_.]+', '-')).ToLowerInvariant()
+    if ($sealedLockNames -contains $normalized) { throw "FAILED: R5E-clean 控制器包含 worker lock 包: $metaName" }
+
+    Write-Host "[ok] R5E-clean 固定 pip 控制器身份验证通过: $pythonExe"
+    return $pythonExe
+}
+# ---------------------------------------------------------------------------
+# R5J: 入口自有最小 Windows PATH profile（R5J-minimal-windows-v1）
+# 进程本地、不可注入；仅由可信 OS/PowerShell 锚点构造；不读取 R5B/R5I 工件、
+# 不枚举/过滤父 PATH、不读取 User/Machine PATH、不使用环境变量提供额外目录。
+# 必须在 RunId 解析、路径派生和任何构建写入之前调用。
+# ---------------------------------------------------------------------------
+function Set-EntryOwnedMinimalChildPath {
+    $profileId = 'R5J-minimal-windows-v1'
+
+    # 可信锚点（唯一允许的目录来源）
+    $psHomeDir = $PSHOME
+    $systemDir = [Environment]::SystemDirectory
+    $windowsRoot = [System.IO.Path]::GetDirectoryName($systemDir)
+
+    # 交叉确认 $PSHOME 等于当前 pwsh.exe 的真实父目录
+    $currentProcessPath = (Get-Process -Id $PID).Path
+    $realParent = [System.IO.Path]::GetDirectoryName($currentProcessPath)
+    if (-not $psHomeDir.Equals($realParent, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "FAILED: R5J PATH profile PSHOME 与当前 pwsh.exe 真实父目录不一致: $psHomeDir"
+    }
+
+    # 许可可选目录：System32\WindowsPowerShell\v1.0
+    # 依据：Build 唯一命令链 cmd.exe -> VsDevCmd.bat（固定绝对路径）-> powershell.exe（VsDevCmd.bat 遥测）
+    $psV1Dir = Join-Path $systemDir 'WindowsPowerShell\v1.0'
+
+    # 固定顺序；OrdinalIgnoreCase 去重保留首次
+    $rawSegments = @($psHomeDir, $systemDir, $windowsRoot, $psV1Dir)
+    $segments = New-Object 'System.Collections.Generic.List[string]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($seg in $rawSegments) {
+        $key = $seg.TrimEnd('\')
+        if ($seen.Add($key)) { $segments.Add($seg) }
+    }
+
+    # 每段验证
+    $forbiddenTools = @('ccache', 'clcache', 'mingw32-make', 'zig')
+    $pathext = [Environment]::GetEnvironmentVariable('PATHEXT', 'Process')
+    $exts = @($pathext.Split(';') | Where-Object { $_ -ne '' })
+    foreach ($seg in $segments) {
+        if ([string]::IsNullOrWhiteSpace($seg)) { throw 'FAILED: R5J PATH profile 含空段' }
+        if ($seg -notmatch '^[A-Za-z]:[\\/]') { throw "FAILED: R5J PATH profile 段非绝对路径: $seg" }
+        if ($seg -match '["*?<>|]' -or $seg -match '%[^%]+%' -or $seg -match '\$env:') { throw "FAILED: R5J PATH profile 段含引号/通配符/未展开变量: $seg" }
+        if (-not (Test-Path -LiteralPath $seg -PathType Container)) { throw "FAILED: R5J PATH profile 段不是已存在目录: $seg" }
+
+        # 目录自身及每一层祖先均非 reparse point
+        $cur = $seg.TrimEnd('\')
+        while ($cur -and $cur.Length -ge 3 -and $cur -notmatch '^[A-Za-z]:$') {
+            $item = Get-Item -LiteralPath $cur -Force
+            if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw "FAILED: R5J PATH profile 段含 reparse point: $cur" }
+            $parent = [System.IO.Path]::GetDirectoryName($cur)
+            if ($parent -eq $cur) { break }
+            $cur = $parent
+        }
+
+        # 禁止类目录（用户配置/TEMP/TMP/下载/.codex\tmp/控制器/venv/RunId/BuildRoot/EvidenceRoot/缓存/历史现场/编译器工具链）
+        $low = $seg.ToLowerInvariant()
+        $blocked = @('\temp','\tmp','\download','site-packages','pip-controller-py3144-clean-r5e','worker-build-py3144','\venv','run-state','drone-task-014-builds','drone-task-014-evidence','drone-task-014-migration','drone-task-014-toolchain','.codex','quartus','mingw','zig','ccache','clcache','microsoft visual studio','\users\')
+        foreach ($b in $blocked) {
+            if ($low -like ('*' + $b + '*')) { throw "FAILED: R5J PATH profile 段命中禁止目录类: $seg ($b)" }
+        }
+
+        # 文件级禁止工具审计
+        foreach ($tool in $forbiddenTools) {
+            foreach ($ext in $exts) {
+                $candidate = Join-Path $seg ($tool + $ext)
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) { throw "FAILED: R5J PATH profile 段含禁止工具: $candidate" }
+            }
+            if (Test-Path -LiteralPath (Join-Path $seg $tool) -PathType Leaf) { throw "FAILED: R5J PATH profile 段含禁止工具(无扩展): $(Join-Path $seg $tool)" }
+        }
+    }
+
+    # 应用：删除当前进程环境中等价重复 PATH/Path 键，设置唯一 PATH
+    foreach ($k in [Environment]::GetEnvironmentVariables('Process').Keys) {
+        if ($k -ieq 'PATH') { [Environment]::SetEnvironmentVariable([string]$k, $null, 'Process') }
+    }
+    $newPath = ($segments -join ';')
+    [Environment]::SetEnvironmentVariable('PATH', $newPath, 'Process')
+
+    # ordinal 验证 + UTF-8 无 BOM SHA-256 指纹
+    if ($env:PATH -cne $newPath) { throw 'FAILED: R5J PATH profile 应用后 ordinal 不一致' }
+    $sha = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($newPath))).Replace('-', '')
+
+    # Get-Command 复核 + 文件级复核
+    foreach ($tool in $forbiddenTools) {
+        $found = Get-Command $tool -ErrorAction SilentlyContinue
+        if ($null -ne $found) { throw "FAILED: R5J PATH profile 应用后禁止工具可解析: $tool -> $($found.Source)" }
+        foreach ($seg in $segments) {
+            foreach ($ext in $exts) {
+                $candidate = Join-Path $seg ($tool + $ext)
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) { throw "FAILED: R5J PATH profile 文件级复核发现禁止工具: $candidate" }
+            }
+        }
+    }
+
+    Write-Host "[ok] R5J PATH profile=$profileId segments=$($segments.Count) sha256=$sha PARENT_PATH_IMPORTED_SEGMENTS=0"
+    foreach ($seg in $segments) { Write-Host "      segment: $seg" }
+}
+
+# ---------------------------------------------------------------------------
 # 冻结常量（R2B/R3A）
 # ---------------------------------------------------------------------------
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -61,15 +240,12 @@ $JavaExample = Join-Path $ProjectRoot 'java-example\ProcessBuilderDemo.java'
 $LockWorker  = Join-Path $ProjectRoot 'tools\build\worker-build-requirements-lock.txt'
 $LockNuitka  = Join-Path $ProjectRoot 'tools\build\nuitka-build-system-lock.txt'
 
-# C 盘只读控制器（完整绝对路径，R2B/R3A 冻结）
+# C 盘只读工具输入（完整绝对路径；旧 C 盘 pip 控制器已永久禁止，入口不再引用）
 $BASE_PYTHON_EXE = 'C:\Users\35594\AppData\Local\CodexToolchains\drone-task-014\python-3.14.4-x64\python.exe'
-$PIP_CONTROLLER_PYTHON_EXE = 'C:\Users\35594\AppData\Local\CodexToolchains\drone-task-014\worker-build-py3144\Scripts\python.exe'
 $C_PYTHON_3144_ROOT = 'C:\Users\35594\AppData\Local\CodexToolchains\drone-task-014\python-3.14.4-x64'
-$C_PIP_CONTROLLER_VENV_ROOT = 'C:\Users\35594\AppData\Local\CodexToolchains\drone-task-014\worker-build-py3144'
 $C_NUITKA_REFERENCE_ROOT = 'C:\Users\35594\AppData\Local\CodexToolchains\drone-task-014\nuitka-4.1.3-py3144'
 $C_TOOLCHAIN_BASELINES = @(
     @{ Root = $C_PYTHON_3144_ROOT;         Files = 3957; Dirs = 248; Bytes = 135527811 }
-    @{ Root = $C_PIP_CONTROLLER_VENV_ROOT; Files = 5976; Dirs = 689; Bytes = 235431459 }
     @{ Root = $C_NUITKA_REFERENCE_ROOT;    Files = 2915; Dirs = 335; Bytes = 46483662 }
 )
 
@@ -78,6 +254,14 @@ $E_REPO_ROOT = 'E:\AI_Projects\Codex-drone-range-simulation'
 $E_TOOLCHAIN_ROOT = Join-Path $E_REPO_ROOT 'drone-task-014-toolchain'
 $WHEELHOUSE_ROOT = Join-Path $E_TOOLCHAIN_ROOT 'wheelhouse-py3144-dep-r1'
 $DEPENDENCY_WALKER_SEED_ROOT = Join-Path $E_TOOLCHAIN_ROOT 'cache\nuitka\downloads\depends\x86_64'
+
+# R5F: 固定 R5E-clean 控制器根（不可外部注入）
+$R5E_CLEAN_CONTROLLER_ROOT = 'E:\AI_Projects\Codex-drone-range-simulation\drone-task-014-toolchain\pip-controller-py3144-clean-r5e'
+
+# R5F: 固定 R5E-clean 控制器身份验证（任何 RunId 生成、路径派生、目录/文件写入、复制、venv、Python/Nuitka/pip 副作用之前）
+$PipControllerPythonExe = Assert-PipControllerProfile
+# R5J: 入口自有最小 PATH profile（进程本地；RunId 解析、路径派生、目录/文件写入或外部进程调用之前）
+Set-EntryOwnedMinimalChildPath
 
 # 每次运行唯一 RunId：外部显式 -RunId 优先；未提供时按原格式内部生成（在任何路径派生、目录/文件写入或外部进程调用之前完成）
 $RunId = Resolve-RunId -Provided $PSBoundParameters.ContainsKey('RunId') -Value $RunId
@@ -213,7 +397,6 @@ function Get-TreeDigest {
 function Get-ToolchainSnapshot {
     [pscustomobject]@{
         BasePython      = Get-TreeDigest -Root $C_PYTHON_3144_ROOT
-        PipController   = Get-TreeDigest -Root $C_PIP_CONTROLLER_VENV_ROOT
         NuitkaReference = Get-TreeDigest -Root $C_NUITKA_REFERENCE_ROOT
     }
 }
@@ -225,14 +408,13 @@ function Assert-ToolchainBaseline {
             throw "FAILED: C 盘工具链根基线不符: $($b.Root) files=$($d.Files)/$($b.Files) dirs=$($d.Dirs)/$($b.Dirs) bytes=$($d.Bytes)/$($b.Bytes)"
         }
     }
-    Write-Host '[ok] C 盘三个工具链根基线核验通过'
+    Write-Host '[ok] C 盘工具链根基线核验通过（base python 与 reference-only nuitka）'
 }
 
 function Assert-ToolchainUnchanged {
     param($Before, $After)
     $pairs = @(
         @('python-3.14.4-x64',   $Before.BasePython,      $After.BasePython),
-        @('worker-build-py3144', $Before.PipController,    $After.PipController),
         @('nuitka-4.1.3-py3144', $Before.NuitkaReference, $After.NuitkaReference)
     )
     foreach ($pair in $pairs) {
@@ -240,7 +422,7 @@ function Assert-ToolchainUnchanged {
             throw "FAILED: C 盘工具链根发生变化: $($pair[0]) before=$($pair[1].Digest) after=$($pair[2].Digest)"
         }
     }
-    Write-Host '[ok] C 盘三个工具链根前后不变（文件数、目录数、总字节、SHA 树摘要一致）'
+    Write-Host '[ok] C 盘工具链根前后不变（base python 与 reference-only nuitka；文件数、目录数、总字节、SHA 树摘要一致）'
 }
 
 # ---------------------------------------------------------------------------
@@ -328,34 +510,34 @@ function Assert-VenvReady {
 # ---------------------------------------------------------------------------
 function Invoke-PipLocked {
     param([string]$LockFile, [switch]$OnlyBinary, [switch]$NoBuildIsolation)
-    $globalArgs = @('--python', $BUILD_PYTHON_EXE)
-    $cmdArgs = @('install', '--no-index', '--find-links', $WHEELHOUSE_ROOT,
+    $globalArgs = @('--isolated', '--python', $BUILD_PYTHON_EXE)
+    $cmdArgs = @('install', '--no-input', '--no-index', '--find-links', $WHEELHOUSE_ROOT,
         '--cache-dir', $PIP_CACHE_ROOT, '--disable-pip-version-check')
     if ($OnlyBinary) { $cmdArgs += '--only-binary=:all:' }
     if ($NoBuildIsolation) { $cmdArgs += '--no-build-isolation' }
     $cmdArgs += '--require-hashes', '-r', $LockFile
-    & $PIP_CONTROLLER_PYTHON_EXE -I -B -m pip @globalArgs @cmdArgs
+    & $PipControllerPythonExe -I -B -m pip @globalArgs @cmdArgs
     if ($LASTEXITCODE -ne 0) { throw "FAILED: pip 安装失败（$LockFile）" }
 }
 
 function Assert-VenvPackages {
-    # C 盘 pip 控制器版本（只读查询；控制器不得承接安装）
-    $controllerPip = (& $PIP_CONTROLLER_PYTHON_EXE -c 'import importlib.metadata as m; print(m.version("pip"))' 2>$null)
+    # 固定 R5E-clean 控制器 pip 版本（只读查询；控制器不得承接安装）
+    $controllerPip = (& $PipControllerPythonExe -c 'import importlib.metadata as m; print(m.version("pip"))' 2>$null)
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($controllerPip)) {
-        throw 'FAILED: C 盘 pip 控制器版本查询失败'
+        throw 'FAILED: 固定 R5E-clean 控制器版本查询失败'
     }
     $controllerPip = $controllerPip.Trim()
     if ($controllerPip -ne '26.0.1') {
-        throw "FAILED: C 盘 pip 控制器版本错误: $controllerPip（必须为 26.0.1）"
+        throw "FAILED: 固定 R5E-clean 控制器版本错误: $controllerPip（必须为 26.0.1）"
     }
-    # C 盘 pip 控制器不得包含任何 lock 包（不得成为安装目标）
-    $controllerNamesRaw = (& $PIP_CONTROLLER_PYTHON_EXE -c 'import importlib.metadata as m; print(",".join(sorted((d.metadata["Name"] if "Name" in d.metadata else d.metadata["name"]) for d in m.distributions())))' 2>$null)
-    if ($LASTEXITCODE -ne 0) { throw 'FAILED: C 盘 pip 控制器包清单查询失败' }
+    # 固定 R5E-clean 控制器不得包含任何 lock 包（不得成为安装目标）
+    $controllerNamesRaw = (& $PipControllerPythonExe -c 'import importlib.metadata as m; print(",".join(sorted((d.metadata["Name"] if "Name" in d.metadata else d.metadata["name"]) for d in m.distributions())))' 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw 'FAILED: 固定 R5E-clean 控制器包清单查询失败' }
     $controllerNames = @($controllerNamesRaw.Trim() -split ',' | Where-Object { $_ -ne '' })
     $lockNames = @($ExpectedVenvPackages | ForEach-Object { ($_ -split '==')[0] })
     $contaminated = @($controllerNames | Where-Object { $lockNames -contains $_ })
     if ($contaminated.Count -gt 0) {
-        throw "FAILED: C 盘 pip 控制器包含 lock 包（不得成为安装目标）: $($contaminated -join ', ')"
+        throw "FAILED: 固定 R5E-clean 控制器包含 lock 包（不得成为安装目标）: $($contaminated -join ', ')"
     }
     # E 盘每次运行 venv 闭包（importlib.metadata 枚举；E venv 无 pip）
     $json = (& $BUILD_PYTHON_EXE -c 'import importlib.metadata as m, json; print(json.dumps(sorted([{"name": d.metadata["Name"] if "Name" in d.metadata else d.metadata["name"], "version": d.version} for d in m.distributions()], key=lambda x: x["name"])))' 2>$null)
@@ -364,7 +546,7 @@ function Assert-VenvPackages {
     }
     $distributions = @($json | ConvertFrom-Json)
     $names = @($distributions | ForEach-Object { $_.name })
-    if ($names -contains 'pip') { throw 'FAILED: E 盘 venv 不得包含 pip（pip 由 C 盘控制器提供）' }
+    if ($names -contains 'pip') { throw 'FAILED: E 盘 venv 不得包含 pip（pip 由固定 R5E-clean 控制器提供）' }
     $managed = @($distributions | ForEach-Object { "$($_.name)==$($_.version)" })
     $missing = @()
     $versionMismatch = @()
@@ -387,7 +569,7 @@ function Assert-VenvPackages {
     if ($missing.Count -gt 0) { throw "FAILED: lock 包缺失: $($missing -join ', ')" }
     if ($versionMismatch.Count -gt 0) { throw "FAILED: lock 包版本错误: $($versionMismatch -join ', ')" }
     if ($extra.Count -gt 0) { throw "FAILED: E 盘 venv 额外包: $($extra -join ', ')" }
-    Write-Host "[ok] E 盘 venv 闭包精确（13 个 lock 管理包，无 pip）；C 盘 pip 控制器仅含 pip $controllerPip"
+    Write-Host "[ok] E 盘 venv 闭包精确（13 个 lock 管理包，无 pip）；固定 R5E-clean 控制器仅含 pip $controllerPip"
 }
 
 # ---------------------------------------------------------------------------
@@ -486,15 +668,15 @@ evidenceRoot = $LOG_EVIDENCE_ROOT
 
 [1] C 盘工具链（只读控制器 / reference-only，前后完整性校验）
     BASE_PYTHON_EXE=$BASE_PYTHON_EXE
-    PIP_CONTROLLER_PYTHON_EXE=$PIP_CONTROLLER_PYTHON_EXE
+    PipControllerPythonExe=$PipControllerPythonExe
     NUITKA_REFERENCE_ROOT=$C_NUITKA_REFERENCE_ROOT (REFERENCE_ONLY_NOT_CONSUMED)
 
 [2] E 盘每次运行 venv 创建
     $BASE_PYTHON_EXE -I -B -m venv --without-pip $BUILD_VENV_ROOT
 
-[3] 两阶段哈希安装（pip 控制器 --python 指向 E 盘 venv，--no-index --require-hashes）
-    $PIP_CONTROLLER_PYTHON_EXE -I -B -m pip --python $BUILD_PYTHON_EXE install --no-index --find-links $WHEELHOUSE_ROOT --cache-dir $PIP_CACHE_ROOT --disable-pip-version-check --only-binary=:all: --require-hashes -r $LockNuitka
-    $PIP_CONTROLLER_PYTHON_EXE -I -B -m pip --python $BUILD_PYTHON_EXE install --no-index --find-links $WHEELHOUSE_ROOT --cache-dir $PIP_CACHE_ROOT --disable-pip-version-check --no-build-isolation --require-hashes -r $LockWorker
+[3] 两阶段哈希安装（固定 R5E-clean 控制器 --isolated --python 指向 E 盘 venv，--no-input --no-index --require-hashes）
+    $PipControllerPythonExe -I -B -m pip --isolated --python $BUILD_PYTHON_EXE install --no-input --no-index --find-links $WHEELHOUSE_ROOT --cache-dir $PIP_CACHE_ROOT --disable-pip-version-check --only-binary=:all: --require-hashes -r $LockNuitka
+    $PipControllerPythonExe -I -B -m pip --isolated --python $BUILD_PYTHON_EXE install --no-input --no-index --find-links $WHEELHOUSE_ROOT --cache-dir $PIP_CACHE_ROOT --disable-pip-version-check --no-build-isolation --require-hashes -r $LockWorker
 
 [4] Nuitka standalone 唯一构建命令
     cmd /d /c ""$VsDevCmd" -arch=x64 -host_arch=x64 && "$BUILD_PYTHON_EXE" -I -B -m nuitka --mode=standalone --msvc=latest --disable-cache=ccache --windows-console-mode=attach --output-dir="$BUILD_ROOT" --output-folder-name=drone-range-worker --output-filename=drone-range-worker --include-package-data=rasterio --include-package-data=pyproj --include-package-data=certifi --nofollow-import-to=PySide6 --report="$ReportsDir\nuitka-report.xml" "$WorkerMain""
@@ -509,6 +691,7 @@ evidenceRoot = $LOG_EVIDENCE_ROOT
     $BUILD_ROOT\drone-range-worker.build\
 
 [7] 环境
+    PATH=入口自有最小 profile R5J-minimal-windows-v1（$PSHOME；System32；Windows 根；System32\WindowsPowerShell\v1.0；不继承父 PATH 段；不使用 R5B/R5I PATH 工件）
     PIP_CONFIG_FILE=NUL；继承 PIP_* 全部清理；TEMP/TMP/TMPDIR/LOCALAPPDATA/NUITKA_CACHE_DIR/PIP_CACHE_DIR 指向 E 盘 run-state。
 "@
     return $plan

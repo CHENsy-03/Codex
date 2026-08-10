@@ -1,0 +1,61 @@
+{
+  "classification": "synthetic_non_sensitive",
+  "filename": "canonical_worker_map_v1.tif",
+  "fixture_id": "DRONE-WORKER-GEOTIFF-ACCEPTANCE-001",
+  "generator": {
+    "filename": "generate_canonical_worker_map_v1.py",
+    "requirements": "Python standard library only",
+    "sha256": "7F52E8FE5A9B8DE15F08542E0B259FB43B620A0BDC64B6C9303F28DCFCCC4B00"
+  },
+  "georeferencing": {
+    "affine_gdal": [
+      104.0,
+      0.0001,
+      0.0,
+      31.0,
+      0.0,
+      -0.0001
+    ],
+    "axis_order": "x=longitude,y=latitude",
+    "bounds": {
+      "bottom": 30.9968,
+      "left": 104.0,
+      "right": 104.0032,
+      "top": 31.0
+    },
+    "crs": "EPSG:4326",
+    "raster_type": "PixelIsArea"
+  },
+  "purpose": "Permanent standalone-worker runtime acceptance input; never production imagery",
+  "raster": {
+    "bands": 1,
+    "compression": "none",
+    "data_formula": "value=((row*32+column)%251)+1",
+    "dtype": "uint8",
+    "height": 32,
+    "nodata": null,
+    "photometric": "BlackIsZero",
+    "raw_pixel_sha256": "F90EB6607AD372ADFBE184F04C1D29061464A6E187E54F8D1ECDFE0EE7A562EB",
+    "width": 32
+  },
+  "reference_vectors": {
+    "a": {
+      "column": 5,
+      "latitude": 30.99955,
+      "longitude": 104.00055,
+      "row": 4
+    },
+    "b": {
+      "column": 24,
+      "latitude": 30.99795,
+      "longitude": 104.00245,
+      "row": 20
+    },
+    "raw_duration_seconds_at_20_m_s": 12.688134797895,
+    "speed_m_s": 20.0,
+    "wgs84_distance_m": 253.762695957897
+  },
+  "sha256": "6AD2C14C444B8FB47FD8F3FC5BEE3550B0425B32D13CB0E9021A8130E8176AD1",
+  "size_bytes": 1384,
+  "version": 1
+}

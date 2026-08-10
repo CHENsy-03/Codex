@@ -57,6 +57,20 @@ public final class WorkerCommandLine {
         env.put("PYTHONIOENCODING", "utf-8");
         return new WorkerCommandLine(command, projectRoot, env);
     }
+    public static WorkerCommandLine forStandaloneWorker(Path executable, Path workingDirectory) {
+        Objects.requireNonNull(executable, "executable");
+        Objects.requireNonNull(workingDirectory, "workingDirectory");
+        if (!executable.isAbsolute()) {
+            throw new IllegalArgumentException("可执行文件必须是绝对路径: " + executable);
+        }
+        if (!workingDirectory.isAbsolute()) {
+            throw new IllegalArgumentException("工作目录必须是绝对路径: " + workingDirectory);
+        }
+        // standalone 软件目录可执行文件：无附加参数、不设置 Python 解释器专用环境变量
+        // （WorkerProcessHandle 使用 environment().putAll 叠加，空图继承父环境 PATH）。
+        List<String> command = List.of(executable.toString());
+        return new WorkerCommandLine(command, workingDirectory, Map.of());
+    }
 
     public List<String> command() {
         return command;
