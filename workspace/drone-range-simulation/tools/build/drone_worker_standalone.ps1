@@ -23,11 +23,33 @@ param(
     [ValidateSet('PlanOnly', 'Build', 'Validate', 'Assemble')]
     [string]$Mode,
 
-    [int]$BuildTimeoutMinutes = 60
+    [int]$BuildTimeoutMinutes = 60,
+
+    [string]$RunId
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# ---------------------------------------------------------------------------
+# RunId 契约（R4B）：区分未提供与显式提供；纯函数，可被 AST 单独提取测试
+# ---------------------------------------------------------------------------
+function Resolve-RunId {
+    param(
+        [bool]$Provided,
+        [AllowNull()]
+        [string]$Value
+    )
+    if (-not $Provided) {
+        $id = [DateTime]::UtcNow.ToString('yyyyMMddHHmmss') + '-' + ([guid]::NewGuid().ToString('N').Substring(0, 12))
+        if ($id -notmatch '^\d{14}-[0-9A-Fa-f]{12}$') { throw 'FAILED: 内部 RunId 生成格式非法' }
+        return $id
+    }
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace($Value)) { throw 'FAILED: RunId 显式值不得为空或纯空白' }
+    if ($Value.Length -gt 64) { throw 'FAILED: RunId 不得超过 64 字符' }
+    if ($Value -notmatch '^[0-9A-Za-z-]{1,64}$') { throw "FAILED: RunId 包含非法字符: $Value" }
+    return $Value
+}
 
 # ---------------------------------------------------------------------------
 # 冻结常量（R2B/R3A）
@@ -57,9 +79,8 @@ $E_TOOLCHAIN_ROOT = Join-Path $E_REPO_ROOT 'drone-task-014-toolchain'
 $WHEELHOUSE_ROOT = Join-Path $E_TOOLCHAIN_ROOT 'wheelhouse-py3144-dep-r1'
 $DEPENDENCY_WALKER_SEED_ROOT = Join-Path $E_TOOLCHAIN_ROOT 'cache\nuitka\downloads\depends\x86_64'
 
-# 每次运行唯一 RunId（安全字符校验；非空；唯一）
-$RunId = [DateTime]::UtcNow.ToString('yyyyMMddHHmmss') + '-' + ([guid]::NewGuid().ToString('N').Substring(0, 12))
-if ($RunId -notmatch '^[0-9A-Za-z\-]{1,64}$') { throw "FAILED: RunId 安全字符校验失败: $RunId" }
+# 每次运行唯一 RunId：外部显式 -RunId 优先；未提供时按原格式内部生成（在任何路径派生、目录/文件写入或外部进程调用之前完成）
+$RunId = Resolve-RunId -Provided $PSBoundParameters.ContainsKey('RunId') -Value $RunId
 
 # 每次运行路径（全部由同一 RunId 推导，全部位于 E 盘冻结根内）
 $RUN_STATE_ROOT = Join-Path $E_TOOLCHAIN_ROOT ("run-state\" + $RunId)

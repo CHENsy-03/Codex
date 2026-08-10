@@ -14,7 +14,7 @@ if (-not (Test-Path -LiteralPath $EvidenceDir -PathType Container)) { throw "EVI
 if (-not $EvidenceDir.StartsWith($r3aPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'EVIDENCE_DIR_NOT_UNDER_R3A_MIGRATION' }
 $leaf = Split-Path $EvidenceDir -Leaf
 $parentLeaf = Split-Path (Split-Path (Split-Path $EvidenceDir -Parent) -Parent) -Leaf
-if ($parentLeaf -notmatch '^task014-storage-consolidation-build-control-implementation-r3a-\d{14}$') { throw 'EVIDENCE_PARENT_NOT_R3A' }
+if ($parentLeaf -notmatch '^task014-storage-consolidation-build-control-(implementation-r3a|test-harness-repair-retest-r4b1)-\d{14}$') { throw 'EVIDENCE_PARENT_NOT_ALLOWED' }
 if ($leaf -ne 'cmd-quoting') { throw 'EVIDENCE_LEAF_NOT_CMD_QUOTING' }
 $evItem = Get-Item -LiteralPath $EvidenceDir -Force
 if ($evItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw 'EVIDENCE_DIR_IS_REPARSE_POINT' }

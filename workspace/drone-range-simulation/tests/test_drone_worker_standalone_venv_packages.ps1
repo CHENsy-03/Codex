@@ -15,7 +15,7 @@ if (-not (Test-Path -LiteralPath $EvidenceDir -PathType Container)) { throw "EVI
 if (-not $EvidenceDir.StartsWith($r3aPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'EVIDENCE_DIR_NOT_UNDER_R3A_MIGRATION' }
 $leaf = Split-Path $EvidenceDir -Leaf
 $parentLeaf = Split-Path (Split-Path (Split-Path $EvidenceDir -Parent) -Parent) -Leaf
-if ($parentLeaf -notmatch '^task014-storage-consolidation-build-control-implementation-r3a-\d{14}$') { throw 'EVIDENCE_PARENT_NOT_R3A' }
+if ($parentLeaf -notmatch '^task014-storage-consolidation-build-control-(implementation-r3a|runid-contract-repair-r4b|test-harness-repair-retest-r4b1)-\d{14}$') { throw 'EVIDENCE_PARENT_NOT_ALLOWED' }
 if ($leaf -ne 'venv-packages') { throw 'EVIDENCE_LEAF_NOT_VENV_PACKAGES' }
 $evItem = Get-Item -LiteralPath $EvidenceDir -Force
 if ($evItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw 'EVIDENCE_DIR_IS_REPARSE_POINT' }
@@ -59,7 +59,8 @@ Add-Result 'PIP_NO_VENVPYTHON' (-not ($iplText -match '\$VenvPython')) 'no legac
 Add-Result 'STATIC_VENV_CREATE' ($fullText -match '\$BASE_PYTHON_EXE -I -B -m venv --without-pip \$BUILD_VENV_ROOT') 'venv creation via BASE_PYTHON_EXE --without-pip'
 Add-Result 'STATIC_PIP_ENV' ($fullText -match 'PIP_CONFIG_FILE' -and $fullText -match 'PYTHONDONTWRITEBYTECODE' -and $fullText -match 'PYTHONNOUSERSITE') 'PIP_CONFIG_FILE + PYTHONDONTWRITEBYTECODE + PYTHONNOUSERSITE'
 Add-Result 'STATIC_RUN_STATE_VARS' ($fullText -match '\$RUN_STATE_ROOT' -and $fullText -match '\$BUILD_VENV_ROOT' -and $fullText -match '\$BUILD_PYTHON_EXE' -and $fullText -match '\$NUITKA_CACHE_ROOT' -and $fullText -match '\$PIP_CACHE_ROOT' -and $fullText -match '\$TEMP_ROOT' -and $fullText -match '\$LOCALAPPDATA_ROOT' -and $fullText -match '\$DW_TARGET' -and $fullText -match '\$BUILD_ROOT' -and $fullText -match '\$LOG_EVIDENCE_ROOT') 'all R2B/R3A frozen path variables present'
-Add-Result 'STATIC_RUNID_VALIDATION' ($fullText -match 'RunId' -and $fullText -match '\^\[0-9A-Za-z\\-\]\{1,64\}\$') 'RunId safe-char validation present'
+$ridFuncTextForStatic = (@($funcs | Where-Object { $_.Name -eq 'Resolve-RunId' })[0]).Extent.Text
+Add-Result 'STATIC_RUNID_VALIDATION' ($ridFuncTextForStatic -match '\^\[0-9A-Za-z-\]\{1,64\}\$' -or $ridFuncTextForStatic -match '\^\[0-9A-Za-z\\-\]\{1,64\}\$') 'Resolve-RunId contains safe-char regex ^[0-9A-Za-z-]{1,64}$ (or escaped equivalent)'
 Add-Result 'STATIC_NO_CD_FALLBACK' ($fullText -match 'Assert-NoCDDriveFallback' -and -not ($fullText -match '\$env:LOCALAPPDATA[^\r\n]*CodexToolchains')) 'no C/D fallback'
 Add-Result 'STATIC_DW' ($fullText -match 'Assert-DependencyWalkerSeed' -and $fullText -match 'Copy-DependencyWalkerSeed' -and $fullText -match '\$DEPENDENCY_WALKER_SEED_ROOT' -and $fullText -match '\$DW_TARGET') 'DW seed validation + copy + target'
 Add-Result 'STATIC_TOOLCHAIN_INTEGRITY' ($fullText -match 'Get-ToolchainSnapshot' -and $fullText -match 'Assert-ToolchainBaseline' -and $fullText -match 'Assert-ToolchainUnchanged') 'C toolchain integrity before/after'
@@ -68,14 +69,75 @@ Add-Result 'STATIC_NUITKA_E_DRIVE' ($fullText -match '-I -B -m nuitka' -and -not
 $lockDir = Split-Path $ScriptPath -Parent
 Add-Result 'LOCK_NUITKA_SHA' ((Get-FileHash -LiteralPath (Join-Path $lockDir 'nuitka-build-system-lock.txt') -Algorithm SHA256).Hash -eq '83F111E093BAD00E18D8EE645A55359E4A3B9EA26A1B2D8B91776712A0DB30FB') 'nuitka lock SHA unchanged'
 Add-Result 'LOCK_WORKER_SHA' ((Get-FileHash -LiteralPath (Join-Path $lockDir 'worker-build-requirements-lock.txt') -Algorithm SHA256).Hash -eq '4E3BFE284DA2FA6732AAB238B1806AB2B64F6EFFFBFA28D74CF77FC60A6C8181') 'worker lock SHA unchanged'
+# --- R4B: external RunId contract assertions (AST-only; no top-level execution) ---
+$ridFuncs = @($funcs | Where-Object { $_.Name -eq 'Resolve-RunId' })
+Add-Result 'RID_FUNCTION_COUNT_ONE' ($ridFuncs.Count -eq 1) "count=$($ridFuncs.Count)"
+. ([scriptblock]::Create($ridFuncs[0].Extent.Text))
+$ridParam = @($ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'RunId' })
+Add-Result 'RID_PARAM_DECLARED_STRING' ($ridParam.Count -eq 1 -and $ridParam[0].StaticType.FullName -eq 'System.String') "count=$($ridParam.Count) type=$($ridParam[0].StaticType.FullName)"
+$modeParam = @($ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Mode' })
+$btoParam = @($ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'BuildTimeoutMinutes' })
+Add-Result 'RID_MODE_CONTRACT_KEPT' ($modeParam.Count -eq 1 -and $btoParam.Count -eq 1) 'Mode and BuildTimeoutMinutes still declared'
+Add-Result 'RID_VALIDATESET_KEPT' ($fullText -match "[ValidateSet('PlanOnly', 'Build', 'Validate', 'Assemble')]") 'Mode ValidateSet unchanged'
+$btoDefAst = $btoParam[0].DefaultValue
+$btoDefVal = if ($btoDefAst -is [System.Management.Automation.Language.ConstantExpressionAst]) { $btoDefAst.Value } else { $null }
+Add-Result 'RID_BTO_DEFAULT_KEPT' ($btoParam.Count -eq 1 -and $btoParam[0].StaticType.FullName -eq 'System.Int32' -and $btoDefVal -eq 60) "type=$($btoParam[0].StaticType.FullName) default=$btoDefVal"
+$sample = Resolve-RunId -Provided $true -Value 'task014-r4a-20260810140000-a1b2c3d4'
+Add-Result 'RID_SAMPLE_RETURNED_AS_IS' ($sample -eq 'task014-r4a-20260810140000-a1b2c3d4') "value=$sample"
+$long64 = ('a' * 64)
+Add-Result 'RID_64_ACCEPTED' ((Resolve-RunId -Provided $true -Value $long64) -eq $long64) '64-char accepted and returned unchanged'
+$gen = Resolve-RunId -Provided $false -Value $null
+Add-Result 'RID_NOT_PROVIDED_FORMAT' ($gen -match '^\d{14}-[0-9A-Fa-f]{12}$') "value=$gen"
+function Invoke-RidReject([string]$id, [string]$fragment, [string]$value) {
+    $caught = $null
+    try { $null = Resolve-RunId -Provided $true -Value $value; $caught = 'NO_THROW' } catch { $caught = $_.Exception.Message }
+    Add-Result $id (($caught -ne 'NO_THROW') -and ($caught -match $fragment)) "value=[$value] message=$caught"
+}
+Invoke-RidReject 'RID_EMPTY_REJECTED' '空或纯空白' ''
+Invoke-RidReject 'RID_WHITESPACE_REJECTED' '空或纯空白' '   '
+Invoke-RidReject 'RID_DOT_REJECTED' '非法字符' 'a.b'
+Invoke-RidReject 'RID_SLASH_REJECTED' '非法字符' 'a/b'
+Invoke-RidReject 'RID_BACKSLASH_REJECTED' '非法字符' 'a\b'
+Invoke-RidReject 'RID_COLON_REJECTED' '非法字符' 'a:b'
+Invoke-RidReject 'RID_SPACE_REJECTED' '非法字符' 'a b'
+Invoke-RidReject 'RID_65_REJECTED' '超过 64 字符' ('a' * 65)
+$linesText = $fullText -split "`r?
+"
+function Get-LineNo([string]$pattern) {
+    for ($i = 0; $i -lt $linesText.Count; $i++) { if ($linesText[$i] -match $pattern) { return ($i + 1) } }
+    return -1
+}
+$lineResolve = Get-LineNo '\$RunId = Resolve-RunId -Provided \$PSBoundParameters\.ContainsKey\(''RunId''\)'
+$lineRunState = Get-LineNo '\$RUN_STATE_ROOT = Join-Path'
+$lineNewItem = Get-LineNo 'New-Item -ItemType Directory'
+$linePip = Get-LineNo '\$PIP_CONTROLLER_PYTHON_EXE -I -B -m pip'
+$lineNuitka = Get-LineNo 'BUILD_PYTHON_EXE.*-I -B -m nuitka'
+Add-Result 'RID_RESOLVE_BEFORE_PATHS_AND_WRITES' ($lineResolve -gt 0 -and $lineResolve -lt $lineRunState -and $lineResolve -lt $lineNewItem -and $lineResolve -lt $linePip -and $lineResolve -lt $lineNuitka) "resolve=$lineResolve runState=$lineRunState newItem=$lineNewItem pip=$linePip nuitka=$lineNuitka"
+Add-Result 'RID_NOT_OVERWRITTEN' ($fullText -match '\$RunId = Resolve-RunId -Provided \$PSBoundParameters\.ContainsKey\(''RunId''\) -Value \$RunId' -and -not ($fullText -match '(?m)^\$RunId = \[DateTime\]::UtcNow')) 'external RunId not regenerated at top level'
+Add-Result 'RID_NO_RUN_STATE_BY_TEST' (-not ($EvidenceDir -match 'run-state')) "evidenceDir=$EvidenceDir (test writes only under R4B evidence test subdir)"
+
 # --- mock infrastructure (scratch under R3A evidence test subdir; no real python/pip executed) ---
 $scratch = Join-Path $EvidenceDir 'scratch'
 New-Item -ItemType Directory -Path $scratch -Force | Out-Null
 $controllerMock = Join-Path $scratch 'mockcontroller.cmd'
 $buildMock = Join-Path $scratch 'mockbuild.cmd'
-$controllerText = "@echo off`r`nsetlocal enabledelayedexpansion`r`nset `"CMD=%*`"`r`necho %CMD% | findstr /C:`"m.version(`" >nul`r`nif !errorlevel! equ 0 (echo %MOCK_CONTROLLER_PIP% & exit /b 0)`r`necho %CMD% | findstr /C:`"m.distributions()`" >nul`r`nif !errorlevel! equ 0 (echo %MOCK_CONTROLLER_NAMES% & exit /b 0)`r`nexit /b 1`r`n"
+$controllerText = "@echo off`r
+setlocal enabledelayedexpansion`r
+set `"CMD=%*`"`r
+echo %CMD% | findstr /C:`"m.version(`" >nul`r
+if !errorlevel! equ 0 (echo %MOCK_CONTROLLER_PIP% & exit /b 0)`r
+echo %CMD% | findstr /C:`"m.distributions()`" >nul`r
+if !errorlevel! equ 0 (echo %MOCK_CONTROLLER_NAMES% & exit /b 0)`r
+exit /b 1`r
+"
 Set-Content -LiteralPath $controllerMock -Value $controllerText -Encoding Ascii
-$buildText = "@echo off`r`nsetlocal enabledelayedexpansion`r`nset `"CMD=%*`"`r`necho %CMD% | findstr /C:`"json.dumps(sorted`" >nul`r`nif !errorlevel! equ 0 (echo %MOCK_BUILD_JSON% & exit /b 0)`r`nexit /b 1`r`n"
+$buildText = "@echo off`r
+setlocal enabledelayedexpansion`r
+set `"CMD=%*`"`r
+echo %CMD% | findstr /C:`"json.dumps(sorted`" >nul`r
+if !errorlevel! equ 0 (echo %MOCK_BUILD_JSON% & exit /b 0)`r
+exit /b 1`r
+"
 Set-Content -LiteralPath $buildMock -Value $buildText -Encoding Ascii
 function Set-Mock([string]$controllerPip, [string]$controllerNames, [string]$buildJson) {
     $env:MOCK_CONTROLLER_PIP = $controllerPip
