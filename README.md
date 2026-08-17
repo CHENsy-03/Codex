@@ -1,241 +1,159 @@
----
+# Codex Workspace
 
-## 11. 工作区原则
-
-本工作区只维护：
-
-- AI 开发规范
-- 多项目协作
-- 架构文档
-
-具体业务规则应放在各项目内部。
-
-工作区不直接存放业务代码。
-
----\n# Codex Workspace — AI 软件研发中心
-
-> 这不是一个普通项目目录，这是一个 **AI 开发工作台**。
->
-> 所有项目共享：AGENTS 规范、架构设计、开发规则、AI 工作流、Prompt 模板。
+> 这是一个多项目软件研发工作区，不是单一业务系统。
+> 根目录维护仓库级规范、文档和协作入口；具体项目代码与项目文档放在 `workspace/<project>` 中。
 
 ---
 
-## 1. 工作区介绍
+## 1. 仓库用途
 
-E:\AI_Projects\Codex\ 是你所有项目的根目录。
+本仓库用于统一管理多个独立项目，并提供一套跨项目复用的人工和 AI 协作规则。
 
-它不是一个单体仓库，而是一个 **多项目共享工作区**。
+根级内容负责回答：
 
-| 特性 | 说明 |
-|---|---|
-| 多项目 | 9 个在研项目统一管理 |
-| 统一规范 | AGENTS.md 约束所有项目 |
-| 统一架构 | Python + Go 双语言 |
-| AI 协作 | GPT / Codex / DeepSeek 分工明确 |
-| 文档集中 | docs/ 存放所有共享文档 |
-| 输出隔离 | output/ 存放所有 AI 生成物 |
+- 项目如何组织；
+- 根级规范与项目内部文档如何分工；
+- AI 和开发者开始任务前必须遵守哪些规则；
+- 文档、变更记录和架构决策如何维护。
+
+项目业务规则、架构、任务进度和测试结果应放在对应项目的 `AGENTS.md` 或 `docs/` 中，不应写入根级规范。
 
 ---
 
-## 2. 目录说明
+## 2. 目录职责
 
-`
+```text
 Codex/
-├── AGENTS.md              项目最高原则（所有 AI 必须遵守）
-├── .agents/                AI 模板（prompts / review / workflow）
-├── .git/
-│
-├── docs/                   共享文档
-│   ├── SYSTEM_ARCHITECTURE.md   系统架构
-│   ├── DEVELOPMENT_RULES.md     开发规范
-│   ├── AI_WORKFLOW.md           AI 协作工作流
-│   ├── TASK.md                  当前任务
-│   ├── CHANGELOG.md             变更日志
-│   └── decisions/               架构决策记录（ADR）
-│
-├── workspace/              在研项目（9 个）
-│   ├── go-spider/              Go 爬虫
-│   ├── chaincode-drone/        无人机区块链
-│   ├── exam-system/            考试系统（Python+Go）
-│   ├── crawler/                采集平台
-│   ├── drone-survey-server/    无人机勘测服务器
-│   ├── gps-simulator/          GPS 定位模拟
-│   ├── frontend-design/        前端网页设计
-│   ├── agreements/             投资协议制作
-│   └── diagram-design/         思维导图 / 流程图
-│
-├── archive/                归档项目
-│   ├── error-analysis/
-│   ├── doc-modifications/
-│   └── backups/
-│
-└── output/                 AI 生成物
-    ├── reports/      设计报告 / 架构报告 / Review 报告
-    ├── diagrams/     Mermaid / PlantUML / 流程图 / ER 图
-    ├── sql/          迁移 SQL / 初始化 SQL
-    ├── prompts/      GPT / Codex / DeepSeek 专用 Prompt
-    └── temp/         临时输出
-`
+├── AGENTS.md              仓库级 AI/开发规则
+├── README.md              仓库入口文档
+├── .agents/               AI 工作目录、模板和流程
+├── docs/                  仓库级规范文档
+│   ├── DEVELOPMENT_RULES.md      跨项目开发规则
+│   ├── DEVELOPMENT_CHECKLIST.md  开发检查清单
+│   ├── AI_WORKFLOW.md            AI 协作工作流
+│   ├── SYSTEM_ARCHITECTURE.md    仓库级组织架构
+│   ├── TASK.md                   通用任务模板与字段约定
+│   ├── CHANGELOG.md              仓库级治理变更日志
+│   └── decisions/                架构决策记录
+├── workspace/             各独立项目目录
+│   └── <project>/
+├── archive/               已归档项目
+└── output/                生成报告和交付物
+```
+
+根级目录不应存放具体项目的业务代码。
 
 ---
 
-## 3. AI 工作流程
+## 3. 项目隔离原则
 
-详见 [docs/AI_WORKFLOW.md](docs/AI_WORKFLOW.md)
+每个项目使用独立目录：
 
-快速概览：
+```text
+workspace/<project>/
+```
 
-`
-用户需求 → GPT(需求分析) → Codex(实现) → DeepSeek(复杂问题) → GPT(Review) → 完成
-`
+项目应自行维护：
 
-| 步骤 | 负责 AI | 产出 |
-|---|---|---|
-| 需求分析 | GPT | 需求文档 / TASK.md |
-| 架构设计 | GPT | ADR / 设计文档 |
-| 代码实现 | Codex + DeepSeek | workspace/ 代码 |
-| 本地测试 | Codex | pytest / go test |
-| Code Review | GPT | Review 意见 |
-| 最终验收 | GPT | 验收确认 |
+- `AGENTS.md`：项目级规则；
+- `docs/`：项目架构、任务、开发规则、变更记录和 ADR；
+- 源码、测试、配置和部署文件。
+
+根级规范适用于所有项目；项目内部规则可以更具体，但不得与根级的安全、Git、文档同步和最小修改原则冲突。
 
 ---
 
-## 4. 如何启动 Codex
+## 4. 新项目基本结构
 
-Codex 负责代码实现和文件操作。
+```text
+workspace/<project>/
+├── AGENTS.md
+├── README.md
+├── docs/
+│   ├── SYSTEM_ARCHITECTURE.md
+│   ├── DEVELOPMENT_RULES.md
+│   ├── TASK.md
+│   └── CHANGELOG.md
+├── tests/
+├── configs/
+├── scripts/
+└── <源码目录>
+```
 
-`
-适用的场景：
-  - 编写代码
-  - 运行测试
-  - 文件操作
-  - Git 操作（status / diff / log）
-`
-
-`
-不适用的场景：
-  - 架构决策
-  - 需求分析
-  - 终审验收
-`
-
-启动方式：直接在终端调用或通过 IDE 集成。
+项目可以根据技术栈调整结构，但应保持文档、测试和配置目录清晰。
 
 ---
 
-## 5. 如何启动 DeepSeek
+## 5. 根级规范与项目文档分工
 
-DeepSeek 负责复杂推理和问题排查。
-
-`
-适用的场景：
-  - 算法设计
-  - 复杂 Bug 分析
-  - 性能优化方案
-  - 架构合理性评估
-`
-
-`
-不适用的场景：
-  - 执行命令
-  - 文件操作
-  - Git 操作
-`
-
----
-
-## 6. 如何创建新项目
-
-`ash
-# 1. 在 workspace/ 下创建项目目录
-mkdir workspace/my-project
-
-# 2. 添加项目级 AGENTS.md（引用根级规范）
-cp .agents/templates/project-AGENTS.md workspace/my-project/AGENTS.md
-
-# 3. 创建标准目录结构
-mkdir -p workspace/my-project/{docs,tests,client,server,configs,scripts}
-
-# 4. 更新 README.md 在研项目列表
-`
-
-建议所有项目统一结构：
-
-`
-project/
-├── AGENTS.md         项目级原则
-├── docs/             项目文档
-├── tests/            测试
-├── client/           客户端
-├── server/           服务端
-├── configs/          配置
-└── scripts/          工具脚本
-`
-
----
-
-## 7. Git 规范
-
-| 操作 | 允许 | 禁止 |
-|---|---|---|
-| git status | ✅ | — |
-| git diff | ✅ | — |
-| git log | ✅ | — |
-| git add / commit | ✅（开发者确认） | — |
-| git push | — | ❌ 必须开发者手动 |
-| git reset --hard | — | ❌ 禁止 |
-| git clean -fd | — | ❌ 禁止 |
-| 强制覆盖 | — | ❌ 禁止 |
-
-所有提交必须由开发者确认。
-
----
-
-## 8. 文档说明
-
-| 文档 | 用途 | 如何更新 |
-|---|---|---|
-| AGENTS.md | 项目最高原则 | 架构变更时 |
-| docs/SYSTEM_ARCHITECTURE.md | 系统架构 | 架构变更时 |
-| docs/DEVELOPMENT_RULES.md | 开发规范 | 规范变更时 |
-| docs/AI_WORKFLOW.md | AI 协作流程 | 流程变更时 |
-| docs/TASK.md | 当前任务 | 每次任务 |
-| docs/CHANGELOG.md | 变更日志 | 每次修改 |
-| docs/decisions/ADR-*.md | 架构决策 | 每次决策 |
-| README.md | 工作区入口 | 目录变化时 |
-
----
-
-## 9. 开发流程
-
-`
-① 需求
-   ↓ GPT 输出 TASK.md
-② 设计
-   ↓ GPT 输出 ADR（如有必要）
-③ 实现
-   ↓ Codex 按 AGENTS.md 原则实现
-④ 测试
-   ↓ Codex 运行 pytest / go test
-⑤ Review
-   ↓ GPT 输出 Review 意见
-⑥ 修复
-   ↓ Codex 按 Review 修改
-⑦ 提交
-   ↓ 开发者确认后 commit
-⑧ 更新 CHANGELOG
-`
-
----
-
-## 10. 更新记录
-
-| 日期 | 变更 |
+| 内容 | 存放位置 |
 |---|---|
-| 2026-07-26 | 目录结构重组：workspace / archive / output / .agents |
-| 2026-07-26 | 新增文档：AI_WORKFLOW.md / CHANGELOG.md / ADR |
-| 2026-07-26 | 新增 README 完整版本 |
+| 多项目通用 AI/开发规则 | 根级 `AGENTS.md`、`docs/DEVELOPMENT_RULES.md` |
+| 仓库目录和项目隔离原则 | 根级 `docs/SYSTEM_ARCHITECTURE.md` |
+| 通用任务模板和状态定义 | 根级 `docs/TASK.md` |
+| AI/Codex 协作流程 | 根级 `docs/AI_WORKFLOW.md` |
+| 项目内部架构、任务进度、测试结果 | `workspace/<project>/docs/` |
+| 项目专属 ADR | `workspace/<project>/docs/decisions/` |
 
 ---
 
-*最后更新：2026-07-26*
+## 6. 通用工作方式
+
+```text
+用户需求
+    ↓
+明确任务范围
+    ↓
+阅读适用的 AGENTS.md 和项目文档
+    ↓
+确认 Git 现场与修改边界
+    ↓
+实施最小修改
+    ↓
+运行相关测试和检查
+    ↓
+输出真实结果与剩余风险
+    ↓
+由开发者决定提交和发布
+```
+
+开始任何修改前必须：
+
+- 阅读仓库根目录和当前项目的 `AGENTS.md`；
+- 检查当前分支、HEAD、暂存区、工作区和未跟踪文件；
+- 确认允许修改的文件范围；
+- 不覆盖用户预存修改；
+- 不执行未经授权的 Git 写操作。
+
+---
+
+## 7. Git 与任务基本流程
+
+- 每个任务建议使用独立分支，分支名应表达任务类型和内容。
+- 修改前记录 Git 基线，修改后核对差异。
+- 暂存和提交由开发者明确授权后执行。
+- AI 默认不得 push、创建 PR 或修改历史。
+- 所有测试结果必须来自真实执行，不得预填或虚构。
+
+---
+
+## 8. 文档入口
+
+- [AGENTS.md](./AGENTS.md)
+- [docs/DEVELOPMENT_RULES.md](./docs/DEVELOPMENT_RULES.md)
+- [docs/DEVELOPMENT_CHECKLIST.md](./docs/DEVELOPMENT_CHECKLIST.md)
+- [docs/AI_WORKFLOW.md](./docs/AI_WORKFLOW.md)
+- [docs/SYSTEM_ARCHITECTURE.md](./docs/SYSTEM_ARCHITECTURE.md)
+- [docs/TASK.md](./docs/TASK.md)
+- [docs/CHANGELOG.md](./docs/CHANGELOG.md)
+- [docs/decisions/ADR_PROCESS.md](./docs/decisions/ADR_PROCESS.md)
+
+---
+
+## 9. 仓库级变更日志
+
+根级 `docs/CHANGELOG.md` 只记录仓库级规范、目录和治理变化。具体项目功能变更应记录在项目内部变更日志中。
+
+---
+
+*最后更新：2026-08-11*

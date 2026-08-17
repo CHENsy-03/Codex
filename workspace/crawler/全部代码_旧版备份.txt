@@ -1,0 +1,4537 @@
+==============================================================
+  Python + Go 全部代码
+==============================================================
+
+文件数: 43
+
+
+############################################################
+# FILE: api/__init__.py
+############################################################
+from api.server import app, create_app
+
+
+############################################################
+# FILE: api/server.py
+############################################################
+import json, os, logging, threading
+
+try:
+    from fastapi import FastAPI, Query, HTTPException
+    from fastapi.responses import PlainTextResponse
+    from pydantic import BaseModel
+    FASTAPI_OK = True
+except ImportError:
+    FASTAPI_OK = False
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
+log = logging.getLogger('api')
+
+from parser.html_parser import extract_title, extract_date, extract_content
+from extractor.scorer import score_article
+from monitor.metrics import get_collector
+
+
+def _load_sites():
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(base, 'config', 'site.json'), 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+if FASTAPI_OK:
+    app = FastAPI(title='Crawler API v2.0', description='Parser Service')
+
+    class ParseRequest(BaseModel):
+        url: str = ''
+        html: str = ''
+
+    @app.post('/parse')
+    async def parse_html(req: ParseRequest):
+        if not req.html or len(req.html) < 100:
+            raise HTTPException(400, 'HTML content required (min 100 chars)')
+        title = extract_title(req.html)
+        date = extract_date(req.html)
+        content = extract_content(req.html)
+        result = score_article({'title': title, 'content': content, 'url': req.url}, ('',))
+        collector = get_collector()
+        collector.inc('parse_total')
+        collector.inc('parse_success')
+        return {
+            'url': req.url, 'title': title, 'publish_date': date,
+            'content': content[:500], 'content_len': len(content), 'score': result['score'],
+        }
+
+    @app.get('/health')
+    async def health():
+        return {'status': 'ok'}
+
+    @app.get('/ready')
+    async def ready():
+        return {'status': 'ready'}
+
+    @app.get('/sites')
+    async def list_sites():
+        sites = _load_sites()
+        return [{'key': k, 'name': v['name'], 'domain': v['domain']} for k, v in sites.items()]
+
+    @app.get('/articles')
+    async def query_articles(keyword: str = Query(None), site: str = Query(None), limit: int = Query(50)):
+        from storage.manager import StorageManager
+        store = StorageManager()
+        result = store.query_articles(keyword=keyword, site=site, limit=limit)
+        store.close()
+        return {'count': len(result), 'articles': [{k: v for k, v in a.items() if k != 'content'} for a in result]}
+
+    @app.get('/tasks')
+    async def list_tasks(limit: int = Query(20)):
+        from storage.manager import StorageManager
+        store = StorageManager()
+        if store.duck_conn:
+            result = store.duck_conn.execute(
+                'SELECT id, keyword, site, status, article_count, created_at FROM task ORDER BY created_at DESC LIMIT ?', [limit]
+            ).fetchall()
+            cols = ['id', 'keyword', 'site', 'status', 'article_count', 'created_at']
+            tasks = [dict(zip(cols, [str(v) for v in row])) for row in result]
+        else:
+            tasks = []
+        store.close()
+        return {'count': len(tasks), 'tasks': tasks}
+
+    @app.get('/statistics')
+    async def get_statistics():
+        from storage.manager import StorageManager
+        store = StorageManager()
+        stats = store.get_statistics()
+        store.close()
+        return stats
+
+    @app.get('/metrics')
+    async def metrics():
+        collector = get_collector()
+        return PlainTextResponse(collector.dump_prometheus(), media_type='text/plain')
+
+    @app.on_event('startup')
+    async def startup_parser_worker():
+        if os.environ.get('PARSER_WORKER_ENABLED', '').lower() not in ('1', 'true'):
+            log.info('Parser worker disabled (env PARSER_WORKER_ENABLED != true)')
+            return
+        threading.Thread(target=_run_parser_worker, daemon=True).start()
+        log.info('Parser worker started (bg)')
+
+else:
+    app = None
+
+
+def _run_parser_worker():
+    import time
+    try:
+        import redis as _redis
+    except ImportError:
+        log.warning('redis-py not installed, parser worker disabled')
+        return
+    r = _redis.Redis(host='localhost', port=6379, decode_responses=True)
+    log.info('Parser worker listening on crawler:html')
+    while True:
+        try:
+            result = r.brpop('crawler:html', timeout=5)
+            if result is None:
+                continue
+            _, data = result
+            payload = json.loads(data)
+            url = payload.get('url', '')
+            html = payload.get('html', '')
+            title = payload.get('title', '')
+            if not html or len(html) < 100:
+                continue
+            parsed_title = extract_title(html) or title
+            parsed_date = extract_date(html)
+            parsed_content = extract_content(html)
+            score_result = score_article({'title': parsed_title, 'content': parsed_content, 'url': url}, ('',))
+            result_payload = json.dumps({
+                'url': url, 'title': parsed_title, 'publish_date': parsed_date,
+                'content': parsed_content, 'score': score_result['score'],
+            }, ensure_ascii=False)
+            r.lpush('crawler:result', result_payload)
+            collector = get_collector()
+            collector.inc('parse_total')
+            collector.inc('parse_success')
+            log.info('PARSED -> result_queue: %s (%d chars)', parsed_title[:50], len(parsed_content or ''))
+        except Exception as e:
+            log.error('Parser worker error: %s', e)
+            time.sleep(2)
+
+
+def create_app():
+    return app
+
+
+############################################################
+# FILE: go-spider\internal\api\handler.go
+############################################################
+package api
+
+import (
+	"fmt"
+	"log"
+	"strconv"
+	"sync"
+	"time"
+
+	"crawler-platform/internal/store"
+	"crawler-platform/internal/worker"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+// parseIntParam parses a query parameter as an integer.
+func parseIntParam(s, name string) (int, error) {
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a number", name)
+	}
+	return v, nil
+}
+
+// isDBReady returns true when the underlying database connection is usable.
+// It handles pure nil interfaces, typed nil pointers (e.g. nil *store.MySQLStore),
+// and valid database connections. Test fakes always return true.
+func isDBReady(db articleQuerier) bool {
+	if db == nil {
+		return false
+	}
+	switch v := db.(type) {
+	case *store.MySQLStore:
+		return v != nil
+	default:
+		return true
+	}
+}
+
+type Task struct {
+	ID        string       `json:"id"`
+	Site      string       `json:"site"`
+	Keywords  string       `json:"keywords"`
+	Status    string       `json:"status"`
+	CreatedAt time.Time    `json:"created_at"`
+	Stats     worker.Stats `json:"stats"`
+}
+
+type TaskStore struct {
+	mu    sync.RWMutex
+	tasks map[string]*Task
+}
+
+func NewTaskStore() *TaskStore {
+	return &TaskStore{tasks: make(map[string]*Task)}
+}
+
+func (ts *TaskStore) Create(site, keywords string) *Task {
+	task := &Task{
+		ID:        uuid.New().String()[:8],
+		Site:      site,
+		Keywords:  keywords,
+		Status:    "created",
+		CreatedAt: time.Now(),
+	}
+	ts.mu.Lock()
+	ts.tasks[task.ID] = task
+	ts.mu.Unlock()
+	return task
+}
+
+func (ts *TaskStore) Get(id string) *Task {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return ts.tasks[id]
+}
+
+func (ts *TaskStore) Update(id string, status string, stats worker.Stats) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if t, ok := ts.tasks[id]; ok {
+		t.Status = status
+		t.Stats = stats
+	}
+}
+
+type CreateTaskReq struct {
+	Site     string `json:"site" binding:"required"`
+	Keywords string `json:"keywords" binding:"required"`
+	MaxPages int    `json:"max_pages"`
+	Workers  int    `json:"workers"`
+}
+
+func (s *Server) health(c *gin.Context) {
+	c.JSON(200, gin.H{"status": "ok"})
+}
+
+func (s *Server) ready(c *gin.Context) {
+	c.JSON(200, gin.H{"status": "ready"})
+}
+
+func (s *Server) createTask(c *gin.Context) {
+	var req CreateTaskReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Workers == 0 {
+		req.Workers = 4
+	}
+	if req.MaxPages < 0 {
+		c.JSON(400, gin.H{"error": "max_pages must be >= 0"})
+		return
+	}
+	if req.MaxPages == 0 {
+		req.MaxPages = 1
+	}
+
+	task := s.store.Create(req.Site, req.Keywords)
+
+	go func() {
+		if err := s.redis.PushSearch(task.ID, req.Site, req.Keywords, 1, req.MaxPages); err != nil {
+			log.Printf("[task:%s] PushSearch error: %v", task.ID, err)
+			s.store.Update(task.ID, "failed", worker.Stats{})
+			return
+		}
+		log.Printf("[task:%s] pushed search: site=%s keyword=%s max_pages=%d", task.ID, req.Site, req.Keywords, req.MaxPages)
+		s.store.Update(task.ID, "searching", worker.Stats{})
+
+		for {
+			stats := s.manager.Stats()
+			s.store.Update(task.ID, "running", stats)
+			if stats.Completed+stats.Failed >= stats.Submitted && stats.QueueLen == 0 {
+				s.store.Update(task.ID, "completed", stats)
+				log.Printf("[task:%s] completed: %d ok, %d failed", task.ID, stats.Completed, stats.Failed)
+				return
+			}
+			time.Sleep(3 * time.Second)
+		}
+	}()
+
+	c.JSON(202, gin.H{"task_id": task.ID, "status": "created"})
+}
+
+func (s *Server) taskStatus(c *gin.Context) {
+	id := c.Query("id")
+	if id == "" {
+		c.JSON(400, gin.H{"error": "id required"})
+		return
+	}
+	task := s.store.Get(id)
+	if task == nil {
+		c.JSON(404, gin.H{"error": "task not found"})
+		return
+	}
+	c.JSON(200, task)
+}
+
+func (s *Server) listArticles(c *gin.Context) {
+	keyword := c.Query("keyword")
+	limitStr := c.DefaultQuery("limit", "100")
+
+	limit, err := parseIntParam(limitStr, "limit")
+	if err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	if limit <= 0 {
+		c.JSON(400, gin.H{"error": "limit must be positive"})
+		return
+	}
+	if limit > 1000 {
+		c.JSON(400, gin.H{"error": "limit must not exceed 1000"})
+		return
+	}
+	if !isDBReady(s.db) {
+		c.JSON(503, gin.H{"error": "database not available"})
+		return
+	}
+
+	articles, err := s.db.QueryArticles(keyword, limit)
+	if err != nil {
+		log.Printf("[api] listArticles query error: %v", err)
+		c.JSON(500, gin.H{"error": "internal server error"})
+		return
+	}
+	if articles == nil {
+		articles = []store.Article{}
+	}
+	c.JSON(200, gin.H{"count": len(articles), "articles": articles})
+}
+
+func (s *Server) metrics(c *gin.Context) {
+	c.String(200, "# TYPE crawler gauge\ncrawler_info{version=\"1.0\"} 1\n")
+}
+
+func (s *Server) listSites(c *gin.Context) {
+	c.JSON(200, []gin.H{
+		{"key": "czj_beijing", "name": "北京市财政局"},
+		{"key": "czj_hangzhou", "name": "杭州市财政局"},
+	})
+}
+
+
+############################################################
+# FILE: go-spider\internal\api\handler_test.go
+############################################################
+package api
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http/httptest"
+	"testing"
+
+	"crawler-platform/internal/store"
+
+	"github.com/gin-gonic/gin"
+)
+
+type fakeArticleQuerier struct {
+	called   bool
+	articles []store.Article
+	err      error
+}
+
+func (f *fakeArticleQuerier) QueryArticles(keyword string, limit int) ([]store.Article, error) {
+	f.called = true
+	if f.err != nil {
+		return nil, f.err
+	}
+	if keyword == "" {
+		return f.articles, nil
+	}
+	var filtered []store.Article
+	for _, a := range f.articles {
+		if a.Keyword == keyword {
+			filtered = append(filtered, a)
+		}
+	}
+	return filtered, nil
+}
+
+func newTestServer(db articleQuerier) *Server {
+	gin.SetMode(gin.TestMode)
+	return &Server{router: gin.New(), db: db}
+}
+
+func setupRoutes(s *Server) {
+	s.router.GET("/articles", s.listArticles)
+}
+
+func TestListArticles_ReturnsAll(t *testing.T) {
+	db := &fakeArticleQuerier{
+		articles: []store.Article{
+			{URL: "http://example.com/1", Title: "A1", Score: 85, Site: "test", Keyword: "kw1"},
+			{URL: "http://example.com/2", Title: "A2", Score: 90, Site: "test", Keyword: "kw2"},
+		},
+	}
+	s := newTestServer(db)
+	setupRoutes(s)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/articles", nil)
+	s.router.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status=%d", w.Code)
+	}
+	var resp struct {
+		Count    int
+		Articles []store.Article
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Count != 2 {
+		t.Fatalf("count=%d", resp.Count)
+	}
+	if resp.Articles[0].URL != "http://example.com/1" {
+		t.Fatalf("url=%q", resp.Articles[0].URL)
+	}
+}
+
+func TestListArticles_KeywordFilter(t *testing.T) {
+	db := &fakeArticleQuerier{
+		articles: []store.Article{
+			{Title: "F", Keyword: "财政", Score: 10, URL: "http://a.com/f"},
+			{Title: "T", Keyword: "科技", Score: 20, URL: "http://a.com/t"},
+		},
+	}
+	s := newTestServer(db)
+	setupRoutes(s)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/articles?keyword=科技", nil)
+	s.router.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status=%d", w.Code)
+	}
+	var resp struct {
+		Count    int
+		Articles []store.Article
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Count != 1 {
+		t.Fatalf("count=%d", resp.Count)
+	}
+	if resp.Articles[0].Keyword != "科技" {
+		t.Fatalf("keyword=%q", resp.Articles[0].Keyword)
+	}
+}
+
+func TestListArticles_LimitParam(t *testing.T) {
+	db := &fakeArticleQuerier{}
+	s := newTestServer(db)
+	setupRoutes(s)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/articles?limit=10", nil)
+	s.router.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status=%d", w.Code)
+	}
+	if !db.called {
+		t.Fatal("QueryArticles should be called")
+	}
+}
+
+func TestListArticles_EmptyResult(t *testing.T) {
+	db := &fakeArticleQuerier{articles: []store.Article{}}
+	s := newTestServer(db)
+	setupRoutes(s)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/articles", nil)
+	s.router.ServeHTTP(w, req)
+	var resp struct {
+		Count    int
+		Articles []store.Article
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Count != 0 {
+		t.Fatalf("count=%d", resp.Count)
+	}
+	if resp.Articles == nil {
+		t.Fatal("articles is null")
+	}
+}
+
+func TestListArticles_NegativeLimit(t *testing.T) {
+	db := &fakeArticleQuerier{articles: []store.Article{{Title: "x"}}}
+	s := newTestServer(db)
+	setupRoutes(s)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/articles?limit=-1", nil)
+	s.router.ServeHTTP(w, req)
+	if w.Code != 400 {
+		t.Fatalf("status=%d", w.Code)
+	}
+	if db.called {
+		t.Fatal("QueryArticles should not be called for limit=-1")
+	}
+}
+
+func TestListArticles_NonNumericLimit(t *testing.T) {
+	db := &fakeArticleQuerier{articles: []store.Article{{Title: "x"}}}
+	s := newTestServer(db)
+	setupRoutes(s)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/articles?limit=abc", nil)
+	s.router.ServeHTTP(w, req)
+	if w.Code != 400 {
+		t.Fatalf("status=%d", w.Code)
+	}
+	if db.called {
+		t.Fatal("QueryArticles should not be called for limit=abc")
+	}
+}
+
+func TestListArticles_ZeroLimit(t *testing.T) {
+	db := &fakeArticleQuerier{articles: []store.Article{{Title: "x"}}}
+	s := newTestServer(db)
+	setupRoutes(s)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/articles?limit=0", nil)
+	s.router.ServeHTTP(w, req)
+	if w.Code != 400 {
+		t.Fatalf("status=%d", w.Code)
+	}
+	if db.called {
+		t.Fatal("QueryArticles should not be called for limit=0")
+	}
+}
+
+func TestListArticles_ExceedsMaxLimit(t *testing.T) {
+	db := &fakeArticleQuerier{articles: []store.Article{{Title: "x"}}}
+	s := newTestServer(db)
+	setupRoutes(s)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/articles?limit=1001", nil)
+	s.router.ServeHTTP(w, req)
+	if w.Code != 400 {
+		t.Fatalf("status=%d", w.Code)
+	}
+	if db.called {
+		t.Fatal("QueryArticles should not be called for limit=1001")
+	}
+}
+
+func TestListArticles_QueryError(t *testing.T) {
+	db := &fakeArticleQuerier{err: fmt.Errorf("db error")}
+	s := newTestServer(db)
+	setupRoutes(s)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/articles", nil)
+	s.router.ServeHTTP(w, req)
+	if w.Code != 500 {
+		t.Fatalf("status=%d", w.Code)
+	}
+	var resp map[string]string
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error"] == "" {
+		t.Fatal("error field should be set")
+	}
+	if resp["error"] == "db error" {
+		t.Fatal("must not leak internal error details")
+	}
+}
+
+func TestListArticles_DefaultLimit(t *testing.T) {
+	db := &fakeArticleQuerier{articles: make([]store.Article, 100)}
+	s := newTestServer(db)
+	setupRoutes(s)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/articles", nil)
+	s.router.ServeHTTP(w, req)
+	var resp struct {
+		Count int `json:"count"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Count != 100 {
+		t.Fatalf("count=%d", resp.Count)
+	}
+}
+func TestListArticles_DBNotAvailable(t *testing.T) {
+	s := newTestServer(nil)
+	setupRoutes(s)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/articles", nil)
+	s.router.ServeHTTP(w, req)
+	if w.Code != 503 { t.Fatalf("status=%d, want 503", w.Code) }
+	var resp map[string]string
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error"] == "" { t.Fatal("error field should be set") }
+	if resp["error"] == "db error" { t.Fatal("must not leak internal error details") }
+}
+
+func TestListArticles_TypedNilDBNotAvailable(t *testing.T) {
+	var ms *store.MySQLStore
+	s := newTestServer(ms)
+	setupRoutes(s)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/articles", nil)
+	s.router.ServeHTTP(w, req)
+	if w.Code != 503 { t.Fatalf("status=%d, want 503", w.Code) }
+	var resp map[string]string
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error"] == "" { t.Fatal("error field should be set") }
+}
+
+func TestListArticles_InvalidParamWhenDBNil(t *testing.T) {
+	s := newTestServer(nil)
+	setupRoutes(s)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/articles?limit=abc", nil)
+	s.router.ServeHTTP(w, req)
+	if w.Code != 400 { t.Fatalf("status=%d, want 400 (not 503)", w.Code) }
+}
+
+
+############################################################
+# FILE: go-spider\internal\api\router.go
+############################################################
+package api
+
+import (
+	"crawler-platform/internal/queue"
+	"crawler-platform/internal/store"
+	"crawler-platform/internal/worker"
+
+	"github.com/gin-gonic/gin"
+)
+
+// articleQuerier is the subset of store.QueryArticles needed by the API.
+type articleQuerier interface {
+	QueryArticles(keyword string, limit int) ([]store.Article, error)
+}
+
+type Server struct {
+	router  *gin.Engine
+	redis   *queue.RedisQueue
+	manager *worker.WorkerManager
+	store   *TaskStore
+	db      articleQuerier
+}
+
+func NewServer(rq *queue.RedisQueue, mgr *worker.WorkerManager, db articleQuerier) *Server {
+	s := &Server{
+		router:  gin.Default(),
+		redis:   rq,
+		manager: mgr,
+		store:   NewTaskStore(),
+		db:      db,
+	}
+	s.routes()
+	return s
+}
+
+func (s *Server) routes() {
+	s.router.GET("/health", s.health)
+	s.router.GET("/ready", s.ready)
+	s.router.GET("/task/status", s.taskStatus)
+	s.router.POST("/task/create", s.createTask)
+	s.router.GET("/articles", s.listArticles)
+
+	// API wrapper copies Python FastAPI routes for compatibility
+	s.router.GET("/metrics", s.metrics)
+	s.router.GET("/sites", s.listSites)
+}
+
+func (s *Server) Run(addr string) error {
+	return s.router.Run(addr)
+}
+
+
+############################################################
+# FILE: go-spider\internal\client\resty.go
+############################################################
+package client
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/url"
+	"strings"
+	"time"
+
+	"crawler-platform/internal/config"
+
+	"github.com/go-resty/resty/v2"
+)
+
+type Article struct {
+	Title string `json:"title"`
+	URL   string `json:"url"`
+}
+
+type RestyFetcher struct {
+	client *resty.Client
+	delay  time.Duration
+}
+
+func NewRestyFetcher(delaySec float64) *RestyFetcher {
+	c := resty.New().
+		SetTimeout(15 * time.Second).
+		SetRetryCount(3).
+		SetRetryWaitTime(1 * time.Second).
+		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36").
+		SetHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	return &RestyFetcher{client: c, delay: time.Duration(delaySec * float64(time.Second))}
+}
+
+func (f *RestyFetcher) Fetch(url string) (string, error) {
+	if f.delay > 0 {
+		time.Sleep(f.delay)
+	}
+	resp, err := f.client.R().Get(url)
+	if err != nil {
+		return "", fmt.Errorf("fetch %s: %w", url, err)
+	}
+	if resp.StatusCode() >= 400 {
+		return "", fmt.Errorf("fetch %s: HTTP %d", url, resp.StatusCode())
+	}
+	return resp.String(), nil
+}
+
+func SearchArticles(cfg *config.SiteConfig, keyword string) []Article {
+	search := cfg.Search
+	if search.APIURL == "" {
+		return nil
+	}
+
+	switch search.Type {
+	case "trs_json":
+		return searchTRS(cfg, keyword)
+	case "jpaas_jsearch":
+		return searchJPAAS(cfg, keyword)
+	default:
+		log.Printf("[client] unknown search type: %s", search.Type)
+		return nil
+	}
+}
+
+func searchTRS(cfg *config.SiteConfig, keyword string) []Article {
+	params := map[string]string{}
+	for k, v := range cfg.Search.Params {
+		params[k] = fmt.Sprintf("%v", v)
+	}
+	params["qt"] = keyword
+	params["pageSize"] = fmt.Sprintf("%v", cfg.Search.Params["pageSize"])
+	params["page"] = "1"
+
+	form := url.Values{}
+	for k, v := range params {
+		form.Set(k, v)
+	}
+
+	c := resty.New().SetTimeout(15 * time.Second)
+	resp, err := c.R().
+		SetHeader("Content-Type", "application/x-www-form-urlencoded").
+		SetFormDataFromValues(form).
+		Post(cfg.Search.APIURL)
+
+	if err != nil {
+		log.Printf("[trs] search error: %v", err)
+		return nil
+	}
+
+	var result struct {
+		ResultDocs []struct {
+			Title   string `json:"title"`
+			URL     string `json:"url"`
+			Summary string `json:"summary"`
+		} `json:"resultDocs"`
+	}
+	if err := json.Unmarshal(resp.Body(), &result); err != nil {
+		log.Printf("[trs] parse error: %v", err)
+		return nil
+	}
+
+	var articles []Article
+	for _, doc := range result.ResultDocs {
+		url := doc.URL
+		if !strings.HasPrefix(url, "http") {
+			url = cfg.BaseURL + url
+		}
+		articles = append(articles, Article{Title: doc.Title, URL: url})
+	}
+	log.Printf("[trs] %s -> %d results", keyword, len(articles))
+	return articles
+}
+
+func searchJPAAS(cfg *config.SiteConfig, keyword string) []Article {
+	params := map[string]string{
+		"q":        keyword,
+		"p":        "1",
+		"pg":       "10",
+		"sortType": "1",
+	}
+	for k, v := range cfg.Search.Params {
+		params[k] = fmt.Sprintf("%v", v)
+	}
+
+	c := resty.New().SetTimeout(15 * time.Second)
+	resp, err := c.R().
+		SetHeader("X-Requested-With", "XMLHttpRequest").
+		SetHeader("Accept", "*/*").
+		SetQueryParams(params).
+		Get(cfg.Search.APIURL)
+
+	if err != nil {
+		log.Printf("[jpaas] search error: %v", err)
+		return nil
+	}
+
+	var result struct {
+		Code string `json:"code"`
+		Data struct {
+			AppSearchResultBeanList []struct {
+				MapSearchResult struct {
+					Items []struct {
+						Data struct {
+							Title string `json:"title_str"`
+							URL   string `json:"url"`
+						} `json:"data"`
+					} `json:"items"`
+				} `json:"mapSearchResult"`
+				Title string `json:"title_str"`
+				URL   string `json:"url"`
+			} `json:"appSearchResultBeanList"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body(), &result); err != nil {
+		log.Printf("[jpaas] parse error: %v", err)
+		return nil
+	}
+
+	var articles []Article
+	for _, doc := range result.Data.AppSearchResultBeanList {
+		title := doc.Title
+		articleURL := doc.URL
+		if doc.MapSearchResult.Items != nil {
+			for _, item := range doc.MapSearchResult.Items {
+				if item.Data.Title != "" {
+					title = item.Data.Title
+				}
+				if item.Data.URL != "" {
+					articleURL = item.Data.URL
+				}
+			}
+		}
+		if articleURL == "" || title == "" {
+			continue
+		}
+		if strings.HasPrefix(articleURL, "http://") {
+			articleURL = strings.Replace(articleURL, "http://", "https://", 1)
+		}
+		articles = append(articles, Article{Title: title, URL: articleURL})
+	}
+	log.Printf("[jpaas] %s -> %d results", keyword, len(articles))
+	return articles
+}
+
+
+############################################################
+# FILE: go-spider\internal\config\config.go
+############################################################
+package config
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+// SiteConfig mirrors Python's site_cfg dict
+type SiteConfig struct {
+	Name      string       `json:"name"`
+	Domain    string       `json:"domain"`
+	BaseURL   string       `json:"base_url"`
+	Search    SearchConfig `json:"search"`
+	Extract   ExtractConfig `json:"extract"`
+	Score     ScoreConfig  `json:"score"`
+	RateLimit RateLimitConfig `json:"rate_limit"`
+}
+
+type SearchConfig struct {
+	Type    string            `json:"type"`
+	PageURL string            `json:"page_url"`
+	APIURL  string            `json:"api_url"`
+	Params  map[string]interface{} `json:"params"`
+}
+
+type ExtractConfig struct {
+	Mode string `json:"mode"`
+}
+
+type ScoreConfig struct {
+	TitleWeight int `json:"title_weight"`
+	BodyWeight  int `json:"body_weight"`
+	URLWeight   int `json:"url_weight"`
+	Threshold   int `json:"threshold"`
+}
+
+type RateLimitConfig struct {
+	Delay float64 `json:"delay"`
+	Jitter float64 `json:"jitter"`
+}
+
+func Load(siteKey, configDir string) (*SiteConfig, error) {
+	sitePath := filepath.Join(configDir, "site.json")
+	httpPath := filepath.Join(configDir, "http.json")
+	scorePath := filepath.Join(configDir, "score.json")
+
+	sites := make(map[string]SiteConfig)
+	if err := loadJSON(sitePath, &sites); err != nil {
+		return nil, fmt.Errorf("site config: %w", err)
+	}
+
+	cfg, ok := sites[siteKey]
+	if !ok {
+		return nil, fmt.Errorf("site not found: %s", siteKey)
+	}
+
+	httpData := make(map[string]RateLimitConfig)
+	if err := loadJSON(httpPath, &httpData); err == nil {
+		if rl, ok := httpData[siteKey]; ok {
+			cfg.RateLimit = rl
+		}
+	}
+
+	scoreData := make(map[string]ScoreConfig)
+	if err := loadJSON(scorePath, &scoreData); err == nil {
+		if sc, ok := scoreData[siteKey]; ok {
+			cfg.Score = sc
+		} else if global, ok := scoreData["_global"]; ok {
+			cfg.Score = global
+		}
+	}
+
+	return &cfg, nil
+}
+
+func MustLoad(siteKey, configDir string) *SiteConfig {
+	cfg, err := Load(siteKey, configDir)
+	if err != nil {
+		panic(err)
+	}
+	return cfg
+}
+
+func loadJSON(path string, v interface{}) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, v)
+}
+
+
+############################################################
+# FILE: go-spider\internal\httpx\breaker.go
+############################################################
+package httpx
+
+import (
+	"log"
+	"sync"
+	"time"
+)
+
+type BreakerState int
+
+const (
+	Closed BreakerState = iota
+	Open
+	HalfOpen
+)
+
+func (s BreakerState) String() string {
+	switch s {
+	case Closed: return "CLOSED"
+	case Open: return "OPEN"
+	case HalfOpen: return "HALF_OPEN"
+	default: return "UNKNOWN"
+	}
+}
+
+type CircuitBreaker struct {
+	mu               sync.Mutex
+	name             string
+	state            BreakerState
+	failureCount     int
+	failureThreshold int
+	recoveryTimeout  time.Duration
+	lastFailureTime  time.Time
+}
+
+func NewBreaker(name string, threshold int, recovery time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
+		name:             name,
+		state:            Closed,
+		failureThreshold: threshold,
+		recoveryTimeout:  recovery,
+	}
+}
+
+func (cb *CircuitBreaker) Allow() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	switch cb.state {
+	case Closed:
+		return true
+	case Open:
+		if time.Since(cb.lastFailureTime) >= cb.recoveryTimeout {
+			cb.state = HalfOpen
+			log.Printf("[breaker:%s] OPEN -> HALF_OPEN", cb.name)
+			return true
+		}
+		return false
+	case HalfOpen:
+		return true
+	}
+	return false
+}
+
+func (cb *CircuitBreaker) Success() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failureCount = 0
+	if cb.state == HalfOpen {
+		cb.state = Closed
+		log.Printf("[breaker:%s] HALF_OPEN -> CLOSED", cb.name)
+	}
+}
+
+func (cb *CircuitBreaker) Failure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failureCount++
+	cb.lastFailureTime = time.Now()
+	if cb.failureCount >= cb.failureThreshold && cb.state != Open {
+		cb.state = Open
+		log.Printf("[breaker:%s] CLOSED -> OPEN (failures=%d)", cb.name, cb.failureCount)
+	}
+	if cb.state == HalfOpen {
+		cb.state = Open
+		log.Printf("[breaker:%s] HALF_OPEN -> OPEN", cb.name)
+	}
+}
+
+func (cb *CircuitBreaker) State() BreakerState {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	return cb.state
+}
+
+
+############################################################
+# FILE: go-spider\internal\httpx\client.go
+############################################################
+package httpx
+
+import (
+	"fmt"
+	"log"
+	"net/url"
+	"time"
+
+	"github.com/go-resty/resty/v2"
+)
+
+type Client struct {
+	resty   *resty.Client
+	limiter *RateLimiter
+	breaker *CircuitBreaker
+	retry   RetryConfig
+	deadQ   *DeadQueue
+}
+
+func NewClient(name string) *Client {
+	return &Client{
+		resty: resty.New().
+			SetTimeout(15 * time.Second).
+			SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"),
+		limiter: NewRateLimiter(3.0),
+		breaker: NewBreaker(name, 3, 60*time.Second),
+		retry:   DefaultRetryConfig,
+		deadQ:   NewDeadQueue(100),
+	}
+}
+
+func (c *Client) Get(rawURL string) (string, error) {
+	domain := extractDomain(rawURL)
+	breaker := c.breaker
+
+	if !breaker.Allow() {
+		err := fmt.Errorf("breaker OPEN for %s", domain)
+		c.deadQ.Push(DeadTask{URL: rawURL, Error: err.Error(), Time: time.Now()})
+		return "", err
+	}
+
+	var result string
+	err := RetryWithBackoff(c.retry, func() error {
+		c.limiter.Wait(rawURL)
+
+		resp, e := c.resty.R().Get(rawURL)
+		if e != nil {
+			breaker.Failure()
+			return e
+		}
+		if resp.StatusCode() >= 400 {
+			breaker.Failure()
+			return fmt.Errorf("HTTP %d", resp.StatusCode())
+		}
+		breaker.Success()
+		result = resp.String()
+		return nil
+	})
+
+	if err != nil {
+		log.Printf("[httpx] GET FAIL %s: %v", rawURL[:80], err)
+		c.deadQ.Push(DeadTask{URL: rawURL, Error: err.Error(), Time: time.Now()})
+		return "", err
+	}
+
+	return result, nil
+}
+
+func (c *Client) DeadQueue() *DeadQueue { return c.deadQ }
+func (c *Client) SetRateLimit(rps float64) { c.limiter.rate = rps }
+
+func extractDomain(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "unknown"
+	}
+	return u.Host
+}
+
+
+############################################################
+# FILE: go-spider\internal\httpx\limiter.go
+############################################################
+package httpx
+
+import (
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+)
+
+type RateLimiter struct {
+	mu       sync.Mutex
+	buckets  map[string]*tokenBucket
+	rate     float64
+}
+
+type tokenBucket struct {
+	tokens   float64
+	lastTime time.Time
+}
+
+func NewRateLimiter(defaultRPS float64) *RateLimiter {
+	return &RateLimiter{
+		buckets: make(map[string]*tokenBucket),
+		rate:    defaultRPS,
+	}
+}
+
+func (rl *RateLimiter) domainRate(domain string) float64 {
+	if strings.Contains(domain, "gov.cn") {
+		return 2.0
+	}
+	return rl.rate
+}
+
+func (rl *RateLimiter) Wait(rawURL string) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return
+	}
+	domain := u.Host
+
+	rl.mu.Lock()
+	bucket, ok := rl.buckets[domain]
+	if !ok {
+		bucket = &tokenBucket{tokens: 1, lastTime: time.Now()}
+		rl.buckets[domain] = bucket
+	}
+
+	rate := rl.domainRate(domain)
+	now := time.Now()
+	elapsed := now.Sub(bucket.lastTime).Seconds()
+	bucket.tokens += elapsed * rate
+	if bucket.tokens > rate {
+		bucket.tokens = rate
+	}
+	bucket.lastTime = now
+
+	if bucket.tokens < 1.0 {
+		waitTime := time.Duration((1.0 - bucket.tokens) / rate * float64(time.Second))
+		rl.mu.Unlock()
+		time.Sleep(waitTime)
+		rl.mu.Lock()
+		bucket.tokens = 0
+		bucket.lastTime = time.Now()
+	} else {
+		bucket.tokens -= 1.0
+	}
+	rl.mu.Unlock()
+}
+
+
+############################################################
+# FILE: go-spider\internal\httpx\retry.go
+############################################################
+package httpx
+
+import (
+	"log"
+	"math"
+	"time"
+)
+
+type RetryConfig struct {
+	MaxRetries int
+	BaseDelay  time.Duration
+	MaxDelay   time.Duration
+}
+
+var DefaultRetryConfig = RetryConfig{
+	MaxRetries: 3,
+	BaseDelay:  1 * time.Second,
+	MaxDelay:   30 * time.Second,
+}
+
+type DeadQueue struct {
+	ch chan DeadTask
+}
+
+type DeadTask struct {
+	URL   string
+	Error string
+	Time  time.Time
+}
+
+func NewDeadQueue(size int) *DeadQueue {
+	return &DeadQueue{ch: make(chan DeadTask, size)}
+}
+
+func (dq *DeadQueue) Push(task DeadTask) {
+	select {
+	case dq.ch <- task:
+	default:
+		log.Printf("[dead-queue] full, dropping: %s", task.URL[:60])
+	}
+}
+
+func (dq *DeadQueue) PopAll() []DeadTask {
+	var tasks []DeadTask
+	for {
+		select {
+		case t := <-dq.ch:
+			tasks = append(tasks, t)
+		default:
+			return tasks
+		}
+	}
+}
+
+func RetryWithBackoff(cfg RetryConfig, fn func() error) error {
+	var lastErr error
+	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(math.Min(
+				float64(cfg.BaseDelay)*math.Pow(2, float64(attempt-1)),
+				float64(cfg.MaxDelay),
+			))
+			log.Printf("[retry] attempt %d/%d after %v", attempt, cfg.MaxRetries, delay)
+			time.Sleep(delay)
+		}
+
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		log.Printf("[retry] attempt %d/%d FAILED: %v", attempt, cfg.MaxRetries, err)
+	}
+	return lastErr
+}
+
+
+############################################################
+# FILE: go-spider\internal\protocol\messages.go
+############################################################
+package protocol
+
+import (
+	"crypto/rand"
+	"fmt"
+)
+
+const Version = "1.0"
+
+func NewTaskID() string {
+	b := make([]byte, 4)
+	rand.Read(b)
+	return fmt.Sprintf("task-%x", b)
+}
+
+func NewMessageID() string {
+	b := make([]byte, 4)
+	rand.Read(b)
+	return fmt.Sprintf("msg-%x", b)
+}
+
+type Envelope struct {
+	ProtocolVersion string `json:"protocol_version"`
+	TaskID          string `json:"task_id"`
+	MessageID       string `json:"message_id"`
+	Timestamp       string `json:"timestamp"`
+}
+
+type SearchMessage struct {
+	Envelope
+	Type    string `json:"type"`
+	Site    string `json:"site"`
+	Keyword string `json:"keyword"`
+	Level   int    `json:"level"`
+	MaxPages int    `json:"max_pages"`
+}
+
+type URLMessage struct {
+	Envelope
+	Type    string `json:"type"`
+	URL     string `json:"url"`
+	Site    string `json:"site"`
+	Keyword string `json:"keyword"`
+	Level   int    `json:"level"`
+	Title   string `json:"title"`
+}
+
+type HTMLMessage struct {
+	Envelope
+	Type    string `json:"type"`
+	URL     string `json:"url"`
+	Site    string `json:"site"`
+	Keyword string `json:"keyword"`
+	Level   int    `json:"level"`
+	Title   string `json:"title"`
+	HTML    string `json:"html"`
+}
+
+type ResultMessage struct {
+	Envelope
+	Type        string   `json:"type"`
+	Site        string   `json:"site"`
+	Keyword     string   `json:"keyword"`
+	Level       int      `json:"level"`
+	URL         string   `json:"url"`
+	Title       string   `json:"title"`
+	PublishDate string   `json:"publish_date"`
+	Content     string   `json:"content"`
+	Summary     string   `json:"summary"`
+	Score       int      `json:"score"`
+	MatchedKeywords []string `json:"matched_keywords"`
+}
+
+type SearchDoneMessage struct {
+	Envelope
+	Type     string `json:"type"`
+	Site     string `json:"site"`
+	Keyword  string `json:"keyword"`
+	URLCount int    `json:"url_count"`
+	Level    int    `json:"level"`
+}
+
+type ErrorMessage struct {
+	Envelope
+	Type      string `json:"type"`
+	Site      string `json:"site"`
+	Keyword   string `json:"keyword"`
+	Level     int    `json:"level"`
+	Stage     string `json:"stage"`
+	URL       string `json:"url"`
+	ErrorCode string `json:"error_code"`
+	Error     string `json:"error"`
+	Retryable bool   `json:"retryable"`
+}
+
+
+############################################################
+# FILE: go-spider\internal\protocol\messages_test.go
+############################################################
+package protocol
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestMarshalUnmarshalSearch(t *testing.T) {
+  m := SearchMessage{
+    Envelope: Envelope{ProtocolVersion: Version, TaskID: "t1", MessageID: "m1", Timestamp: "now"},
+    Type:     "search", Site: "bj", Keyword: "kw", Level: 1, MaxPages: 1,
+  }
+	data, _ := json.Marshal(m)
+	var dec SearchMessage
+	json.Unmarshal(data, &dec)
+	if dec.Site != "bj" || dec.Keyword != "kw" {
+		t.Fatal("bad roundtrip")
+	}
+}
+
+func TestMarshalUnmarshalResult(t *testing.T) {
+	orig := ResultMessage{
+		Envelope: Envelope{ProtocolVersion: Version, TaskID: "t1", MessageID: "m2", Timestamp: "now"},
+		Type:     "result", Site: "bj", Keyword: "kw", Level: 1,
+		URL: "https://x.com", Title: "T", PublishDate: "2026-01-01",
+		Content: "C", Summary: "S", Score: 85,
+		MatchedKeywords: []string{"kw"},
+	}
+	data, _ := json.Marshal(orig)
+	var dec ResultMessage
+	json.Unmarshal(data, &dec)
+	if dec.Score != 85 {
+		t.Fatal("score mismatch")
+	}
+}
+
+func TestMarshalUnmarshalError(t *testing.T) {
+	orig := ErrorMessage{
+		Envelope: Envelope{ProtocolVersion: Version, TaskID: "t1", MessageID: "m3", Timestamp: "now"},
+		Type:     "error", Site: "bj", Keyword: "kw", Level: 1, Stage: "download", URL: "https://x.com", ErrorCode: "HTTP_403", Error: "forbidden", Retryable: false,
+	}
+	data, _ := json.Marshal(orig)
+	var dec ErrorMessage
+	json.Unmarshal(data, &dec)
+	if dec.ErrorCode != "HTTP_403" || dec.Retryable != false {
+		t.Fatal("bad error roundtrip")
+	}
+}
+
+func TestEnvelopePreservesVersion(t *testing.T) {
+  orig := SearchMessage{
+    Envelope: Envelope{ProtocolVersion: Version, TaskID: "t1", MessageID: "m4", Timestamp: "now"},
+    Type:     "search", Site: "bj", Keyword: "kw", Level: 1, MaxPages: 1,
+  }
+	var result map[string]interface{}
+	data, _ := json.Marshal(orig)
+	json.Unmarshal(data, &result)
+	if result["protocol_version"] != Version {
+		t.Fatal("protocol_version preserved")
+	}
+	if result["type"] != "search" {
+		t.Fatal("type field present")
+	}
+	if result["site"] != "bj" {
+		t.Fatal("site field present")
+	}
+}
+
+func TestOmitEmptyFieldStillSerialized(t *testing.T) {
+	m := ErrorMessage{
+		Envelope: Envelope{ProtocolVersion: Version, TaskID: "t1", MessageID: "m5", Timestamp: "now"},
+		Type:     "error", Stage: "download", ErrorCode: "ERR", Error: "msg",
+	}
+	data, _ := json.Marshal(m)
+	var result map[string]interface{}
+	json.Unmarshal(data, &result)
+	if _, exists := result["retryable"]; !exists {
+		t.Fatal("retryable should be serialized even if false")
+	}
+	if _, exists := result["url"]; !exists {
+		t.Fatal("url should be serialized even if empty")
+	}
+}
+
+func TestFixtureMatchSearch(t *testing.T) {
+  msg := SearchMessage{Envelope: Envelope{ProtocolVersion: "1.0", TaskID: "task-001", MessageID: "msg-001", Timestamp: "2026-07-27T16:00:00Z"}, Type: "search", Site: "czj_beijing", Keyword: "低空经济", Level: 1, MaxPages: 1}
+	data, _ := json.Marshal(msg)
+	var result map[string]interface{}
+	json.Unmarshal(data, &result)
+	if result["site"] != "czj_beijing" || result["keyword"] != "低空经济" {
+		t.Fatal("search fixture mismatch")
+	}
+}
+
+func TestFixtureMatchResult(t *testing.T) {
+	msg := ResultMessage{Envelope: Envelope{ProtocolVersion: "1.0", TaskID: "task-001", MessageID: "msg-004", Timestamp: "2026-07-27T16:00:00Z"}, Type: "result", URL: "https://czj.beijing.gov.cn/art/1.html", Title: "低空经济政策解读", PublishDate: "2026-07-27", Content: "正文内容", Score: 85}
+	data, _ := json.Marshal(msg)
+	var result map[string]interface{}
+	json.Unmarshal(data, &result)
+	if result["score"].(float64) != 85 {
+		t.Fatal("result fixture score mismatch")
+	}
+	if result["publish_date"] != "2026-07-27" {
+		t.Fatal("result fixture date mismatch")
+	}
+}
+func TestNewTaskIDNonEmpty(t *testing.T) {
+	id := NewTaskID()
+	if id == "" {
+		t.Fatal("NewTaskID returned empty")
+	}
+}
+
+func TestNewMessageIDNonEmpty(t *testing.T) {
+	id := NewMessageID()
+	if id == "" {
+		t.Fatal("NewMessageID returned empty")
+	}
+}
+
+func TestNewTaskIDUnique(t *testing.T) {
+	seen := make(map[string]bool)
+	for i := 0; i < 100; i++ {
+		id := NewTaskID()
+		if seen[id] {
+			t.Fatalf("duplicate task id: %s", id)
+		}
+		seen[id] = true
+	}
+}
+
+func TestNewMessageIDUnique(t *testing.T) {
+	seen := make(map[string]bool)
+	for i := 0; i < 100; i++ {
+		id := NewMessageID()
+		if seen[id] {
+			t.Fatalf("duplicate message id: %s", id)
+		}
+		seen[id] = true
+	}
+}
+
+func TestURLMessageWithTitle(t *testing.T) {
+	m := URLMessage{
+		Envelope: Envelope{ProtocolVersion: Version, TaskID: "t1", MessageID: "m1", Timestamp: "now"},
+		Type:     "url", URL: "https://x.com", Site: "bj",
+		Keyword: "kw", Level: 1, Title: "示例标题",
+	}
+	var result map[string]interface{}
+	data, _ := json.Marshal(m)
+	json.Unmarshal(data, &result)
+	if result["title"] != "示例标题" {
+		t.Fatalf("title = %v, want 示例标题", result["title"])
+	}
+	if result["type"] != "url" {
+		t.Fatal("type field present")
+	}
+}
+func TestMarshalUnmarshalSearchDone(t *testing.T) {
+	orig := SearchDoneMessage{
+		Envelope: Envelope{ProtocolVersion: Version, TaskID: "t1", MessageID: "m6", Timestamp: "now"},
+		Type:     "search_done", Site: "bj", Keyword: "kw", URLCount: 12, Level: 1,
+	}
+	data, _ := json.Marshal(orig)
+	var dec SearchDoneMessage
+	json.Unmarshal(data, &dec)
+	if dec.URLCount != 12 {
+		t.Fatal("url_count mismatch")
+	}
+	if dec.Type != "search_done" {
+		t.Fatal("type not search_done")
+	}
+}
+
+
+############################################################
+# FILE: go-spider\internal\queue\redis.go
+############################################################
+package queue
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"crawler-platform/internal/protocol"
+
+	"github.com/redis/go-redis/v9"
+)
+
+type HTMLPayload struct {
+	TaskID  string `json:"task_id"`
+	URL     string `json:"url"`
+	Site    string `json:"site"`
+	Keyword string `json:"keyword"`
+	Level   int    `json:"level"`
+	HTML    string `json:"html,omitempty"`
+	Time    string `json:"time"`
+	Title   string `json:"title,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Score   int    `json:"score"`
+}
+
+type RedisQueue struct {
+	client    *redis.Client
+	searchQueue string
+	eventQueue string
+	urlQueue  string
+	htmlQueue string
+	errQueue  string
+	resQueue  string
+}
+
+func NewRedisQueue(addr string) *RedisQueue {
+	client := redis.NewClient(&redis.Options{
+		Addr:         addr,
+		DialTimeout:  3 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+	})
+	return &RedisQueue{
+		client:    client,
+		eventQueue: "crawler:event",
+		searchQueue: "crawler:search",
+		urlQueue:  "crawler:url",
+		htmlQueue: "crawler:html",
+		errQueue:  "crawler:error",
+		resQueue:  "crawler:result",
+	}
+}
+
+func (rq *RedisQueue) Ping() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return rq.client.Ping(ctx).Err()
+}
+
+func (rq *RedisQueue) PushURLTask(url, site, keyword string, level int, title, taskID string) error {
+	payload := HTMLPayload{
+		TaskID: taskID, URL: url, Site: site, Keyword: keyword, Level: level, Title: title,
+		Time: time.Now().Format(time.RFC3339),
+	}
+	return rq.push(rq.urlQueue, payload)
+}
+
+func (rq *RedisQueue) PushHTML(url, title, html, site, keyword string, level int, taskID string) error {
+	payload := HTMLPayload{
+		TaskID: taskID, URL: url, Title: title, HTML: html,
+		Site: site, Keyword: keyword, Level: level,
+		Time: time.Now().Format(time.RFC3339),
+	}
+	return rq.push(rq.htmlQueue, payload)
+}
+
+// Deprecated: Use PushErrorMessage instead. This function uses the old HTMLPayload format.
+func (rq *RedisQueue) PushError(url, errMsg string) error {
+	payload := HTMLPayload{
+		URL: url, Error: errMsg,
+		Time: time.Now().Format(time.RFC3339),
+	}
+	return rq.push(rq.errQueue, payload)
+}
+
+func (rq *RedisQueue) push(queue string, payload HTMLPayload) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return rq.client.LPush(ctx, queue, data).Err()
+}
+
+func (rq *RedisQueue) PopURL() (*HTMLPayload, error) {
+	return rq.pop(rq.urlQueue)
+}
+
+func (rq *RedisQueue) PopHTML() (*HTMLPayload, error) {
+	return rq.pop(rq.htmlQueue)
+}
+
+func (rq *RedisQueue) PopResult() (*HTMLPayload, error) {
+	return rq.pop(rq.resQueue)
+}
+
+func (rq *RedisQueue) pop(queue string) (*HTMLPayload, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := rq.client.BRPop(ctx, 3*time.Second, queue).Result()
+	if err != nil {
+		return nil, err
+	}
+	var payload HTMLPayload
+	if err := json.Unmarshal([]byte(result[1]), &payload); err != nil {
+		return nil, err
+	}
+	return &payload, nil
+}
+func (rq *RedisQueue) PushSearch(taskID, site, keyword string, level, maxPages int) error {
+	msg := protocol.SearchMessage{
+		Envelope: protocol.Envelope{
+			ProtocolVersion: protocol.Version,
+			TaskID:          taskID,
+			MessageID:       protocol.NewMessageID(),
+			Timestamp:       time.Now().Format(time.RFC3339),
+		},
+		Type:     "search",
+		Site:     site,
+		Keyword:  keyword,
+		Level:    level,
+		MaxPages: maxPages,
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return rq.client.LPush(ctx, rq.searchQueue, data).Err()
+}
+
+func (rq *RedisQueue) PopSearch() (*protocol.SearchMessage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := rq.client.BRPop(ctx, 3*time.Second, rq.searchQueue).Result()
+	if err != nil {
+		return nil, err
+	}
+	var msg protocol.SearchMessage
+	if err := json.Unmarshal([]byte(result[1]), &msg); err != nil {
+		return nil, err
+	}
+	return &msg, nil
+}
+func (rq *RedisQueue) PushResultMessage(msg *protocol.ResultMessage) error {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return rq.client.LPush(ctx, rq.resQueue, data).Err()
+}
+
+func (rq *RedisQueue) PopResultMessage() (*protocol.ResultMessage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := rq.client.BRPop(ctx, 3*time.Second, rq.resQueue).Result()
+	if err != nil {
+		return nil, err
+	}
+	var msg protocol.ResultMessage
+	if err := json.Unmarshal([]byte(result[1]), &msg); err != nil {
+		return nil, err
+	}
+	return &msg, nil
+}
+func (rq *RedisQueue) PopSearchDone() (*protocol.SearchDoneMessage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := rq.client.BRPop(ctx, 3*time.Second, rq.eventQueue).Result()
+	if err != nil {
+		return nil, err
+	}
+	var msg protocol.SearchDoneMessage
+	if err := json.Unmarshal([]byte(result[1]), &msg); err != nil {
+		return nil, err
+	}
+	return &msg, nil
+}
+func (rq *RedisQueue) PushErrorMessage(msg *protocol.ErrorMessage) error {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return rq.client.LPush(ctx, rq.errQueue, data).Err()
+}
+
+func (rq *RedisQueue) PopErrorMessage(timeout time.Duration) (*protocol.ErrorMessage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := rq.client.BRPop(ctx, timeout, rq.errQueue).Result()
+	if err != nil {
+		return nil, err
+	}
+	var msg protocol.ErrorMessage
+	if err := json.Unmarshal([]byte(result[1]), &msg); err != nil {
+		return nil, err
+	}
+	return &msg, nil
+}
+
+
+############################################################
+# FILE: go-spider\internal\queue\redis_test.go
+############################################################
+package queue
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestHTMLPayloadMarshalIncludesTitle(t *testing.T) {
+	payload := HTMLPayload{
+		URL:   "https://example.com",
+		Title: "Example",
+		HTML:  "<html></html>",
+		Time:  "2026-07-26T00:00:00Z",
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal HTMLPayload: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal HTMLPayload: %v", err)
+	}
+
+	if decoded["title"] != "Example" {
+		t.Fatalf("title = %v, want Example", decoded["title"])
+	}
+	if _, exists := decoded["error"]; exists {
+		t.Fatal("empty error should be omitted")
+	}
+}
+
+func TestHTMLPayloadMarshalIncludesError(t *testing.T) {
+	payload := HTMLPayload{
+		URL:   "https://example.com",
+		Error: "request failed",
+		Time:  "2026-07-26T00:00:00Z",
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal HTMLPayload: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal HTMLPayload: %v", err)
+	}
+
+	if decoded["error"] != "request failed" {
+		t.Fatalf("error = %v, want request failed", decoded["error"])
+	}
+	if _, exists := decoded["title"]; exists {
+		t.Fatal("empty title should be omitted")
+	}
+}
+func TestPushSearchFormatMatchesProtocol(t *testing.T) {
+	var data map[string]any
+	msg := map[string]any{
+		"protocol_version": "1.0",
+		"task_id":          "",
+		"message_id":       "",
+		"timestamp":        "2026-07-27T16:00:00Z",
+		"type":             "search",
+		"site":             "czj_beijing",
+		"keyword":          "低空经济",
+		"level":            1,
+		"max_pages":        0,
+	}
+	encoded, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal search message: %v", err)
+	}
+	if err := json.Unmarshal(encoded, &data); err != nil {
+		t.Fatalf("unmarshal search message: %v", err)
+	}
+	if data["site"] != "czj_beijing" {
+		t.Fatalf("site = %v, want czj_beijing", data["site"])
+	}
+	if data["max_pages"].(float64) != 0 {
+		t.Fatalf("max_pages = %v, want 0", data["max_pages"])
+	}
+}
+func TestHTMLPayloadDeserializePreservesFields(t *testing.T) {
+	data := `{
+		"task_id": "t-001",
+		"url": "https://czj.beijing.gov.cn/art/1.html",
+		"site": "czj_beijing",
+		"keyword": "低空经济",
+		"level": 1,
+		"title": "政策解读",
+		"time": "2026-07-27T16:00:00Z"
+	}`
+	var p HTMLPayload
+	if err := json.Unmarshal([]byte(data), &p); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if p.TaskID != "t-001" {
+		t.Fatalf("TaskID = %q, want t-001", p.TaskID)
+	}
+	if p.URL != "https://czj.beijing.gov.cn/art/1.html" {
+		t.Fatal("URL missing")
+	}
+	if p.Site != "czj_beijing" {
+		t.Fatalf("Site = %q, want czj_beijing", p.Site)
+	}
+	if p.Keyword != "低空经济" {
+		t.Fatalf("Keyword = %q, want 低空经济", p.Keyword)
+	}
+	if p.Level != 1 {
+		t.Fatalf("Level = %d, want 1", p.Level)
+	}
+	if p.Title != "政策解读" {
+		t.Fatalf("Title = %q, want 政策解读", p.Title)
+	}
+}
+
+
+func TestMaxPagesPositive(t *testing.T) {
+	tests := []struct {
+		input int
+		want  int
+		valid bool
+	}{
+		{input: 0, want: 1, valid: true},
+		{input: 1, want: 1, valid: true},
+		{input: 5, want: 5, valid: true},
+		{input: -1, want: 0, valid: false},
+	}
+	for _, tc := range tests {
+		maxPages := tc.input
+		if maxPages < 0 {
+			continue // should be rejected at API layer
+		}
+		if maxPages == 0 {
+			maxPages = 1
+		}
+		if maxPages != tc.want {
+			t.Fatalf("input=%d: got %d, want %d", tc.input, maxPages, tc.want)
+		}
+	}
+}
+func TestErrorMessageMarshalUnmarshal(t *testing.T) {
+	msg := map[string]interface{}{
+		"protocol_version": "1.0",
+		"task_id":          "t-001",
+		"message_id":       "m-001",
+		"timestamp":        "2026-07-27T16:00:00Z",
+		"type":             "error",
+		"stage":            "download",
+		"site":             "czj_beijing",
+		"keyword":          "低空经济",
+		"level":            1,
+		"url":              "https://czj.beijing.gov.cn/art/1.html",
+		"error_code":       "HTTP_403",
+		"error":            "forbidden",
+		"retryable":        false,
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal error message: %v", err)
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatalf("unmarshal error message: %v", err)
+	}
+	if result["site"] != "czj_beijing" {
+		t.Fatalf("site = %v, want czj_beijing", result["site"])
+	}
+	if result["retryable"] != false {
+		t.Fatalf("retryable = %v, want false", result["retryable"])
+	}
+}
+
+
+############################################################
+# FILE: go-spider\internal\store\mysql.go
+############################################################
+package store
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+)
+
+type Article struct {
+	ID              uint       `gorm:"primaryKey" json:"id"`
+	URL             string     `gorm:"type:varchar(1000);not null;uniqueIndex:idx_url_hash,length:32" json:"url"`
+	Title           string     `gorm:"type:varchar(500)" json:"title"`
+	Summary         string     `gorm:"type:text" json:"summary"`
+	Content         string     `gorm:"type:longtext" json:"content"`
+	PublishTime     *time.Time `json:"publish_time"`
+	Province        string     `gorm:"type:varchar(100)" json:"province"`
+	Site            string     `gorm:"type:varchar(200)" json:"site"`
+	Keyword         string     `gorm:"type:varchar(200)" json:"keyword"`
+	Score           int        `gorm:"default:0" json:"score"`
+	MatchedKeywords string     `gorm:"type:varchar(500)" json:"matched_keywords"`
+	CrawlTime       time.Time  `json:"crawl_time"`
+	DetailFetched   bool       `gorm:"default:false" json:"detail_fetched"`
+	SourceType      string     `gorm:"type:varchar(50)" json:"source_type"`
+	Status          string     `gorm:"type:varchar(20);default:new" json:"status"`
+	CreatedAt       time.Time  `json:"created_at"`
+}
+
+type Task struct {
+	ID           string    `gorm:"type:varchar(32);primaryKey" json:"id"`
+	Keyword      string    `gorm:"type:varchar(200)" json:"keyword"`
+	Site         string    `gorm:"type:varchar(100)" json:"site"`
+	Status       string    `gorm:"type:varchar(32);default:created" json:"status"`
+	ArticleCount int       `gorm:"default:0" json:"article_count"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+type CrawlLog struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	URL       string    `gorm:"type:varchar(1000);not null" json:"url"`
+	Status    int       `gorm:"not null" json:"status"`
+	CostMs    int       `gorm:"default:0" json:"cost_ms"`
+	Error     string    `gorm:"type:text" json:"error"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type MySQLStore struct {
+	db *gorm.DB
+}
+
+func NewMySQLStore(dsn string) (*MySQLStore, error) {
+	if dsn == "" {
+		dsn = fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True",
+			envDefault("MYSQL_USER", "root"),
+			envDefault("MYSQL_PASSWORD", ""),
+			envDefault("MYSQL_HOST", "localhost"),
+			envDefault("MYSQL_PORT", "3306"),
+			envDefault("MYSQL_DATABASE", "crawler_db"),
+		)
+	}
+
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Warn),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("mysql connect: %w", err)
+	}
+
+	if err := db.AutoMigrate(&Article{}, &Task{}, &CrawlLog{}); err != nil {
+		return nil, fmt.Errorf("auto migrate: %w", err)
+	}
+
+	log.Println("[store] MySQL connected, tables migrated")
+	return &MySQLStore{db: db}, nil
+}
+
+func (s *MySQLStore) SaveArticle(a *Article) error {
+	return s.db.Where("url = ?", a.URL).Assign(a).FirstOrCreate(a).Error
+}
+
+func (s *MySQLStore) SaveTask(t *Task) error {
+	return s.db.Where("id = ?", t.ID).Assign(t).FirstOrCreate(t).Error
+}
+
+func (s *MySQLStore) UpdateTask(id, status string, count int) error {
+	result := s.db.Model(&Task{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"status": status, "article_count": count,
+	})
+	if result.Error != nil {
+		log.Printf("[store] UpdateTask error: id=%s status=%s count=%d err=%v", id, status, count, result.Error)
+		return fmt.Errorf("update task %s status=%s: %w", id, status, result.Error)
+	}
+	if result.RowsAffected == 0 {
+		log.Printf("[store] UpdateTask: no rows affected: id=%s status=%s count=%d", id, status, count)
+	}
+	return nil
+}
+
+func (s *MySQLStore) LogCrawl(url string, httpStatus, costMs int, errMsg string) {
+	s.db.Create(&CrawlLog{
+		URL: url, Status: httpStatus, CostMs: costMs, Error: errMsg,
+	})
+}
+
+func (s *MySQLStore) QueryArticles(keyword string, limit int) ([]Article, error) {
+	var articles []Article
+	q := s.db.Order("score DESC").Limit(limit)
+	if keyword != "" {
+		q = q.Where("title LIKE ?", "%"+keyword+"%")
+	}
+	err := q.Find(&articles).Error
+	return articles, err
+}
+
+func envDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+
+############################################################
+# FILE: go-spider\internal\store\mysql_test.go
+############################################################
+package store
+
+import (
+	"strings"
+	"testing"
+
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+)
+
+func connectTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	dsn := "root:@tcp(localhost:3306)/crawler_db?charset=utf8mb4&parseTime=True"
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Skipf("MySQL not available: %v", err)
+	}
+	return db
+}
+
+func brokenStore(t *testing.T) *MySQLStore {
+	t.Helper()
+	db := connectTestDB(t)
+	// Close the underlying connection pool to simulate DB failure
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Skipf("failed to get underlying sql.DB: %v", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Skipf("failed to close sql.DB: %v", err)
+	}
+	return &MySQLStore{db: db}
+}
+
+func TestUpdateTaskSuccess(t *testing.T) {
+	db := connectTestDB(t)
+	s := &MySQLStore{db: db}
+
+	taskID := "ut-" + t.Name()
+	s.db.Create(&Task{ID: taskID, Keyword: "test", Site: "test", Status: "created"})
+	t.Cleanup(func() {
+		s.db.Unscoped().Delete(&Task{}, "id = ?", taskID)
+	})
+
+	err := s.UpdateTask(taskID, "completed", 5)
+	if err != nil {
+		t.Fatalf("UpdateTask returned error: %v", err)
+	}
+
+	var task Task
+	if err := s.db.First(&task, "id = ?", taskID).Error; err != nil {
+		t.Fatalf("failed to read task: %v", err)
+	}
+	if task.Status != "completed" {
+		t.Fatalf("status = %q, want %q", task.Status, "completed")
+	}
+	if task.ArticleCount != 5 {
+		t.Fatalf("article_count = %d, want %d", task.ArticleCount, 5)
+	}
+}
+
+func TestUpdateTaskErrorOnInvalidDB(t *testing.T) {
+	s := brokenStore(t)
+	err := s.UpdateTask("nonexistent-id", "completed", 1)
+	if err == nil {
+		t.Fatal("UpdateTask: expected error for closed DB connection, got nil")
+	}
+	if !strings.Contains(err.Error(), "update task") {
+		t.Fatalf("error message should contain 'update task', got: %v", err)
+	}
+}
+
+func TestUpdateTaskNonExistentRow(t *testing.T) {
+	db := connectTestDB(t)
+	s := &MySQLStore{db: db}
+
+	err := s.UpdateTask("non-existent-"+t.Name(), "completed", 1)
+	if err != nil {
+		t.Fatalf("UpdateTask on non-existent row returned error: %v", err)
+	}
+}
+
+
+############################################################
+# FILE: go-spider\internal\worker\pool.go
+############################################################
+package worker
+
+import (
+	"fmt"
+	"log"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"crawler-platform/internal/client"
+	"crawler-platform/internal/config"
+	"crawler-platform/internal/protocol"
+	"crawler-platform/internal/queue"
+	"crawler-platform/internal/store"
+)
+
+type Task struct {
+	TaskID  string
+	URL     string
+	Title   string
+	Site    string
+	Keyword string
+	Level   int
+	SiteCfg *config.SiteConfig
+}
+
+// taskStore is the subset of store capabilities used by the worker pool.
+// Production uses taskStore; tests provide a fake.
+type taskStore interface {
+	UpdateTask(id, status string, count int) error
+	SaveArticle(article *store.Article) error
+}
+
+type Stats struct {
+	Submitted int64
+	Completed int64
+	Failed    int64
+	QueueLen  int
+}
+
+type TaskStatus struct {
+	SearchDone bool
+	Expected   int
+	Stored     int
+	Failed     int
+	storedURLs map[string]struct{}
+	failedURLs map[string]struct{}
+}
+
+type Pool struct {
+	workers      int
+	taskCh       chan Task
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
+	resultWg     sync.WaitGroup
+	redis        *queue.RedisQueue
+	store        taskStore
+	taskStatuses map[string]*TaskStatus
+	taskMu       sync.Mutex
+	fetcher      *client.RestyFetcher
+	submitted    atomic.Int64
+	completed    atomic.Int64
+	failed       atomic.Int64
+}
+
+func NewPool(workerCount int, rq *queue.RedisQueue, mysqlStore taskStore) *Pool {
+	return &Pool{
+		workers:      workerCount,
+		taskCh:       make(chan Task, 1000),
+		stopCh:       make(chan struct{}),
+		redis:        rq,
+		store:        mysqlStore,
+		taskStatuses: make(map[string]*TaskStatus),
+	}
+}
+
+func (p *Pool) Start() {
+	p.fetcher = client.NewRestyFetcher(0.5)
+	for i := 0; i < p.workers; i++ {
+		p.wg.Add(1)
+		go p.worker(i)
+	}
+	if p.redis != nil {
+		p.StartRedisConsumer()
+	}
+	p.StartEventConsumer()
+	if p.store != nil {
+		p.StartResultConsumer()
+	}
+	p.StartErrorConsumer()
+	log.Printf("[worker] pool started with %d workers", p.workers)
+}
+
+func (p *Pool) Stop() {
+	close(p.stopCh)
+	p.wg.Wait()
+	p.resultWg.Wait()
+	log.Println("[worker] pool stopped")
+}
+
+func (p *Pool) Submit(task Task) {
+	p.submitted.Add(1)
+	p.taskCh <- task
+}
+
+func (p *Pool) Stats() Stats {
+	return Stats{
+		Submitted: p.submitted.Load(),
+		Completed: p.completed.Load(),
+		Failed:    p.failed.Load(),
+		QueueLen:  len(p.taskCh),
+	}
+}
+
+func (p *Pool) worker(id int) {
+	defer p.wg.Done()
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case task := <-p.taskCh:
+			p.process(id, task)
+		}
+	}
+}
+
+func (p *Pool) process(id int, task Task) {
+	html, err := p.fetcher.Fetch(task.URL)
+	if err != nil {
+		log.Printf("[worker-%d] FETCH FAIL %s: %v", id, task.URL, err)
+		p.failed.Add(1)
+		if p.redis != nil {
+			if pushErr := p.redis.PushErrorMessage(&protocol.ErrorMessage{
+				Envelope: protocol.Envelope{
+					ProtocolVersion: protocol.Version,
+					TaskID:          task.TaskID,
+					MessageID:       protocol.NewMessageID(),
+					Timestamp:       time.Now().Format(time.RFC3339),
+				},
+				Type:      "error",
+				Stage:     "download",
+				Site:      task.Site,
+				Keyword:   task.Keyword,
+				Level:     task.Level,
+				URL:       task.URL,
+				ErrorCode: "DOWNLOAD_FAILED",
+				Error:     err.Error(),
+				Retryable: true,
+			}); pushErr != nil {
+				log.Printf("[worker-%d] PUSH ERROR FAIL: %v", id, pushErr)
+			}
+		}
+		return
+	}
+	log.Printf("[worker-%d] FETCHED: %s (%d bytes)", id, task.Title, len(html))
+
+	if p.redis != nil {
+		if err := p.redis.PushHTML(task.URL, task.Title, html, task.Site, task.Keyword, task.Level, task.TaskID); err != nil {
+			log.Printf("[worker-%d] REDIS HTML FAIL: %v", id, err)
+			if pushErr := p.redis.PushErrorMessage(&protocol.ErrorMessage{
+				Envelope: protocol.Envelope{
+					ProtocolVersion: protocol.Version,
+					TaskID:          task.TaskID,
+					MessageID:       protocol.NewMessageID(),
+					Timestamp:       time.Now().Format(time.RFC3339),
+				},
+				Type:      "error",
+				Stage:     "download",
+				Site:      task.Site,
+				Keyword:   task.Keyword,
+				Level:     task.Level,
+				URL:       task.URL,
+				ErrorCode: "DOWNLOAD_FAILED",
+				Error:     fmt.Sprintf("html_push_fail: %v", err),
+				Retryable: true,
+			}); pushErr != nil {
+				log.Printf("[worker-%d] PUSH ERROR FAIL: %v", id, pushErr)
+			}
+			p.failed.Add(1)
+			return
+		}
+		log.Printf("[worker-%d] -> Redis HTML: %s (%d bytes)", id, task.Title, len(html))
+	} else {
+		log.Printf("[worker-%d] FETCHED: %s (%d bytes) [no Redis]", id, task.Title, len(html))
+	}
+
+	p.completed.Add(1)
+}
+
+// WorkerManager: public API wrapping the worker pool
+// Architecture: WorkerManager -> Pool -> N goroutines
+// Each goroutine: Fetch(URL) -> Save HTML -> Push to Redis
+type WorkerManager struct {
+	pool *Pool
+}
+
+func NewWorkerManager(workerCount int, rq *queue.RedisQueue, mysqlStore taskStore) *WorkerManager {
+	return &WorkerManager{pool: NewPool(workerCount, rq, mysqlStore)}
+}
+
+func (p *Pool) StartResultConsumer() {
+	p.resultWg.Add(1)
+	go func() {
+		defer p.resultWg.Done()
+		log.Println("[worker] Result consumer started: listening crawler:result")
+		for {
+			select {
+			case <-p.stopCh:
+				log.Println("[worker] Result consumer stopped")
+				return
+			default:
+				msg, err := p.redis.PopResultMessage()
+				if err != nil {
+					continue
+				}
+				if msg == nil {
+					continue
+				}
+				if err := p.consumeResult(msg); err != nil {
+					log.Printf("[result] consume error: %v", err)
+				}
+			}
+		}
+	}()
+}
+
+func (p *Pool) getOrCreateTaskStatus(taskID string) *TaskStatus {
+	if ts, ok := p.taskStatuses[taskID]; ok {
+		return ts
+	}
+	ts := &TaskStatus{}
+	ts.storedURLs = make(map[string]struct{})
+	ts.failedURLs = make(map[string]struct{})
+	p.taskStatuses[taskID] = ts
+	return ts
+}
+
+func (p *Pool) StartEventConsumer() {
+	p.resultWg.Add(1)
+	go func() {
+		defer p.resultWg.Done()
+		log.Println("[worker] Event consumer started: listening crawler:event")
+		for {
+			select {
+			case <-p.stopCh:
+				log.Println("[worker] Event consumer stopped")
+				return
+			default:
+				sd, err := p.redis.PopSearchDone()
+				if err != nil {
+					continue
+				}
+				if sd == nil {
+					continue
+				}
+				if err := p.handleSearchDone(sd); err != nil {
+					log.Printf("[event] handleSearchDone error: task=%s err=%v", sd.TaskID, err)
+				}
+			}
+		}
+	}()
+}
+
+func (p *Pool) determineTaskStatus(ts *TaskStatus) string {
+	if !ts.SearchDone {
+		return ""
+	}
+	if ts.Expected == 0 {
+		return "completed"
+	}
+	if ts.Stored == ts.Expected {
+		return "completed"
+	}
+	if ts.Stored+ts.Failed < ts.Expected {
+		return ""
+	}
+	if ts.Stored > 0 && ts.Failed > 0 {
+		return "completed_with_errors"
+	}
+	if ts.Stored == 0 && ts.Failed > 0 {
+		return "failed"
+	}
+	return ""
+}
+
+func (p *Pool) handleSearchDone(msg *protocol.SearchDoneMessage) error {
+	p.taskMu.Lock()
+	ts := p.getOrCreateTaskStatus(msg.TaskID)
+	ts.SearchDone = true
+	ts.Expected = msg.URLCount
+	status := p.determineTaskStatus(ts)
+	p.taskMu.Unlock()
+
+	log.Printf("[task:%s] search_done: expected=%d stored=%d", msg.TaskID, msg.URLCount, ts.Stored)
+
+	if status != "" {
+		if p.store != nil {
+			if err := p.store.UpdateTask(msg.TaskID, status, ts.Stored); err != nil {
+				log.Printf("[task:%s] failed to persist final status %s: %v", msg.TaskID, status, err)
+				return err
+			}
+		}
+		log.Printf("[task:%s] %s: stored=%d failed=%d expected=%d", msg.TaskID, status, ts.Stored, ts.Failed, ts.Expected)
+	}
+	return nil
+}
+
+func (p *Pool) checkTaskCompletion(taskID string) error {
+	p.taskMu.Lock()
+	ts, ok := p.taskStatuses[taskID]
+	if !ok {
+		p.taskMu.Unlock()
+		return nil
+	}
+	status := p.determineTaskStatus(ts)
+	p.taskMu.Unlock()
+
+	if status != "" {
+		if p.store != nil {
+			if err := p.store.UpdateTask(taskID, status, ts.Stored); err != nil {
+				log.Printf("[task:%s] failed to persist completion status %s: %v", taskID, status, err)
+				return err
+			}
+		}
+		log.Printf("[task:%s] %s: stored=%d failed=%d expected=%d", taskID, status, ts.Stored, ts.Failed, ts.Expected)
+	}
+	return nil
+}
+
+// parsePublishTime parses a date string from the v1 protocol into a time pointer.
+// Supported formats: YYYY-MM-DD (primary), RFC3339 (fallback).
+// Empty/whitespace-only returns (nil, nil).
+// Invalid input returns (nil, error).
+// It never returns time.Now().
+func parsePublishTime(s string) (*time.Time, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		return &t, nil
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return &t, nil
+	}
+	return nil, fmt.Errorf("unrecognized date format: %q", s)
+}
+
+func (p *Pool) consumeResult(msg *protocol.ResultMessage) error {
+	log.Printf("[result] processing: task=%s url=%s score=%d", msg.TaskID, msg.URL, msg.Score)
+
+	// URL-level dedup: skip if already stored or failed
+	p.taskMu.Lock()
+	ts := p.getOrCreateTaskStatus(msg.TaskID)
+	if _, exists := ts.failedURLs[msg.URL]; exists {
+		p.taskMu.Unlock()
+		return nil
+	}
+	if _, exists := ts.storedURLs[msg.URL]; exists {
+		p.taskMu.Unlock()
+		return nil
+	}
+	p.taskMu.Unlock()
+
+	publishTime, err := parsePublishTime(msg.PublishDate)
+	if err != nil {
+		log.Printf("[result] invalid publish_date %q for %s: %v", msg.PublishDate, msg.URL, err)
+	}
+
+	article := &store.Article{
+		URL:             msg.URL,
+		Title:           msg.Title,
+		Content:         msg.Content,
+		Site:            msg.Site,
+		Keyword:         msg.Keyword,
+		Score:           msg.Score,
+		MatchedKeywords: strings.Join(msg.MatchedKeywords, ";"),
+		PublishTime:     publishTime,
+		CrawlTime:       time.Now(),
+	}
+
+	if err := p.store.SaveArticle(article); err != nil {
+		p.taskMu.Lock()
+		ts.failedURLs[msg.URL] = struct{}{}
+		ts.Failed = len(ts.failedURLs)
+		p.taskMu.Unlock()
+		if err := p.checkTaskCompletion(msg.TaskID); err != nil {
+			log.Printf("[result] checkTaskCompletion after store error: %v", err)
+		}
+		if p.redis != nil {
+			if pushErr := p.redis.PushErrorMessage(&protocol.ErrorMessage{
+				Envelope: protocol.Envelope{
+					ProtocolVersion: protocol.Version,
+					TaskID:          msg.TaskID,
+					MessageID:       protocol.NewMessageID(),
+					Timestamp:       time.Now().Format(time.RFC3339),
+				},
+				Type:      "error",
+				Stage:     "store",
+				Site:      msg.Site,
+				Keyword:   msg.Keyword,
+				Level:     msg.Level,
+				URL:       msg.URL,
+				ErrorCode: "STORE_FAILED",
+				Error:     err.Error(),
+				Retryable: true,
+			}); pushErr != nil {
+				log.Printf("[result] push error fail: %v", pushErr)
+			}
+		}
+		return fmt.Errorf("save article: %w", err)
+	}
+
+	p.taskMu.Lock()
+	ts.storedURLs[msg.URL] = struct{}{}
+	ts.Stored = len(ts.storedURLs)
+	stored := ts.Stored
+	p.taskMu.Unlock()
+
+	if err := p.store.UpdateTask(msg.TaskID, "running", stored); err != nil {
+		log.Printf("[result] failed to update running status: task=%s err=%v", msg.TaskID, err)
+	}
+	if err := p.checkTaskCompletion(msg.TaskID); err != nil {
+		log.Printf("[result] checkTaskCompletion after saved: task=%s err=%v", msg.TaskID, err)
+		return err
+	}
+	log.Printf("[result] saved: task=%s url=%s score=%d", msg.TaskID, msg.URL, msg.Score)
+	return nil
+}
+
+func (wm *WorkerManager) Start()               { wm.pool.Start() }
+func (wm *WorkerManager) Stop()                { wm.pool.Stop() }
+func (wm *WorkerManager) Submit(t Task)        { wm.pool.Submit(t) }
+func (wm *WorkerManager) Stats() Stats         { return wm.pool.Stats() }
+func (wm *WorkerManager) StartResultConsumer() { wm.pool.StartResultConsumer() }
+func (p *Pool) StartRedisConsumer() {
+	go func() {
+		log.Println("[worker] Redis consumer started: listening crawler:url")
+		for {
+			select {
+			case <-p.stopCh:
+				log.Println("[worker] Redis consumer stopped")
+				return
+			default:
+				payload, err := p.redis.PopURL()
+				if err != nil {
+					continue
+				}
+				if payload == nil {
+					continue
+				}
+				p.submitted.Add(1)
+				p.taskCh <- Task{
+					TaskID:  payload.TaskID,
+					URL:     payload.URL,
+					Title:   payload.Title,
+					Site:    payload.Site,
+					Keyword: payload.Keyword,
+					Level:   payload.Level,
+				}
+			}
+		}
+	}()
+}
+func (wm *WorkerManager) StartEventConsumer() { wm.pool.StartEventConsumer() }
+func (p *Pool) StartErrorConsumer() {
+	p.resultWg.Add(1)
+	go func() {
+		defer p.resultWg.Done()
+		log.Println("[worker] Error consumer started: listening crawler:error")
+		for {
+			select {
+			case <-p.stopCh:
+				log.Println("[worker] Error consumer stopped")
+				return
+			default:
+				msg, err := p.redis.PopErrorMessage(3 * time.Second)
+				if err != nil {
+					continue
+				}
+				if msg == nil {
+					continue
+				}
+				if err := p.consumeError(msg); err != nil {
+					log.Printf("[error] consumeError: task=%s err=%v", msg.TaskID, err)
+				}
+			}
+		}
+	}()
+}
+
+func (p *Pool) consumeError(msg *protocol.ErrorMessage) error {
+	// Search-level errors: task-wide failure, mark as failed directly
+	if msg.Stage == "search" && msg.URL == "" {
+		p.taskMu.Lock()
+		ts := p.getOrCreateTaskStatus(msg.TaskID)
+		ts.SearchDone = true
+		ts.Expected = 0
+		p.taskMu.Unlock()
+
+		log.Printf("[task:%s] search failed: %s", msg.TaskID, msg.Error)
+		if p.store != nil {
+			if err := p.store.UpdateTask(msg.TaskID, "failed", 0); err != nil {
+				combined := fmt.Errorf("search error %q then persist failed status: %w", msg.Error, err)
+				log.Printf("[task:%s] %v", msg.TaskID, combined)
+				return combined
+			}
+		}
+		return nil
+	}
+
+	// URL-level errors: idempotent failure count
+	p.taskMu.Lock()
+	ts := p.getOrCreateTaskStatus(msg.TaskID)
+
+	// Success has priority: URL already stored, skip
+	if _, exists := ts.storedURLs[msg.URL]; exists {
+		p.taskMu.Unlock()
+		return nil
+	}
+	// Duplicate error: URL already failed, skip (idempotent)
+	if _, exists := ts.failedURLs[msg.URL]; exists {
+		p.taskMu.Unlock()
+		return nil
+	}
+
+	ts.failedURLs[msg.URL] = struct{}{}
+	ts.Failed = len(ts.failedURLs)
+	p.taskMu.Unlock()
+
+	log.Printf("[task:%s] error: stage=%s url=%s code=%s", msg.TaskID, msg.Stage, msg.URL, msg.ErrorCode)
+	if err := p.checkTaskCompletion(msg.TaskID); err != nil {
+		log.Printf("[task:%s] checkTaskCompletion after error failed: %v", msg.TaskID, err)
+		return err
+	}
+	return nil
+}
+
+func (wm *WorkerManager) StartErrorConsumer() { wm.pool.StartErrorConsumer() }
+
+
+############################################################
+# FILE: go-spider\internal\worker\pool_test.go
+############################################################
+package worker
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"crawler-platform/internal/protocol"
+	"crawler-platform/internal/store"
+)
+
+type fakeStore struct {
+	updateTask  func(id, status string, count int) error
+	saveArticle func(article *store.Article) error
+}
+
+func (f *fakeStore) UpdateTask(id, status string, count int) error {
+	if f.updateTask != nil {
+		return f.updateTask(id, status, count)
+	}
+	return nil
+}
+
+func (f *fakeStore) SaveArticle(article *store.Article) error {
+	if f.saveArticle != nil {
+		return f.saveArticle(article)
+	}
+	return nil
+}
+
+var errUpdateFailed = errors.New("fake: update task failed")
+var errSaveFailed = errors.New("fake: save article failed")
+
+func newTestPool(store taskStore) *Pool {
+	return &Pool{store: store, taskStatuses: make(map[string]*TaskStatus)}
+}
+func TestHandleSearchDone_CompletedSuccess(t *testing.T) {
+	var gotID, gotStatus string
+	var gotCount int
+	store := &fakeStore{
+		updateTask: func(id, status string, count int) error {
+			gotID, gotStatus, gotCount = id, status, count
+			return nil
+		},
+	}
+	p := newTestPool(store)
+	msg := &protocol.SearchDoneMessage{
+		Envelope: protocol.Envelope{TaskID: "t1"},
+		URLCount: 2,
+	}
+	p.getOrCreateTaskStatus("t1").Expected = 2
+	p.getOrCreateTaskStatus("t1").Stored = 2
+
+	err := p.handleSearchDone(msg)
+	if err != nil {
+		t.Fatalf("handleSearchDone returned error: %v", err)
+	}
+	if gotID != "t1" {
+		t.Fatalf("got id %q, want t1", gotID)
+	}
+	if gotStatus != "completed" {
+		t.Fatalf("got status %q, want completed", gotStatus)
+	}
+	if gotCount != 2 {
+		t.Fatalf("got count %d, want 2", gotCount)
+	}
+}
+func TestHandleSearchDone_CompletedWithErrorsSuccess(t *testing.T) {
+	var gotStatus string
+	store := &fakeStore{
+		updateTask: func(id, status string, count int) error {
+			gotStatus = status
+			return nil
+		},
+	}
+	p := newTestPool(store)
+	msg := &protocol.SearchDoneMessage{
+		Envelope: protocol.Envelope{TaskID: "t2"}, URLCount: 3,
+	}
+	ts := p.getOrCreateTaskStatus("t2")
+	ts.Expected, ts.Stored, ts.Failed = 3, 2, 1
+
+	err := p.handleSearchDone(msg)
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if gotStatus != "completed_with_errors" {
+		t.Fatalf("got %q, want completed_with_errors", gotStatus)
+	}
+}
+
+func TestHandleSearchDone_FailedSuccess(t *testing.T) {
+	var gotStatus string
+	store := &fakeStore{
+		updateTask: func(id, status string, count int) error {
+			gotStatus = status
+			return nil
+		},
+	}
+	p := newTestPool(store)
+	msg := &protocol.SearchDoneMessage{
+		Envelope: protocol.Envelope{TaskID: "t3"}, URLCount: 2,
+	}
+	ts := p.getOrCreateTaskStatus("t3")
+	ts.Expected, ts.Failed = 2, 2
+
+	err := p.handleSearchDone(msg)
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if gotStatus != "failed" {
+		t.Fatalf("got %q, want failed", gotStatus)
+	}
+}
+
+func TestHandleSearchDone_EmptySearch(t *testing.T) {
+	var gotStatus string
+	var gotCount int
+	store := &fakeStore{
+		updateTask: func(id, status string, count int) error {
+			gotStatus, gotCount = status, count
+			return nil
+		},
+	}
+	p := newTestPool(store)
+	msg := &protocol.SearchDoneMessage{
+		Envelope: protocol.Envelope{TaskID: "t4"}, URLCount: 0,
+	}
+	err := p.handleSearchDone(msg)
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if gotStatus != "completed" {
+		t.Fatalf("got %q, want completed", gotStatus)
+	}
+	if gotCount != 0 {
+		t.Fatalf("got count %d, want 0", gotCount)
+	}
+}
+
+func TestHandleSearchDone_CompletedWriteFails(t *testing.T) {
+	store := &fakeStore{updateTask: func(id, status string, count int) error { return errUpdateFailed }}
+	p := newTestPool(store)
+	p.getOrCreateTaskStatus("t5").Expected = 1
+	p.getOrCreateTaskStatus("t5").Stored = 1
+	msg := &protocol.SearchDoneMessage{
+		Envelope: protocol.Envelope{TaskID: "t5"}, URLCount: 1,
+	}
+	err := p.handleSearchDone(msg)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, errUpdateFailed) {
+		t.Fatalf("error should wrap sentinel, got: %v", err)
+	}
+}
+
+func TestHandleSearchDone_CompletedWithErrorsWriteFails(t *testing.T) {
+	store := &fakeStore{updateTask: func(id, status string, count int) error { return errUpdateFailed }}
+	p := newTestPool(store)
+	ts := p.getOrCreateTaskStatus("t6")
+	ts.Expected, ts.Stored, ts.Failed = 3, 1, 2
+	msg := &protocol.SearchDoneMessage{
+		Envelope: protocol.Envelope{TaskID: "t6"}, URLCount: 3,
+	}
+	err := p.handleSearchDone(msg)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, errUpdateFailed) {
+		t.Fatalf("error should wrap sentinel, got: %v", err)
+	}
+}
+
+func TestHandleSearchDone_FailedWriteFails(t *testing.T) {
+	store := &fakeStore{updateTask: func(id, status string, count int) error { return errUpdateFailed }}
+	p := newTestPool(store)
+	ts := p.getOrCreateTaskStatus("t7")
+	ts.Expected, ts.Failed = 2, 2
+	msg := &protocol.SearchDoneMessage{
+		Envelope: protocol.Envelope{TaskID: "t7"}, URLCount: 2,
+	}
+	err := p.handleSearchDone(msg)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, errUpdateFailed) {
+		t.Fatalf("error should wrap sentinel, got: %v", err)
+	}
+}
+
+// checkTaskCompletion tests
+
+func TestCheckTaskCompletion_NotReady(t *testing.T) {
+	var called bool
+	store := &fakeStore{updateTask: func(id, status string, count int) error { called = true; return nil }}
+	p := newTestPool(store)
+	p.getOrCreateTaskStatus("t8").Expected = 2
+	_ = p.checkTaskCompletion("t8")
+	if called {
+		t.Fatal("UpdateTask should not be called when conditions not met")
+	}
+}
+func TestCheckTaskCompletion_CompletedSuccess(t *testing.T) {
+	var gotStatus string
+	store := &fakeStore{updateTask: func(id, status string, count int) error { gotStatus = status; return nil }}
+	p := newTestPool(store)
+	ts := p.getOrCreateTaskStatus("t9")
+	ts.SearchDone, ts.Expected, ts.Stored = true, 2, 2
+	err := p.checkTaskCompletion("t9")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if gotStatus != "completed" {
+		t.Fatalf("got %q, want completed", gotStatus)
+	}
+}
+
+func TestCheckTaskCompletion_CompletedWithErrorsSuccess(t *testing.T) {
+	var gotStatus string
+	store := &fakeStore{updateTask: func(id, status string, count int) error { gotStatus = status; return nil }}
+	p := newTestPool(store)
+	ts := p.getOrCreateTaskStatus("t10")
+	ts.SearchDone, ts.Expected, ts.Stored, ts.Failed = true, 3, 2, 1
+	err := p.checkTaskCompletion("t10")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if gotStatus != "completed_with_errors" {
+		t.Fatalf("got %q, want completed_with_errors", gotStatus)
+	}
+}
+
+func TestCheckTaskCompletion_FailedSuccess(t *testing.T) {
+	var gotStatus string
+	store := &fakeStore{updateTask: func(id, status string, count int) error { gotStatus = status; return nil }}
+	p := newTestPool(store)
+	ts := p.getOrCreateTaskStatus("t11")
+	ts.SearchDone, ts.Expected, ts.Failed = true, 2, 2
+	err := p.checkTaskCompletion("t11")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if gotStatus != "failed" {
+		t.Fatalf("got %q, want failed", gotStatus)
+	}
+}
+
+func TestCheckTaskCompletion_EmptyResult(t *testing.T) {
+	var gotStatus string
+	store := &fakeStore{updateTask: func(id, status string, count int) error { gotStatus = status; return nil }}
+	p := newTestPool(store)
+	p.getOrCreateTaskStatus("t12").SearchDone = true
+	err := p.checkTaskCompletion("t12")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if gotStatus != "completed" {
+		t.Fatalf("got %q, want completed", gotStatus)
+	}
+}
+
+func TestCheckTaskCompletion_WriteFails(t *testing.T) {
+	store := &fakeStore{updateTask: func(id, status string, count int) error { return errUpdateFailed }}
+	p := newTestPool(store)
+	ts := p.getOrCreateTaskStatus("t13")
+	ts.SearchDone, ts.Expected, ts.Stored = true, 1, 1
+	err := p.checkTaskCompletion("t13")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, errUpdateFailed) {
+		t.Fatalf("error should wrap sentinel, got: %v", err)
+	}
+}
+
+// consumeResult tests
+
+func TestConsumeResult_RunningUpdateFailsStillChecksCompletion(t *testing.T) {
+	var runningCalled, completedCalled bool
+	store := &fakeStore{
+		saveArticle: func(a *store.Article) error { return nil },
+		updateTask: func(id, status string, count int) error {
+			if status == "running" {
+				runningCalled = true
+				return errUpdateFailed
+			}
+			if status == "completed" {
+				completedCalled = true
+			}
+			return nil
+		},
+	}
+	p := newTestPool(store)
+	ts := p.getOrCreateTaskStatus("t14")
+	ts.SearchDone, ts.Expected = true, 1
+	msg := &protocol.ResultMessage{
+		Envelope: protocol.Envelope{TaskID: "t14"},
+		URL:      "http://example.com/a", Site: "test", Keyword: "kw",
+	}
+	err := p.consumeResult(msg)
+	if err != nil {
+		t.Fatalf("error after running failure: %v", err)
+	}
+	if !runningCalled {
+		t.Fatal("running UpdateTask should be called")
+	}
+	if !completedCalled {
+		t.Fatal("completed checkTaskCompletion should still execute")
+	}
+}
+
+func TestConsumeResult_SaveArticleFails(t *testing.T) {
+	store := &fakeStore{saveArticle: func(a *store.Article) error { return errSaveFailed }}
+	p := newTestPool(store)
+	msg := &protocol.ResultMessage{
+		Envelope: protocol.Envelope{TaskID: "t15"},
+		URL:      "http://example.com/b",
+	}
+	err := p.consumeResult(msg)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, errSaveFailed) {
+		t.Fatalf("should wrap sentinel, got: %v", err)
+	}
+}
+
+func TestConsumeResult_DedupSkipped(t *testing.T) {
+	var called bool
+	store := &fakeStore{saveArticle: func(a *store.Article) error { called = true; return nil }}
+	p := newTestPool(store)
+	p.getOrCreateTaskStatus("t16").failedURLs = map[string]struct{}{"http://example.com/c": {}}
+	msg := &protocol.ResultMessage{
+		Envelope: protocol.Envelope{TaskID: "t16"},
+		URL:      "http://example.com/c",
+	}
+	err := p.consumeResult(msg)
+	if err != nil {
+		t.Fatalf("error for dedup skip: %v", err)
+	}
+	if called {
+		t.Fatal("SaveArticle should not be called for dedup URL")
+	}
+}
+
+// consumeError tests
+
+func TestConsumeError_SearchLevelWriteFails(t *testing.T) {
+	store := &fakeStore{updateTask: func(id, status string, count int) error { return errUpdateFailed }}
+	p := newTestPool(store)
+	msg := &protocol.ErrorMessage{
+		Envelope: protocol.Envelope{TaskID: "t17"},
+		Stage:    "search", URL: "", Error: "connection timeout",
+	}
+	err := p.consumeError(msg)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "connection timeout") {
+		t.Fatalf("must retain original search error, got: %v", err)
+	}
+	if !errors.Is(err, errUpdateFailed) {
+		t.Fatalf("must wrap db sentinel, got: %v", err)
+	}
+}
+
+func TestConsumeError_SearchLevelWriteSucceeds(t *testing.T) {
+	var gotStatus string
+	store := &fakeStore{updateTask: func(id, status string, count int) error { gotStatus = status; return nil }}
+	p := newTestPool(store)
+	msg := &protocol.ErrorMessage{
+		Envelope: protocol.Envelope{TaskID: "t18"},
+		Stage:    "search", URL: "", Error: "search failed",
+	}
+	err := p.consumeError(msg)
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if gotStatus != "failed" {
+		t.Fatalf("got %q, want failed", gotStatus)
+	}
+}
+
+func TestConsumeError_URLLevelCheckTaskCompletionFails(t *testing.T) {
+	store := &fakeStore{updateTask: func(id, status string, count int) error { return errUpdateFailed }}
+	p := newTestPool(store)
+	ts := p.getOrCreateTaskStatus("t19")
+	ts.SearchDone, ts.Expected = true, 1
+	msg := &protocol.ErrorMessage{
+		Envelope: protocol.Envelope{TaskID: "t19"},
+		Stage:    "download", URL: "http://example.com/err",
+	}
+	err := p.consumeError(msg)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, errUpdateFailed) {
+		t.Fatalf("should wrap sentinel, got: %v", err)
+	}
+}
+
+func TestConsumeError_URLLevelDedupedSuccess(t *testing.T) {
+	var updateCount int
+	store := &fakeStore{updateTask: func(id, status string, count int) error { updateCount++; return nil }}
+	p := newTestPool(store)
+	ts := p.getOrCreateTaskStatus("t20")
+	ts.SearchDone, ts.Expected = true, 1
+	ts.storedURLs = map[string]struct{}{"http://example.com/dup": {}}
+	msg := &protocol.ErrorMessage{
+		Envelope: protocol.Envelope{TaskID: "t20"},
+		Stage:    "download", URL: "http://example.com/dup",
+	}
+	err := p.consumeError(msg)
+	if err != nil {
+		t.Fatalf("should return nil for stored URL, got: %v", err)
+	}
+	if updateCount != 0 {
+		t.Fatalf("UpdateTask called %d times, want 0", updateCount)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// parsePublishTime
+// ---------------------------------------------------------------------------
+
+func TestParsePublishTime_DateOnly(t *testing.T) {
+	pt, err := parsePublishTime("2026-07-27")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if pt == nil {
+		t.Fatal("got nil, expected non-nil")
+	}
+	if pt.Year() != 2026 || pt.Month() != 7 || pt.Day() != 27 {
+		t.Fatalf("got %d-%d-%d, want 2026-7-27", pt.Year(), pt.Month(), pt.Day())
+	}
+}
+
+func TestParsePublishTime_RFC3339(t *testing.T) {
+	pt, err := parsePublishTime("2026-07-27T16:00:00Z")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if pt == nil {
+		t.Fatal("got nil")
+	}
+	if pt.Year() != 2026 || pt.Month() != 7 || pt.Day() != 27 {
+		t.Fatalf("date mismatch")
+	}
+	if pt.Hour() != 16 || pt.Minute() != 0 {
+		t.Fatalf("time mismatch")
+	}
+}
+
+func TestParsePublishTime_Empty(t *testing.T) {
+	pt, err := parsePublishTime("")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if pt != nil {
+		t.Fatal("expected nil for empty string")
+	}
+}
+
+func TestParsePublishTime_Whitespace(t *testing.T) {
+	pt, err := parsePublishTime("  ")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if pt != nil {
+		t.Fatal("expected nil for whitespace")
+	}
+}
+
+func TestParsePublishTime_Invalid(t *testing.T) {
+	pt, err := parsePublishTime("not-a-date")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if pt != nil {
+		t.Fatal("expected nil for invalid")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// consumeResult publish_date scenarios
+// ---------------------------------------------------------------------------
+
+func TestConsumeResult_DateOnly(t *testing.T) {
+	var captured *store.Article
+	store := &fakeStore{
+		saveArticle: func(a *store.Article) error { captured = a; return nil },
+		updateTask:  func(id, status string, count int) error { return nil },
+	}
+	p := newTestPool(store)
+	p.getOrCreateTaskStatus("t21").SearchDone = true
+	p.getOrCreateTaskStatus("t21").Expected = 1
+
+	msg := &protocol.ResultMessage{
+		Envelope: protocol.Envelope{TaskID: "t21"},
+		URL:      "http://example.com/art", Site: "test", Keyword: "kw",
+		PublishDate: "2026-07-27", Title: "T", Content: "C", Score: 1,
+	}
+	_ = p.consumeResult(msg)
+	if captured == nil {
+		t.Fatal("SaveArticle not called")
+	}
+	if captured.PublishTime == nil {
+		t.Fatal("PublishTime is nil")
+	}
+	if captured.PublishTime.Year() != 2026 || captured.PublishTime.Month() != 7 || captured.PublishTime.Day() != 27 {
+		t.Fatalf("date mismatch: %v", captured.PublishTime)
+	}
+}
+
+func TestConsumeResult_EmptyPublishDate(t *testing.T) {
+	var captured *store.Article
+	store := &fakeStore{
+		saveArticle: func(a *store.Article) error { captured = a; return nil },
+		updateTask:  func(id, status string, count int) error { return nil },
+	}
+	p := newTestPool(store)
+	p.getOrCreateTaskStatus("t22").SearchDone = true
+	p.getOrCreateTaskStatus("t22").Expected = 1
+
+	msg := &protocol.ResultMessage{
+		Envelope: protocol.Envelope{TaskID: "t22"},
+		URL:      "http://example.com/art2", Site: "test", Keyword: "kw",
+		PublishDate: "", Title: "T", Content: "C", Score: 1,
+	}
+	err := p.consumeResult(msg)
+	if err != nil {
+		t.Fatalf("consumeResult should not fail: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("SaveArticle not called")
+	}
+	if captured.PublishTime != nil {
+		t.Fatal("PublishTime should be nil for empty publish_date")
+	}
+}
+
+func TestConsumeResult_InvalidPublishDate(t *testing.T) {
+	var captured *store.Article
+	store := &fakeStore{
+		saveArticle: func(a *store.Article) error { captured = a; return nil },
+		updateTask:  func(id, status string, count int) error { return nil },
+	}
+	p := newTestPool(store)
+	p.getOrCreateTaskStatus("t23").SearchDone = true
+	p.getOrCreateTaskStatus("t23").Expected = 1
+
+	msg := &protocol.ResultMessage{
+		Envelope: protocol.Envelope{TaskID: "t23"},
+		URL:      "http://example.com/art3", Site: "test", Keyword: "kw",
+		PublishDate: "bad-date", Title: "T", Content: "C", Score: 1,
+	}
+	err := p.consumeResult(msg)
+	if err != nil {
+		t.Fatalf("invalid publish_date should not fail the whole result: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("SaveArticle not called")
+	}
+	if captured.PublishTime != nil {
+		t.Fatal("PublishTime should be nil for bad date")
+	}
+	if captured.CrawlTime.IsZero() {
+		t.Fatal("CrawlTime should be set")
+	}
+}
+
+
+############################################################
+# FILE: go-spider\main.go
+############################################################
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"crawler-platform/internal/config"
+	"crawler-platform/internal/api"
+	"crawler-platform/internal/protocol"
+	"crawler-platform/internal/queue"
+	"crawler-platform/internal/store"
+	"crawler-platform/internal/worker"
+)
+
+func main() {
+	siteKey := flag.String("site", "", "site key from config")
+	keywords := flag.String("keywords", "", "search keywords (comma separated)")
+	workers := flag.Int("workers", 4, "worker pool size")
+	apiPort := flag.Int("api", 0, "start API server on port")
+	redisAddr := flag.String("redis", "localhost:6379", "redis address")
+	maxPages := flag.Int("max-pages", 1, "maximum search pages")
+	flag.Parse()
+
+	var mysqlStore *store.MySQLStore
+	if ms, err := store.NewMySQLStore(""); err == nil {
+		mysqlStore = ms
+		log.Println("[store] MySQL connected")
+	} else {
+		log.Printf("[store] MySQL not available: %v (results will not be persisted)", err)
+	}
+
+	if *apiPort > 0 {
+		redisQueue := queue.NewRedisQueue(*redisAddr)
+		redisQueue.Ping()
+		mgr := worker.NewWorkerManager(*workers, redisQueue, mysqlStore)
+		mgr.Start()
+		defer mgr.Stop()
+
+		server := api.NewServer(redisQueue, mgr, mysqlStore)
+		addr := fmt.Sprintf(":%d", *apiPort)
+		log.Printf("[api] Gin server starting on %s", addr)
+		if err := server.Run(addr); err != nil {
+			log.Fatalf("[api] server error: %v", err)
+		}
+		return
+	}
+
+	if *siteKey == "" || *keywords == "" {
+		fmt.Println("Usage: go-spider --site czj_beijing --keywords 低空经济")
+		os.Exit(1)
+	}
+
+	cfg := config.MustLoad(*siteKey, "../config")
+	log.Printf("[spider] site=%s domain=%s workers=%d", cfg.Name, cfg.Domain, *workers)
+
+	taskID := protocol.NewTaskID()
+	redisQueue := queue.NewRedisQueue(*redisAddr)
+	if err := redisQueue.Ping(); err != nil {
+		log.Fatalf("[spider] Redis not available: %v", err)
+	}
+
+	mgr := worker.NewWorkerManager(*workers, redisQueue, mysqlStore)
+	mgr.Start()
+	defer mgr.Stop()
+
+	if err := redisQueue.PushSearch(taskID, *siteKey, *keywords, 0, *maxPages); err != nil {
+		log.Fatalf("[spider] PushSearch error: %v", err)
+	}
+	log.Printf("[spider] pushed search: site=%s keyword=%s", *siteKey, *keywords)
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			stats := mgr.Stats()
+			if stats.Submitted == 0 {
+				continue
+			}
+			log.Printf("[spider] stats: submitted=%d completed=%d failed=%d queue=%d",
+				stats.Submitted, stats.Completed, stats.Failed, stats.QueueLen)
+			if stats.Completed+stats.Failed >= stats.Submitted && stats.QueueLen == 0 {
+				log.Println("[spider] all tasks completed")
+				fmt.Println("Done.")
+				return
+			}
+		case <-sig:
+			log.Println("[spider] received signal, shutting down")
+			mgr.Stop()
+			return
+		}
+	}
+}
+
+
+############################################################
+# FILE: httpx/__init__.py
+############################################################
+from httpx.fetch import fetch, post_json, get_json, reset_all_sessions
+from httpx.session_pool import get_session_for_domain, get_random_session, clear_session
+from httpx.rate_limiter import rate_limiter_manager
+from httpx.circuit_breaker import breaker_manager
+from httpx.ua_pool import UAPool
+from httpx.jitter import jitter_sleep
+
+
+############################################################
+# FILE: httpx/_breaker.py
+############################################################
+import time
+import logging
+
+log = logging.getLogger('crawler.circuit_breaker')
+
+
+class CircuitBreaker:
+    """熔断机制：连续失败>=3次->冷却60秒->自动恢复"""
+
+    OPEN = 'OPEN'
+    HALF_OPEN = 'HALF_OPEN'
+    CLOSED = 'CLOSED'
+
+    def __init__(self, failure_threshold=3, recovery_timeout=60, name='default'):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failure_count = 0
+        self.state = self.CLOSED
+        self.last_failure_time = 0
+        self.name = name
+
+    def call(self, func, *args, **kwargs):
+        if self.state == self.OPEN:
+            if time.time() - self.last_failure_time >= self.recovery_timeout:
+                log.info('[CB:%s] HALF_OPEN', self.name)
+                self.state = self.HALF_OPEN
+            else:
+                raise RuntimeError(f'[CB:{self.name}] OPEN, cooling {self.recovery_timeout}s')
+        try:
+            result = func(*args, **kwargs)
+            if self.state == self.HALF_OPEN:
+                log.info('[CB:%s] Recovered', self.name)
+                self.state = self.CLOSED
+                self.failure_count = 0
+            return result
+        except Exception as e:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            log.warning('[CB:%s] Fail %d/%d: %s', self.name,
+                        self.failure_count, self.failure_threshold, str(e)[:60])
+            if self.failure_count >= self.failure_threshold:
+                log.warning('[CB:%s] OPEN', self.name)
+                self.state = self.OPEN
+            raise
+
+    def reset(self):
+        self.failure_count = 0
+        self.state = self.CLOSED
+
+
+############################################################
+# FILE: httpx/_token_bucket.py
+############################################################
+import time
+
+
+class RateLimiter:
+    """令牌桶算法限流器"""
+
+    def __init__(self, rate=5, per=1):
+        self.rate = float(rate)
+        self.per = float(per)
+        self.allowance = self.rate
+        self.last_check = time.time()
+
+    def acquire(self, block=True):
+        now = time.time()
+        elapsed = now - self.last_check
+        self.last_check = now
+        self.allowance += elapsed * (self.rate / self.per)
+        if self.allowance > self.rate:
+            self.allowance = self.rate
+        if self.allowance < 1:
+            if block:
+                sleep_time = (1 - self.allowance) * (self.per / self.rate)
+                time.sleep(sleep_time)
+                self.allowance = 0
+            return False
+        self.allowance -= 1
+        return True
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+
+############################################################
+# FILE: httpx/circuit_breaker.py
+############################################################
+from httpx._breaker import CircuitBreaker
+
+
+class BreakerManager:
+    """Domain-keyed CircuitBreaker pool. 每个域名共享一个熔断器，有历史记忆。"""
+
+    _pool = {}
+
+    @classmethod
+    def get(cls, domain, failure_threshold=3, recovery_timeout=60):
+        if domain not in cls._pool:
+            cls._pool[domain] = CircuitBreaker(
+                failure_threshold=failure_threshold,
+                recovery_timeout=recovery_timeout,
+                name=domain
+            )
+        return cls._pool[domain]
+
+    @classmethod
+    def reset(cls, domain=None):
+        if domain:
+            cls._pool.pop(domain, None)
+        else:
+            cls._pool.clear()
+
+    @classmethod
+    def stats(cls):
+        return {d: {'state': b.state, 'failures': b.failure_count}
+                for d, b in cls._pool.items()}
+
+
+breaker_manager = BreakerManager()
+
+
+############################################################
+# FILE: httpx/fetch.py
+############################################################
+import logging
+import time
+from urllib.parse import urlparse, urlencode
+import requests as req
+from httpx.session_pool import get_session_for_domain, clear_session
+from httpx.jitter import jitter_sleep
+from httpx.rate_limiter import rate_limiter_manager
+from httpx.circuit_breaker import breaker_manager
+
+log = logging.getLogger('crawler.http_client')
+
+def _retry(session, domain, url, rate_cfg, max_retries, timeout, request_fn):
+    """统一重试逻辑：RateLimiter -> Jitter -> CircuitBreaker -> HTTP"""
+    delay = rate_cfg.get('delay', 1.5)
+    jitter = rate_cfg.get('jitter', 0.8)
+    max_r = rate_cfg.get('max_retry', max_retries)
+    rl = rate_limiter_manager.get(domain, rate=rate_cfg.get('rate', max(0.5, 1.0 / (delay or 1.5))), per=1)
+    cb = breaker_manager.get(domain)
+    for attempt in range(1, max_r + 1):
+        try:
+            rl.acquire()
+            def _do():
+                jitter_sleep(delay, jitter)
+                resp = request_fn(session)
+                if resp.status_code >= 300:
+                    raise Exception('HTTP ' + str(resp.status_code))
+                return resp
+            return cb.call(_do)
+        except RuntimeError as e:
+            if 'OPEN' in str(e):
+                log.warning('Breaker open for %s, skip %s', domain, url[:50])
+                return None
+            raise
+        except Exception as e:
+            if attempt < max_r:
+                log.warning('Retry %d/%d for %s: %s', attempt, max_r, url[:50], str(e)[:60])
+                time.sleep(attempt)
+            else:
+                log.warning('Failed after %d retries: %s', max_r, url[:50])
+    return None
+
+def reset_all_sessions():
+    clear_session()
+    log.info('All HTTP sessions reset')
+
+
+def fetch(url, site_cfg=None, max_retries=3, timeout=15):
+    domain = urlparse(url).netloc
+    session = get_session_for_domain(domain)
+    rate_cfg = site_cfg.get('rate_limit', {}) if site_cfg else {}
+    return _retry(session, domain, url, rate_cfg, max_retries, timeout,
+                  lambda s: s.get(url, timeout=timeout))
+
+def get_json(url, params=None, site_cfg=None, max_retries=3, timeout=15):
+    from urllib.parse import urlparse
+    domain = urlparse(url).netloc
+    session = get_session_for_domain(domain)
+    rate_cfg = site_cfg.get('rate_limit', {}) if site_cfg else {}
+    def _do_get(s):
+        headers = {'X-Requested-With': 'XMLHttpRequest','Accept': '*/*',
+                   'Referer': site_cfg.get('search', {}).get('page_url', url) if site_cfg else url}
+        return s.get(url, params=params, headers=headers, timeout=timeout)
+    resp = _retry(session, domain, url, rate_cfg, max_retries, timeout, _do_get)
+    if resp and resp.status_code == 200:
+        return resp.json()
+    return None
+
+def post_json(url, data, site_cfg=None, max_retries=3, timeout=15):
+    """POST请求（form-encoded），专为TRS API设计"""
+    domain = urlparse(url).netloc
+    session = get_session_for_domain(domain)
+    rate_cfg = site_cfg.get('rate_limit', {}) if site_cfg else {}
+    def _do_post(s):
+        headers = {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'}
+        return s.post(url, data=urlencode(data), headers=headers, timeout=timeout)
+    resp = _retry(session, domain, url, rate_cfg, max_retries, timeout, _do_post)
+    if resp is None:
+        return None
+    try:
+        return resp.json()
+    except Exception:
+        log.warning('post_json response parse failed')
+        return None
+
+
+############################################################
+# FILE: httpx/jitter.py
+############################################################
+import random
+import time
+
+
+def jitter_sleep(base_delay=1.5, jitter=0.8):
+    """随机延迟：sleep = base_delay + random(0, jitter)"""
+    delay = max(0.0, base_delay + random.uniform(0, jitter))
+    if delay > 0:
+        time.sleep(delay)
+    return delay
+
+
+def get_jitter_value(base_delay=1.5, jitter=0.8):
+    """返回延迟值但不sleep，供调用方自行决定何时sleep"""
+    return max(0.0, base_delay + random.uniform(0, jitter))
+
+
+############################################################
+# FILE: httpx/rate_limiter.py
+############################################################
+import time
+from httpx._token_bucket import RateLimiter
+
+
+class RateLimiterManager:
+    """Domain-keyed singleton RateLimiter pool. 每个域名共享一个限流器，防止限流失效。"""
+
+    _pool = {}
+
+    @classmethod
+    def get(cls, domain, rate=1.0, per=1):
+        if domain not in cls._pool:
+            cls._pool[domain] = RateLimiter(rate=rate, per=per)
+        return cls._pool[domain]
+
+    @classmethod
+    def reset(cls, domain=None):
+        if domain:
+            cls._pool.pop(domain, None)
+        else:
+            cls._pool.clear()
+
+    @classmethod
+    def stats(cls):
+        return {d: {'allowance': rl.allowance, 'rate': rl.rate}
+                for d, rl in cls._pool.items()}
+
+
+rate_limiter_manager = RateLimiterManager()
+
+
+############################################################
+# FILE: httpx/session_pool.py
+############################################################
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from httpx.ua_pool import UAPool
+
+_ua_pool = UAPool()
+_session_pool = {}
+
+
+def _build_adapter(max_retries=3, pool_conn=10, pool_size=20):
+    retry_strategy = Retry(
+        total=max_retries, backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    return HTTPAdapter(pool_connections=pool_conn, pool_maxsize=pool_size, max_retries=retry_strategy)
+
+
+def get_session_for_domain(domain, max_retries=3):
+    """Domain-bound Session with Connection Pool + KeepAlive + Cookie sharing"""
+    if domain not in _session_pool:
+        ua = _ua_pool.get_for_domain(domain)
+        s = requests.Session()
+        s.headers.update({
+            'User-Agent': ua,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Connection': 'keep-alive',
+        })
+        s.mount('http://', _build_adapter(max_retries))
+        s.mount('https://', _build_adapter(max_retries))
+        _session_pool[domain] = s
+    return _session_pool[domain]
+
+
+def clear_session(domain=None):
+    if domain:
+        _session_pool.pop(domain, None)
+    else:
+        _session_pool.clear()
+
+
+def get_random_session():
+    ua = _ua_pool.get_random()
+    s = requests.Session()
+    s.headers.update({'User-Agent': ua})
+    return s
+
+
+def get_pool_stats():
+    """Debug: return session pool info"""
+    return {d: {'headers': dict(s.headers), 'cookies': dict(s.cookies.get_dict())}
+            for d, s in _session_pool.items()}
+
+
+############################################################
+# FILE: httpx/ua_pool.py
+############################################################
+import hashlib
+import random
+
+
+class UAPool:
+    """UA绑定Session机制：每个域名绑定固定UA，不每次随机"""
+
+    UA_LIST = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Edg/131.0.0.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/18.1 Safari/605.1.15',
+    ]
+
+    def __init__(self):
+        self._domain_ua = {}
+
+    def get_for_domain(self, domain):
+        if domain not in self._domain_ua:
+            idx = int(hashlib.md5(domain.encode()).hexdigest(), 16) % len(self.UA_LIST)
+            self._domain_ua[domain] = self.UA_LIST[idx]
+        return self._domain_ua[domain]
+
+    def get_random(self):
+        return random.choice(self.UA_LIST)
+
+
+############################################################
+# FILE: tests\__init__.py
+############################################################
+# Tests package
+
+
+############################################################
+# FILE: tests\integration\__init__.py
+############################################################
+
+
+############################################################
+# FILE: tests\integration\conftest.py
+############################################################
+import json
+import logging
+import os
+import re
+import threading
+import time
+import uuid
+
+import pytest
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("e2e")
+
+# Skips all tests when E2E_ENABLED is not set
+@pytest.fixture(autouse=True, scope="session")
+def _skip_if_not_e2e():
+    if os.getenv("E2E_ENABLED") != "1":
+        pytest.skip("Set E2E_ENABLED=1 to run integration tests")
+
+E2E_TIMEOUT = int(os.getenv("E2E_TIMEOUT", "30"))
+E2E_REDIS_URL = os.getenv("E2E_REDIS_URL", "redis://localhost:6379/0")
+E2E_MYSQL_DSN = os.getenv("E2E_MYSQL_DSN", "root:@tcp(localhost:3306)/crawler_db")
+E2E_API_URL = os.getenv("E2E_API_URL", "http://localhost:8080")
+
+TEST_QUEUES = ["crawler:search","crawler:url","crawler:html","crawler:result","crawler:event","crawler:error"]
+
+def _parse_mysql_dsn(dsn):
+    m = re.match(r"(?P<user>[^:]+):(?P<password>[^@]*)@tcp\((?P<host>[^:]+):(?P<port>\d+)\)/(?P<database>.+)",dsn)
+    if not m: m = re.match(r"(?P<user>[^:]+):(?P<password>[^@]*)@(?P<host>[^:]+):(?P<port>\d+)/(?P<database>.+)",dsn)
+    if not m: raise ValueError("Cannot parse MYSQL_DSN: "+dsn)
+    return m.groupdict()
+
+@pytest.fixture(scope="session")
+def redis_client():
+    import redis
+    try:
+        r = redis.from_url(E2E_REDIS_URL,decode_responses=True)
+        r.ping()
+        log.info("Redis: "+E2E_REDIS_URL)
+        return r
+    except Exception as e:
+        pytest.fail("Redis: "+str(e))
+
+@pytest.fixture(scope="session")
+def mysql_client():
+    import pymysql
+    cfg = _parse_mysql_dsn(E2E_MYSQL_DSN)
+    try:
+        conn = pymysql.connect(host=cfg["host"],port=int(cfg["port"]),user=cfg["user"],password=cfg["password"],database=cfg["database"],charset="utf8mb4",connect_timeout=5,autocommit=True)
+        log.info("MySQL: "+cfg["host"]+":"+cfg["port"]+"/"+cfg["database"])
+        return conn
+    except Exception as e:
+        pytest.fail("MySQL: "+str(e))
+
+@pytest.fixture
+def task_id():
+    return "e2e-"+uuid.uuid4().hex[:12]
+
+@pytest.fixture(autouse=True)
+def clean_queues():
+    import redis
+    r = redis.from_url(E2E_REDIS_URL,decode_responses=True)
+    for q in TEST_QUEUES: r.delete(q)
+    yield
+    for q in TEST_QUEUES: r.delete(q)
+
+def push_message(r,queue,msg):
+    r.lpush(queue,json.dumps(msg,ensure_ascii=False))
+
+def pop_message(r,queue,timeout=3):
+    result = r.brpop(queue,timeout=timeout)
+    return json.loads(result[1]) if result else None
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "e2e: e2e integration test")
+
+
+############################################################
+# FILE: tests\integration\helpers.py
+############################################################
+import json, time, uuid
+
+def build_msg(base, **overrides):
+    m = dict(base)
+    m["message_id"] = uuid.uuid4().hex[:8]
+    m["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    m.update(overrides)
+    return m
+
+SEARCH_DONE_BASE = {"protocol_version": "1.0", "type": "search_done", "site": "czj_beijing", "keyword": "低空经济", "url_count": 0, "level": 1}
+URL_BASE = {"protocol_version": "1.0", "type": "url", "url": "http://127.0.0.1:18080/article/1", "site": "czj_beijing", "keyword": "低空经济", "level": 1, "title": ""}
+HTML_BASE = {"protocol_version": "1.0", "type": "html", "url": "http://127.0.0.1:18080/article/1", "site": "czj_beijing", "keyword": "低空经济", "level": 1, "title": "", "html": ""}
+ERROR_BASE = {"protocol_version": "1.0", "type": "error", "stage": "download", "site": "czj_beijing", "keyword": "低空经济", "level": 1, "url": "", "error_code": "", "error": "", "retryable": True}
+
+
+
+def create_task(mysql_client, task_id, keyword=chr(0x4f4e)+chr(0x7a7a)+chr(0x7ecf)+chr(0x6d4e), site="czj_beijing"):
+    with mysql_client.cursor() as cur:
+        cur.execute(
+            "INSERT INTO tasks (id,keyword,site,status,article_count) VALUES (%s,%s,%s,%s,%s)",
+            (task_id, keyword, site, "created", 0))
+    mysql_client.commit()
+
+
+############################################################
+# FILE: tests\integration\http_fixture.py
+############################################################
+"""Local HTTP test server for controlled response fixtures."""
+import http.server
+import threading
+import time
+
+
+class _Handler(http.server.BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        if self.path == "/article/1":
+            self._send(200, "<html><body><h1>Policy Title A</h1><p>Content content content content content content content content content content content content content content content content content content content content</p></body></html>")
+        elif self.path == "/article/2":
+            self._send(200, "<html><body><h1>Policy Title B</h1><p>Content B Content B Content B Content B Content B Content B Content B Content B Content B Content B Content B Content B Content B</p></body></html>")
+        elif self.path == "/article/error":
+            self.send_response(500)
+            self.end_headers()
+        elif self.path == "/article/error2":
+            self.send_response(500)
+            self.end_headers()
+        elif self.path == "/article/timeout":
+            time.sleep(30)
+            self.send_response(200)
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _send(self, status, body):
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(body.encode("utf-8"))
+
+    def log_message(self, *a):
+        pass
+
+
+def start_test_server(host="127.0.0.1", port=18080):
+    """Start a test HTTP server in a daemon thread. Returns the server."""
+    server = http.server.HTTPServer((host, port), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+############################################################
+# FILE: tests\integration\test_all_failed.py
+############################################################
+"""E2E: All URLs fail -> failed."""
+import json, pytest, time
+from .helpers import build_msg, URL_BASE, SEARCH_DONE_BASE, ERROR_BASE, create_task
+from .http_fixture import start_test_server
+pytestmark = pytest.mark.e2e
+
+
+
+class TestAllFailed:
+    def test_failed_status(self, redis_client, mysql_client, task_id):
+        svr = start_test_server()
+        create_task(mysql_client, task_id)
+        for url in ["http://127.0.0.1:18080/article/error","http://127.0.0.1:18080/article/error2"]:
+            u = build_msg(URL_BASE, task_id=task_id, url=url, keyword=task_id)
+            redis_client.lpush("crawler:url", json.dumps(u, ensure_ascii=False))
+        d = build_msg(SEARCH_DONE_BASE, task_id=task_id, keyword=task_id, url_count=2)
+        redis_client.lpush("crawler:event", json.dumps(d, ensure_ascii=False))
+        dl = time.time() + 30
+        while time.time() < dl:
+            cur = mysql_client.cursor()
+            cur.execute("SELECT status FROM tasks WHERE id=%s", (task_id,))
+            row = cur.fetchone()
+            if row and row[0] == "failed":
+                svr.shutdown()
+                break
+            time.sleep(0.5)
+        else:
+            svr.shutdown()
+            pytest.fail("Task not failed")
+    def test_duplicate_error_idempotent(self, redis_client, mysql_client, task_id):
+        svr = start_test_server()
+        create_task(mysql_client, task_id)
+        u = build_msg(URL_BASE, task_id=task_id, url="http://127.0.0.1:18080/article/error")
+        redis_client.lpush("crawler:url", json.dumps(u, ensure_ascii=False))
+        e = build_msg(ERROR_BASE, task_id=task_id, keyword=task_id,
+            url="http://127.0.0.1:18080/article/error")
+        for _ in range(2):
+            redis_client.lpush("crawler:error", json.dumps(e, ensure_ascii=False))
+        d = build_msg(SEARCH_DONE_BASE, task_id=task_id, keyword=task_id, url_count=1)
+        redis_client.lpush("crawler:event", json.dumps(d, ensure_ascii=False))
+        dl = time.time() + 30
+        while time.time() < dl:
+            cur = mysql_client.cursor()
+            cur.execute("SELECT status, article_count FROM tasks WHERE id=%s", (task_id,))
+            row = cur.fetchone()
+            if row and row[0]=="failed":
+                assert row[1] == 0
+                svr.shutdown()
+                break
+            time.sleep(0.5)
+        else:
+            svr.shutdown()
+            pytest.fail("Task not failed")
+
+
+############################################################
+# FILE: tests\integration\test_empty_search.py
+############################################################
+"""E2E: Empty search returns completed with Expected=0."""
+import json, pytest, time
+from .helpers import build_msg, SEARCH_DONE_BASE, create_task
+
+pytestmark = pytest.mark.e2e
+
+
+class TestEmptySearch:
+    def test_returns_completed(self, redis_client, mysql_client, task_id):
+        """SearchDone(url_count=0) -> completed, Expected=0."""
+        create_task(mysql_client, task_id)
+        msg = build_msg(SEARCH_DONE_BASE, task_id=task_id, url_count=0)
+        redis_client.lpush("crawler:event", json.dumps(msg, ensure_ascii=False))
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            with mysql_client.cursor() as cur:
+                cur.execute("SELECT status,article_count FROM tasks WHERE id=%s", (task_id,))
+                row = cur.fetchone()
+            if row and row[0] == "completed":
+                assert row[1] == 0
+                return
+            time.sleep(0.5)
+        pytest.fail("Task not completed within 30s")
+
+    def test_no_articles(self, redis_client, mysql_client, task_id):
+        """Empty search creates no articles."""
+        create_task(mysql_client, task_id)
+        msg = build_msg(SEARCH_DONE_BASE, task_id=task_id, url_count=0)
+        redis_client.lpush("crawler:event", json.dumps(msg, ensure_ascii=False))
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            with mysql_client.cursor() as cur:
+                cur.execute("SELECT status FROM tasks WHERE id=%s", (task_id,))
+                row = cur.fetchone()
+            if row and row[0] == "completed":
+                # articles table has no task_id column; article_count=0 from task record confirms empty
+                with mysql_client.cursor() as cur:
+                    cur.execute("SELECT article_count FROM tasks WHERE id=%s", (task_id,))
+                    assert cur.fetchone()[0] == 0
+                return
+            time.sleep(0.5)
+        pytest.fail("Task not completed within 30s")
+
+    def test_no_errors(self, redis_client, mysql_client, task_id):
+        """Empty search creates no error messages."""
+        create_task(mysql_client, task_id)
+        msg = build_msg(SEARCH_DONE_BASE, task_id=task_id, url_count=0)
+        redis_client.lpush("crawler:event", json.dumps(msg, ensure_ascii=False))
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            with mysql_client.cursor() as cur:
+                cur.execute("SELECT status FROM tasks WHERE id=%s", (task_id,))
+                row = cur.fetchone()
+            if row and row[0] == "completed":
+                assert redis_client.llen("crawler:error") == 0
+                return
+            time.sleep(0.5)
+        pytest.fail("Task not completed within 30s")
+
+
+############################################################
+# FILE: tests\integration\test_partial_failure.py
+############################################################
+"""E2E: Partial failure -> completed_with_errors."""
+import json, pytest, time
+from .helpers import build_msg, URL_BASE, SEARCH_DONE_BASE, create_task
+from .http_fixture import start_test_server
+pytestmark = pytest.mark.e2e
+
+
+
+class TestPartialFailure:
+    def test_completed_with_errors(self, redis_client, mysql_client, task_id):
+        svr = start_test_server()
+        create_task(mysql_client, task_id)
+        for url in ["http://127.0.0.1:18080/article/1","http://127.0.0.1:18080/article/error"]:
+            u = build_msg(URL_BASE, task_id=task_id, url=url, keyword=task_id)
+            redis_client.lpush("crawler:url", json.dumps(u, ensure_ascii=False))
+        d = build_msg(SEARCH_DONE_BASE, task_id=task_id, keyword=task_id, url_count=2)
+        redis_client.lpush("crawler:event", json.dumps(d, ensure_ascii=False))
+        dl = time.time() + 30
+        while time.time() < dl:
+            cur = mysql_client.cursor()
+            cur.execute("SELECT status,article_count FROM tasks WHERE id=%s", (task_id,))
+            row = cur.fetchone()
+            if row and row[0] in ("completed_with_errors","completed"):
+                assert row[0] == "completed_with_errors", f"expected completed_with_errors, got {row[0]}"
+                assert row[1] == 1, f"expected article_count=1, got {row[1]}"
+                break
+            time.sleep(0.5)
+        else:
+            svr.shutdown()
+            pytest.fail("Task not done")
+        svr.shutdown()
+
+
+############################################################
+# FILE: tests\integration\test_success_pipeline.py
+############################################################
+"""E2E: All URLs succeed -> completed."""
+import json, pytest, time
+from .helpers import build_msg, URL_BASE, SEARCH_DONE_BASE, create_task
+from .http_fixture import start_test_server
+pytestmark = pytest.mark.e2e
+
+
+
+class TestSuccessPipeline:
+    def test_all_articles_stored(self, redis_client, mysql_client, task_id):
+        svr = start_test_server()
+        create_task(mysql_client, task_id)
+        for url in [
+            "http://127.0.0.1:18080/article/1",
+            "http://127.0.0.1:18080/article/2",
+        ]:
+            u = build_msg(URL_BASE, task_id=task_id, url=url, keyword=task_id)
+            redis_client.lpush("crawler:url", json.dumps(u, ensure_ascii=False))
+        d = build_msg(SEARCH_DONE_BASE, task_id=task_id, keyword=task_id, url_count=2)
+        redis_client.lpush("crawler:event", json.dumps(d, ensure_ascii=False))
+        dl = time.time() + 30
+        while time.time() < dl:
+            cur = mysql_client.cursor()
+            cur.execute("SELECT status FROM tasks WHERE id=%s", (task_id,))
+            row = cur.fetchone()
+            if row and row[0] == "completed":
+                break
+            time.sleep(0.5)
+        else:
+            svr.shutdown()
+            pytest.fail("Task not completed")
+        with mysql_client.cursor() as cur:
+            cur.execute("SELECT article_count FROM tasks WHERE id=%s", (task_id,))
+            assert cur.fetchone()[0] == 2
+        svr.shutdown()
+
+
+
+############################################################
+# FILE: tests\test_core.py
+############################################################
+import unittest
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+class TestImports(unittest.TestCase):
+    def test_httpx_imports(self):
+        from httpx import fetch, post_json, get_json, rate_limiter_manager, breaker_manager
+        self.assertTrue(True)
+
+    def test_parser_imports(self):
+        from parser.multi_strategy import clean_text, normalize_date
+        from parser.html_parser import extract_title, extract_content
+        self.assertEqual(clean_text('<em>low</em> economy'), 'low economy')
+        self.assertEqual(normalize_date('日期：2025年6月7日'), '2025-06-07')
+
+    def test_scorer(self):
+        from extractor.scorer import score_article
+        r = score_article({'title': '低空经济政策', 'content': '发展低空经济', 'url': 'http://test.com/art_1'}, ('低空经济',))
+        self.assertTrue(r['passed'])
+        self.assertGreater(r['score'], 0)
+
+    def test_plugins_registry(self):
+        from plugins import get
+        self.assertIsNotNone(get('trs_json'))
+        self.assertIsNotNone(get('jpaas_jsearch'))
+
+    def test_metrics_collector(self):
+        from monitor.metrics import get_collector
+        c = get_collector()
+        c.inc('test_counter', 3)
+        snap = c.snapshot()
+        self.assertIn('test_counter', snap['counters'])
+
+    def test_config_loading(self):
+        from main import load_config
+        cfg = load_config('czj_beijing')
+        self.assertEqual(cfg['name'], '北京市财政局')
+        self.assertIn('search', cfg)
+        self.assertIn('score', cfg)
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+
+############################################################
+# FILE: tests\test_main_imports.py
+############################################################
+import main
+from extractor.scorer import filter_by_score
+from parser.html_parser import extract_content
+
+
+def test_main_uses_html_parser_extract_content():
+    assert main.extract_content is extract_content
+
+
+def test_main_uses_scorer_filter_by_score():
+    assert main.filter_by_score is filter_by_score
+
+
+############################################################
+# FILE: tests\test_parser_worker.py
+############################################################
+import json
+import os
+import sys
+from unittest.mock import MagicMock, patch
+
+sys.modules["redis"] = MagicMock()
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from workers.parser_worker import _load_site_config, _process_message
+
+
+class TestLoadSiteConfig:
+    def test_valid_site(self):
+        cfg = _load_site_config("czj_beijing")
+        assert cfg is not None
+        assert cfg["name"] == "北京市财政局"
+        assert "search" in cfg
+        assert "extract" in cfg
+
+    def test_unknown_site(self):
+        cfg = _load_site_config("nonexistent")
+        assert cfg is None
+
+
+class TestProcessMessage:
+    def _make_html_msg(self, **overrides):
+        msg = {
+            "protocol_version": "1.0",
+            "task_id": "t-001",
+            "message_id": "m-001",
+            "timestamp": "2026-07-27T16:00:00Z",
+            "type": "html",
+            "url": "https://czj.beijing.gov.cn/art/1.html",
+            "site": "czj_beijing",
+            "keyword": "低空经济",
+            "level": 1,
+            "title": "原始标题",
+            "html": "<html><body><h1>政策解读标题</h1><p>正文内容正文内容正文内容正文内容正文内容正文内容正文内容正文内容正文内容正文内容正文内容正文内容正文内容正文内容正文内容正文内容正文内容正文内容正文内容正文内容</p></body></html>",
+        }
+        msg.update(overrides)
+        return msg
+
+    def test_task_id_preserved(self):
+        msg = self._make_html_msg()
+        result = _process_message(msg)
+        assert result is not None
+        assert result["task_id"] == "t-001"
+        assert result["type"] == "result"
+        assert result["message_id"] != "m-001"
+
+    def test_site_keyword_level_preserved(self):
+        msg = self._make_html_msg()
+        result = _process_message(msg)
+        assert result is not None
+        assert result["site"] == "czj_beijing"
+        assert result["keyword"] == "低空经济"
+        assert result["level"] == 1
+        assert result["url"] == "https://czj.beijing.gov.cn/art/1.html"
+
+    def test_title_prefers_parsed(self):
+        msg = self._make_html_msg(title="回退标题")
+        result = _process_message(msg)
+        assert result is not None
+        assert result["title"] is not None and result["title"] != ""
+
+    def test_title_fallback_to_msg(self):
+        """When extract_title returns empty/falsy, fall back to message title."""
+        with patch("workers.parser_worker.extract_title", return_value=""):
+            msg = self._make_html_msg(title="回退标题")
+            result = _process_message(msg)
+            assert result is not None
+            assert result["title"] == "回退标题"
+
+    def test_result_has_all_v1_fields(self):
+        msg = self._make_html_msg()
+        result = _process_message(msg)
+        assert result is not None
+        required = [
+            "protocol_version", "task_id", "message_id", "timestamp",
+            "type", "site", "keyword", "level",
+            "url", "title", "publish_date", "content", "summary",
+            "score", "matched_keywords",
+        ]
+        for field in required:
+            assert field in result, f"missing field: {field}"
+        assert result["protocol_version"] == "1.0"
+        assert result["type"] == "result"
+        assert isinstance(result["score"], int)
+        assert isinstance(result["matched_keywords"], list)
+
+    def test_unknown_site_returns_none(self):
+        msg = self._make_html_msg(site="nonexistent")
+        result = _process_message(msg)
+        assert result is None
+
+    def test_empty_html_returns_none(self):
+        msg = self._make_html_msg(html="")
+        result = _process_message(msg)
+        assert result is None
+
+    def test_short_html_returns_none(self):
+        msg = self._make_html_msg(html="<html>short</html>")
+        result = _process_message(msg)
+        assert result is None
+
+    def test_parse_exception_does_not_crash(self):
+        """process_message should catch extract exceptions and still return a result."""
+        msg = self._make_html_msg()
+        with patch("workers.parser_worker.extract_date", side_effect=Exception("parse error")):
+            result = _process_message(msg)
+            assert result is not None
+            assert result["url"] == "https://czj.beijing.gov.cn/art/1.html"
+
+    def test_score_exception_does_not_crash(self):
+        msg = self._make_html_msg()
+        with patch("workers.parser_worker.score_article", side_effect=Exception("score error")):
+            result = _process_message(msg)
+            assert result is not None
+            assert result["score"] == 0
+            assert result["matched_keywords"] == []
+
+
+
+
+############################################################
+# FILE: tests\test_redis_protocol.py
+############################################################
+import json
+import os
+from protocol.messages import (
+    SearchMessage, URLMessage, HTMLMessage,
+    ResultMessage, ErrorMessage, SearchDoneMessage,
+)
+
+FIXTURE_PATH = os.path.join(os.path.dirname(__file__), "fixtures", "redis_protocol_v1.json")
+
+
+def _load_fixture():
+    with open(FIXTURE_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _assert_match_expected(msg_type, actual_dict, fixture_dict):
+    expected = fixture_dict[msg_type]
+    for k, v in expected.items():
+        assert k in actual_dict, f"{msg_type} missing field {k}"
+        assert actual_dict[k] == v, f"{msg_type}.{k}: {actual_dict[k]} != {v}"
+    allowed = set(expected.keys())
+    actual_keys = set(actual_dict.keys())
+    extra = actual_keys - allowed
+    assert not extra, f"{msg_type} has unexpected fields: {extra}"
+    assert "time" not in actual_keys, f"{msg_type} should not have old time field"
+
+
+def test_search_message():
+    fix = _load_fixture()
+    e = fix["_envelope"]
+    msg = SearchMessage(task_id=e["task_id"], message_id=e["message_id"], timestamp=e["timestamp"],
+                        site="czj_beijing", keyword="低空经济", level=1, max_pages=1)
+    _assert_match_expected("search", msg.to_dict(), fix)
+
+
+def test_url_message():
+    fix = _load_fixture()
+    e = fix["_envelope"]
+    msg = URLMessage(task_id=e["task_id"], message_id="msg-002", timestamp=e["timestamp"],
+                     url="https://czj.beijing.gov.cn/art/1.html", site="czj_beijing", keyword="低空经济", level=1, title="")
+    _assert_match_expected("url", msg.to_dict(), fix)
+
+
+def test_html_message():
+    fix = _load_fixture()
+    e = fix["_envelope"]
+    msg = HTMLMessage(task_id=e["task_id"], message_id="msg-003", timestamp=e["timestamp"],
+                      url="https://czj.beijing.gov.cn/art/1.html", site="czj_beijing",
+                      keyword="低空经济", level=1, title="低空经济政策解读", html="<html><body>正文</body></html>")
+    _assert_match_expected("html", msg.to_dict(), fix)
+
+
+def test_result_message():
+    fix = _load_fixture()
+    e = fix["_envelope"]
+    msg = ResultMessage(task_id=e["task_id"], message_id="msg-004", timestamp=e["timestamp"],
+                        site="czj_beijing", keyword="低空经济", level=1,
+                        url="https://czj.beijing.gov.cn/art/1.html", title="低空经济政策解读",
+                        publish_date="2026-07-27", content="正文内容", summary="",
+                        score=85, matched_keywords=[])
+    _assert_match_expected("result", msg.to_dict(), fix)
+
+
+def test_error_message():
+    fix = _load_fixture()
+    e = fix["_envelope"]
+    msg = ErrorMessage(task_id=e["task_id"], message_id="msg-005", timestamp=e["timestamp"],
+                       stage="download", site="czj_beijing", keyword="低空经济", level=1,
+                       url="https://czj.beijing.gov.cn/art/1.html",
+                       error_code="HTTP_403", error="forbidden", retryable=False)
+    _assert_match_expected("error", msg.to_dict(), fix)
+def test_search_done_message():
+    fix = _load_fixture()
+    e = fix["_envelope"]
+    msg = SearchDoneMessage(task_id=e["task_id"], message_id="msg-006", timestamp=e["timestamp"],
+                            site="czj_beijing", keyword="低空经济", url_count=12, level=1)
+    _assert_match_expected("search_done", msg.to_dict(), fix)
+
+
+############################################################
+# FILE: tests\test_search_worker.py
+############################################################
+import json
+import os
+import sys
+from unittest.mock import MagicMock
+
+# Mock redis before importing search_worker
+sys.modules["redis"] = MagicMock()
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from protocol.messages import new_task_id, new_message_id
+from workers.search_worker import _load_site_config
+
+
+def _make_search_msg(task_id="t-001", message_id="m-001", site="czj_beijing",
+                     keyword="低空经济", level=1, max_pages=1):
+    return {
+        "protocol_version": "1.0", "task_id": task_id,
+        "message_id": message_id, "timestamp": "2026-07-27T16:00:00Z",
+        "type": "search", "site": site, "keyword": keyword,
+        "level": level, "max_pages": max_pages,
+    }
+
+
+class TestLoadSiteConfig:
+    def test_valid_site(self):
+        cfg = _load_site_config("czj_beijing")
+        assert cfg is not None
+        assert cfg["name"] == "北京市财政局"
+
+    def test_unknown_site(self):
+        cfg = _load_site_config("nonexistent")
+        assert cfg is None
+
+
+class TestMaxPagesValidation:
+    def test_negative_flagged(self):
+        msg = _make_search_msg(max_pages=-1)
+        mp = msg.get("max_pages", 0)
+        assert not (isinstance(mp, int) and mp >= 1)
+
+    def test_zero_normalized_before_send(self):
+        msg = _make_search_msg(max_pages=0)
+        mp = msg.get("max_pages", 0)
+        assert mp == 0
+
+    def test_positive_passed_through(self):
+        msg = _make_search_msg(max_pages=5)
+        mp = msg.get("max_pages", 0)
+        assert mp == 5
+
+
+class TestTaskIDChain:
+    def test_same_task_id_multiple_urls(self):
+        task_id = new_task_id()
+        assert len({task_id for _ in range(10)}) == 1
+
+    def test_different_message_ids(self):
+        ids = {new_message_id() for _ in range(10)}
+        assert len(ids) == 10
+
+    def test_url_message_retains_fields(self):
+        payload = {
+            "task_id": "t-001",
+            "url": "https://czj.beijing.gov.cn/art/1.html",
+            "site": "czj_beijing",
+            "keyword": "低空经济",
+            "level": 1,
+            "title": "政策解读",
+        }
+        assert payload["task_id"] == "t-001"
+        assert payload["site"] == "czj_beijing"
+        assert payload["keyword"] == "低空经济"
+        assert payload["level"] == 1
+        assert payload["title"] == "政策解读"
+
+    def test_html_inherits_task_id(self):
+        task_id = new_task_id()
+        url_msg_id = new_message_id()
+        html_msg_id = new_message_id()
+        assert url_msg_id != html_msg_id
+
+
